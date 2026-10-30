@@ -83,6 +83,15 @@ func (i InstanceIPs) PublicIPv4() string {
 // SLAACv6 returns the SLAAC IPv6 address, or "".
 func (i InstanceIPs) SLAACv6() string { return i.IPv6.SLAAC.Address }
 
+// Account mirrors the subset of GET /v4/account used by the panel.
+// Balance is the current amount owed (positive = amount due).
+type Account struct {
+	Balance           float64 `json:"balance"`            // 当前欠费(正数=欠款)
+	BalanceUninvoiced float64 `json:"balance_uninvoiced"` // 未出账金额
+	Company           string  `json:"company"`
+	Email             string  `json:"email"`
+}
+
 // SSHKey mirrors an item of GET /v4/profile/sshkeys.
 type SSHKey struct {
 	ID      int    `json:"id"`
