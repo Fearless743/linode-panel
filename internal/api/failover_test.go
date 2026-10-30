@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -16,10 +17,11 @@ import (
 // account group holding both, plus a FailoverMonitor whose probe/clientFor are
 // injected so no real Linode API is needed.
 type failoverHarness struct {
-	srv     *Server
-	api     *fakeAPI
-	monitor *FailoverMonitor
-	groupID int
+	srv        *Server
+	api        *fakeAPI
+	monitor    *FailoverMonitor
+	groupID    int
+	createOpts *[]linode.CreateOptions
 }
 
 func newFailoverHarness(t *testing.T) *failoverHarness {
@@ -45,6 +47,7 @@ func newFailoverHarness(t *testing.T) *failoverHarness {
 		t.Fatalf("AddAccountGroupMember 2: %v", err)
 	}
 
+	var createOpts []linode.CreateOptions
 	api := &fakeAPI{
 		getInstance: func(_ context.Context, id int) (linode.Instance, error) {
 			return linode.Instance{
@@ -53,6 +56,7 @@ func newFailoverHarness(t *testing.T) *failoverHarness {
 			}, nil
 		},
 		createInstance: func(_ context.Context, opts linode.CreateOptions) (linode.Instance, error) {
+			createOpts = append(createOpts, opts)
 			return linode.Instance{
 				ID: 100, Label: opts.Label, Region: opts.Region,
 				Type: opts.Type, Image: opts.Image, Status: "booting",
@@ -62,7 +66,7 @@ func newFailoverHarness(t *testing.T) *failoverHarness {
 	srv := New(api, st)
 	m := &FailoverMonitor{srv: srv, tick: time.Minute, log: slog.New(slog.DiscardHandler)}
 	m.clientFor = func(string) LinodeAPI { return api }
-	return &failoverHarness{srv: srv, api: api, monitor: m, groupID: g.ID}
+	return &failoverHarness{srv: srv, api: api, monitor: m, groupID: g.ID, createOpts: &createOpts}
 }
 
 // probeByPAT returns a probe that maps a PAT to a fixed status; unknown PATs
@@ -120,6 +124,18 @@ func TestFailoverReplacesWhenThresholdReached(t *testing.T) {
 	}
 	if !h.api.called("CreateInstance") {
 		t.Fatal("应在候选账号创建替换实例")
+	}
+	// 替换实例必须沿用旧实例的相同配置，且开机启动。
+	if len(*h.createOpts) != 1 {
+		t.Fatalf("CreateInstance 调用次数 = %d, want 1", len(*h.createOpts))
+	}
+	opts := (*h.createOpts)[0]
+	if opts.Region != "us-east" || opts.Type != "g6-standard-1" ||
+		opts.Image != "linode/debian12" || opts.Label != "web" {
+		t.Fatalf("CreateOptions 应与旧实例一致, got %+v", opts)
+	}
+	if opts.Booted == nil || !*opts.Booted {
+		t.Fatalf("CreateOptions.Booted 应为 true, got %v", opts.Booted)
 	}
 	if !h.api.called("DeleteInstance") {
 		t.Fatal("应尽力清理旧实例")
@@ -200,5 +216,69 @@ func TestFailoverHealthErrorNotCounted(t *testing.T) {
 	}
 	if h.api.called("CreateInstance") {
 		t.Fatal("检测出错不应触发替换")
+	}
+}
+
+// TestFailoverCachedFallbackOnGetInstanceError verifies that when the old
+// account is unreachable (GetInstance fails) the replacement still proceeds
+// using the locally cached instance snapshot.
+func TestFailoverCachedFallbackOnGetInstanceError(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	// 旧账号已不可达：直接取实例会失败。
+	h.api.getInstance = func(context.Context, int) (linode.Instance, error) {
+		return linode.Instance{}, errors.New("account suspended")
+	}
+	// 本地缓存里保留旧实例的配置，替换应回退到这里。
+	if err := h.srv.Store.CacheInstances(1, []linode.Instance{{
+		ID: 42, Label: "cached-web", Status: "running", Region: "eu-west",
+		Type: "g6-standard-2", Image: "linode/debian11",
+	}}); err != nil {
+		t.Fatalf("CacheInstances: %v", err)
+	}
+	h.enable(t, 42, 1, 1)
+
+	h.monitor.tickOnce(context.Background())
+
+	cfg, found := h.srv.Store.Failover(100)
+	if !found {
+		t.Fatal("回退缓存后应成功创建并迁移到新实例")
+	}
+	if cfg.LastStatus != HealthOK || cfg.TokenID != 2 {
+		t.Fatalf("新配置 = %+v, want ok/token=2", cfg)
+	}
+	if len(*h.createOpts) != 1 {
+		t.Fatalf("CreateInstance 调用次数 = %d, want 1", len(*h.createOpts))
+	}
+	opts := (*h.createOpts)[0]
+	if opts.Region != "eu-west" || opts.Type != "g6-standard-2" ||
+		opts.Image != "linode/debian11" || opts.Label != "cached-web" {
+		t.Fatalf("应使用缓存快照创建, got %+v", opts)
+	}
+}
+
+// TestFailoverMissingGroup verifies a config whose group no longer exists
+// stops in an error state without creating an instance.
+func TestFailoverMissingGroup(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	if err := h.srv.Store.SetFailover(store.Failover{
+		InstanceID: 42, UserID: 1, GroupID: 99999, TokenID: 1,
+		Enabled: true, Threshold: 1, IntervalSec: 60,
+	}); err != nil {
+		t.Fatalf("SetFailover: %v", err)
+	}
+
+	h.monitor.tickOnce(context.Background())
+
+	cfg, _ := h.srv.Store.Failover(42)
+	if cfg.LastStatus != "error" || cfg.FailCount != 0 {
+		t.Fatalf("组不存在后 = %+v, want error/0", cfg)
+	}
+	if !strings.Contains(cfg.LastDetail, "账号组不存在") {
+		t.Fatalf("详情 = %q, want 含「账号组不存在」", cfg.LastDetail)
+	}
+	if h.api.called("CreateInstance") {
+		t.Fatal("组不存在不应创建实例")
 	}
 }
