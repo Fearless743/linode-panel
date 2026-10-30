@@ -192,6 +192,37 @@ func TestAccountGroupHTTP(t *testing.T) {
 	}
 }
 
+// TestAccountGroupEmptyTokenIDsSerializesAsArray guards the frozen API
+// contract that token_ids is always a JSON array, even for a brand-new group
+// with no members (the store returns nil for it).
+func TestAccountGroupEmptyTokenIDsSerializesAsArray(t *testing.T) {
+	srv := testServer(t, &fakeAPI{})
+	session := loginAlice(t, srv)
+
+	// 建组响应：token_ids 必须是 []，不能是 null。
+	rr := authedPost(t, srv, session, "/api/account/groups", `{"name":"empty-box"}`)
+	wantStatus(t, rr, http.StatusCreated)
+	if body := rr.Body.String(); !strings.Contains(body, `"token_ids":[]`) {
+		t.Fatalf("create body token_ids is not []: %s", body)
+	}
+	var g store.AccountGroup
+	decodeJSON(t, rr, &g)
+
+	// 列组响应：该组尚未加任何成员，token_ids 同样必须是 []。
+	rr = authedGet(t, srv, session, "/api/account/groups")
+	wantStatus(t, rr, http.StatusOK)
+	if body := rr.Body.String(); !strings.Contains(body, `"token_ids":[]`) {
+		t.Fatalf("list body token_ids is not []: %s", body)
+	}
+	var list struct {
+		Groups []store.AccountGroup `json:"groups"`
+	}
+	decodeJSON(t, rr, &list)
+	if len(list.Groups) != 1 || list.Groups[0].ID != g.ID || list.Groups[0].TokenIDs == nil {
+		t.Fatalf("empty group list = %+v", list.Groups)
+	}
+}
+
 // TestAccountGroupCrossUserIsolation ensures one user can neither see nor
 // modify another user's account groups or add another user's tokens.
 func TestAccountGroupCrossUserIsolation(t *testing.T) {

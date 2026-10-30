@@ -14,15 +14,26 @@ import (
 // 或无余额时，可用相同配置在组内另一账号重建替换。这里只提供组的增删改查
 // 与成员管理，替换引擎不在此文件。
 
+// accountGroupOrEmpty normalizes g.TokenIDs to a non-nil slice so the JSON
+// contract always renders token_ids as [] instead of null (store may return
+// nil for a group with no members).
+func accountGroupOrEmpty(g store.AccountGroup) store.AccountGroup {
+	if g.TokenIDs == nil {
+		g.TokenIDs = []int{}
+	}
+	return g
+}
+
 // handleListAccountGroups returns the calling user's account groups, each with
 // its member token ids.
 func (s *Server) handleListAccountGroups(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
 	groups := s.Store.AccountGroups(user.ID)
-	if groups == nil {
-		groups = []store.AccountGroup{}
+	out := make([]store.AccountGroup, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, accountGroupOrEmpty(g))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
 }
 
 // handleCreateAccountGroup creates an empty account group for the calling user.
@@ -40,7 +51,7 @@ func (s *Server) handleCreateAccountGroup(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, g)
+	writeJSON(w, http.StatusCreated, accountGroupOrEmpty(g))
 }
 
 // handleUpdateAccountGroup renames one of the calling user's account groups.
