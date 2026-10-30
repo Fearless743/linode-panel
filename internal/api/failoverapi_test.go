@@ -182,3 +182,36 @@ func TestFailoverHTTPCrossUserFiltered(t *testing.T) {
 		t.Fatalf("GET 应只返回本人配置, got %+v", got.Failovers)
 	}
 }
+
+// TestFailoverHTTPDeleteCrossUserRejected verifies one user cannot delete
+// another user's config by guessing the instance id (IDOR).
+func TestFailoverHTTPDeleteCrossUserRejected(t *testing.T) {
+	h := newFailoverHTTPHarness(t)
+	// alice 自己的配置。
+	rr := h.put(t, 42, fmt.Sprintf(`{"token_id":%d,"group_id":%d,"enabled":true}`, h.memberID, h.groupID))
+	wantStatus(t, rr, http.StatusOK)
+	// 他人（管理员 id 1）的配置。
+	if err := h.srv.Store.SetFailover(store.Failover{
+		InstanceID: 77, UserID: 1, GroupID: 1, TokenID: 1,
+		Enabled: true, Threshold: 1, IntervalSec: 60,
+	}); err != nil {
+		t.Fatalf("seed other user: %v", err)
+	}
+
+	// alice 删除他人的配置 → 拒绝，且对方配置仍在。
+	rr = authedDelete(t, h.srv, h.cookie, "/api/account/failover/77")
+	wantStatus(t, rr, http.StatusBadRequest)
+	if !strings.Contains(rr.Body.String(), "实例替换配置不存在") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+	if cfg, found := h.srv.Store.Failover(77); !found || cfg.UserID != 1 {
+		t.Fatalf("他人配置不应被删除, found=%v cfg=%+v", found, cfg)
+	}
+
+	// alice 删除自己的配置 → 成功。
+	rr = authedDelete(t, h.srv, h.cookie, "/api/account/failover/42")
+	wantStatus(t, rr, http.StatusOK)
+	if _, found := h.srv.Store.Failover(42); found {
+		t.Fatal("本人配置应已删除")
+	}
+}
