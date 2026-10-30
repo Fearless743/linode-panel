@@ -147,6 +147,14 @@ describe("formatBalance", () => {
     expect(formatBalance("abc")).toBe("—");
   });
 
+  it("非 number 类型一律返回破折号（空串/布尔/数组/数字字符串）", () => {
+    expect(formatBalance("")).toBe("—");
+    expect(formatBalance(false)).toBe("—");
+    expect(formatBalance(true)).toBe("—");
+    expect(formatBalance([])).toBe("—");
+    expect(formatBalance("12.5")).toBe("—");
+  });
+
   it("余额阈值常量为 0", () => {
     expect(BALANCE_ALERT_THRESHOLD).toBe(0);
   });

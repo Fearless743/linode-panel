@@ -57,10 +57,8 @@ export function canFailover(group, tokens, excludeTokenId) {
   return replacementCandidates(group, tokens, excludeTokenId).length > 0;
 }
 
-// 余额展示：数字 -> 保留两位小数字符串；null/undefined/NaN/非有限数 -> "—"。
+// 余额展示：仅接受 number 类型，保留两位小数；其余（null/undefined/NaN/非有限数/空串/布尔/数组等）-> "—"。
 export function formatBalance(n) {
-  if (n === null || n === undefined) return "—";
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "—";
-  return v.toFixed(2);
+  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
+  return n.toFixed(2);
 }
