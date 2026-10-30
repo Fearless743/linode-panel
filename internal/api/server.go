@@ -149,6 +149,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/account/groups/{gid}/tokens", s.requireAuth("", s.handleAddAccountGroupMember))
 	mux.HandleFunc("DELETE /api/account/groups/{gid}/tokens/{tid}", s.requireAuth("", s.handleRemoveAccountGroupMember))
 
+	// 账号组自动替换：组内某账号封号/无余额时换到另一账号。
+	mux.HandleFunc("GET /api/account/failover", s.requireAuth("", s.handleListFailover))
+	mux.HandleFunc("PUT /api/account/failover/{iid}", s.requireAuth("", s.handlePutFailover))
+	mux.HandleFunc("DELETE /api/account/failover/{iid}", s.requireAuth("", s.handleDeleteFailover))
+
 	// View permission.
 	mux.HandleFunc("GET /api/instances", s.requireAuth(store.PermView, s.handleListInstances))
 	mux.HandleFunc("GET /api/instances/{id}/refresh", s.requireAuth(store.PermView, s.handleInstanceRefresh))
