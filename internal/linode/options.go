@@ -17,7 +17,7 @@ type LinodeType struct {
 	Memory int    `json:"memory"`
 	VCpus  int    `json:"vcpus"`
 	Price  struct {
-		Hourly float64 `json:"hourly"`
+		Hourly  float64 `json:"hourly"`
 		Monthly float64 `json:"monthly"`
 	} `json:"price"`
 }
