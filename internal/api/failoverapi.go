@@ -112,9 +112,22 @@ func (s *Server) handlePutFailover(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeleteFailover 删除一个实例的替换配置（幂等：删除不存在的不报错）。
+// 删除前先校验归属，避免任意登录用户凭猜到的实例 ID 删除他人的配置。
 func (s *Server) handleDeleteFailover(w http.ResponseWriter, r *http.Request) {
 	iid, ok := parseFailoverInstanceID(w, r)
 	if !ok {
+		return
+	}
+	user, _ := UserFrom(r.Context())
+	cfg, found := s.Store.Failover(iid)
+	if !found {
+		// 不存在按幂等成功处理。
+		writeJSON(w, http.StatusOK, okResponse{OK: true})
+		return
+	}
+	if cfg.UserID != user.ID {
+		// 不暴露他人配置是否存在，统一按不存在处理。
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "实例替换配置不存在"})
 		return
 	}
 	if err := s.Store.DeleteFailover(iid); err != nil {
