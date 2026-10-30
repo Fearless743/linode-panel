@@ -1,0 +1,441 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+
+	"linode-panel/internal/agenthub"
+	"linode-panel/internal/linode"
+	"linode-panel/internal/sshrun"
+	"linode-panel/internal/store"
+)
+
+// sshProbeTimeout bounds one TCP connect to the instance's SSH port.
+const sshProbeTimeout = 3 * time.Second
+
+// rebuildPollTimeout bounds waiting for the instance to reach a status.
+const rebuildPollTimeout = 10 * time.Minute
+
+// run executes the rebuild sequence for t, appending each step to t.Log.
+//
+// Sequence (fails fast; every step logs before running):
+//  0. read the old instance (region/type/image for the rebuild)
+//  1. shutdown the old instance
+//  2. enable network_helper (best effort; failure is logged, not fatal)
+//  3. delete the old instance
+//  4. create a fresh instance (same region/type/image, booted) with a
+//     fresh one-off SSH key
+//  5. poll until the new instance is running (3s interval, 10m cap)
+//  6. disable network_helper and shutdown, wait until offline
+//  7. assign the reserved IP (only when the user provided one)
+//  8. boot, then wait until running
+//  9. run the boot script over SSH (5m timeout)
+//
+// 10. probe the SSH port; task succeeds only when the probe connects
+func (m *Manager) run(t *Task, reservedIP string, pat string) {
+	ctx := context.Background()
+	oldID := t.InstanceID
+
+	// Each rebuild uses the requesting user's PAT via its own client so a
+	// per-user token never leaks across users.
+	api := m.api
+	if pat != "" {
+		api = m.newAPI(pat)
+	}
+
+	old, err := api.GetInstance(ctx, oldID)
+	if err != nil {
+		m.fail(t, fmt.Errorf("读取旧实例失败: %w", err))
+		return
+	}
+	oldIP := ""
+	if len(old.IPv4) > 0 {
+		oldIP = old.IPv4[0]
+	}
+	m.setOldIP(t, oldIP)
+	m.log(t, "step 0: old instance id=%d region=%s type=%s image=%s ip=%s", oldID, old.Region, old.Type, old.Image, oldIP)
+
+	m.log(t, "step 1: shutdown old instance %d", oldID)
+	if err := api.Shutdown(ctx, oldID); err != nil {
+		m.fail(t, fmt.Errorf("关机旧实例失败: %w", err))
+		return
+	}
+
+	// The network helper must be enabled before the instance is deleted so
+	// the freshly created instance inherits it from the image. A failure here
+	// is not fatal: networking may still work via DHCP without the helper.
+	m.log(t, "step 2: enable network_helper on old instance %d", oldID)
+	configID, cfgErr := api.GetConfigID(ctx, oldID)
+	if cfgErr == nil {
+		if err := api.UpdateConfigNetworkHelper(ctx, oldID, configID, true); err != nil {
+			m.log(t, "  network_helper enable failed (continuing): %v", err)
+		}
+	} else {
+		m.log(t, "  get config failed (continuing): %v", cfgErr)
+	}
+
+	m.log(t, "step 3: delete old instance %d", oldID)
+	if err := api.DeleteInstance(ctx, oldID); err != nil {
+		m.fail(t, fmt.Errorf("删除旧实例失败: %w", err))
+		return
+	}
+
+	privPEM, pubKey, err := sshrun.GenerateKey()
+	if err != nil {
+		m.fail(t, fmt.Errorf("生成 SSH 密钥失败: %w", err))
+		return
+	}
+	booted := true
+	createOpts := linode.CreateOptions{
+		Region:         old.Region,
+		Type:           old.Type,
+		Image:          old.Image,
+		AuthorizedKeys: []string{pubKey},
+		Booted:         &booted,
+	}
+	m.log(t, "step 4: create new instance (region=%s type=%s image=%s)", old.Region, old.Type, old.Image)
+	newInst, err := api.CreateInstance(ctx, createOpts)
+	if err != nil {
+		m.fail(t, fmt.Errorf("创建新实例失败: %w", err))
+		return
+	}
+	newID := newInst.ID
+
+	m.log(t, "step 5: wait for instance %d to be running", newID)
+	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
+		m.fail(t, err)
+		return
+	}
+
+	m.log(t, "step 6: disable network_helper and shutdown instance %d", newID)
+	if cfgID, err := api.GetConfigID(ctx, newID); err == nil {
+		if err := api.UpdateConfigNetworkHelper(ctx, newID, cfgID, false); err != nil {
+			m.log(t, "  network_helper disable failed (continuing): %v", err)
+		}
+	} else {
+		m.log(t, "  get config failed (continuing): %v", err)
+	}
+	if err := api.Shutdown(ctx, newID); err != nil {
+		m.fail(t, fmt.Errorf("关机新实例失败: %w", err))
+		return
+	}
+	m.log(t, "step 6b: wait for instance %d to be offline", newID)
+	if err := m.waitStatus(t, api, ctx, newID, "offline"); err != nil {
+		m.fail(t, err)
+		return
+	}
+
+	// Default-open-all-ports: attach the allow-all Cloud Firewall while the
+	// instance is offline (config changes are applied at the next boot).
+	// Best-effort: failure is logged, the rebuild still proceeds.
+	m.log(t, "step 6c: attach allow-all firewall (region=%s instance=%d)", newInst.Region, newID)
+	if err := api.AttachAllowAllFirewall(ctx, newInst.Region, newID); err != nil {
+		m.log(t, "  防火墙绑定失败（继续）: %v", err)
+	}
+
+	if reservedIP != "" {
+		m.log(t, "step 7: assign reserved IP %s", reservedIP)
+		if err := api.AssignIP(ctx, old.Region, reservedIP, newID); err != nil {
+			m.fail(t, fmt.Errorf("分配保留 IP 失败: %w", err))
+			return
+		}
+	}
+
+	m.log(t, "step 8: boot instance %d", newID)
+	if err := api.Boot(ctx, newID); err != nil {
+		m.fail(t, fmt.Errorf("开机失败: %w", err))
+		return
+	}
+
+	m.log(t, "step 8b: wait for instance %d to be running", newID)
+	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
+		m.fail(t, err)
+		return
+	}
+
+	m.log(t, "step 9: run boot script via SSH")
+	ips, err := api.GetInstanceIPs(ctx, newID)
+	if err != nil {
+		m.fail(t, fmt.Errorf("获取新实例 IP 失败: %w", err))
+		return
+	}
+	host := ips.PublicIPv4()
+	if host == "" {
+		host = ips.SLAACv6()
+	}
+	if host == "" {
+		m.fail(t, fmt.Errorf("新实例没有可用的公网 IP"))
+		return
+	}
+	res, runErr := m.RunFn(ctx, sshrun.Options{
+		Host:               host,
+		Port:               m.sshPort,
+		PrivateKey:         privPEM,
+		InsecureSkipVerify: true,
+		Timeout:            5 * time.Minute,
+	}, t.Script)
+	if runErr != nil {
+		m.fail(t, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
+		return
+	}
+	m.log(t, "  ssh exit=%d", res.Exit)
+	if res.Exit != 0 {
+		detail := res.Stderr
+		if detail == "" {
+			detail = res.Stdout
+		}
+		m.fail(t, fmt.Errorf("开机脚本退出码 %d: %s", res.Exit, detail))
+		return
+	}
+	if res.Stderr != "" {
+		m.log(t, "  stderr: %s", res.Stderr)
+	}
+	m.log(t, "step 10: probe SSH port on %s", host)
+
+	if err := m.ProbeFn(ctx, host); err != nil {
+		m.fail(t, fmt.Errorf("SSH 端口探测失败: %w", err))
+		return
+	}
+
+	m.succeed(t, host)
+}
+
+// waitStatus polls api.GetInstance until the instance reaches want or the
+// poll timeout elapses.
+func (m *Manager) waitStatus(t *Task, api LinodeAPI, ctx context.Context, id int, want string) error {
+	interval := m.PollInterval
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	timeout := m.PollTimeout
+	if timeout <= 0 {
+		timeout = rebuildPollTimeout
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		inst, err := api.GetInstance(ctx, id)
+		if err == nil && inst.Status == want {
+			return nil
+		}
+		if err != nil {
+			m.log(t, "  poll: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("等待实例 %d 变为 %s 超时", id, want)
+		case <-ticker.C:
+		}
+	}
+}
+
+// probeHost is the default ProbeFn: a TCP dial to host at the Manager's
+// configured SSH port, bounded by sshProbeTimeout.
+func (m *Manager) probeHost(ctx context.Context, host string) error {
+	return probe(ctx, host, m.sshPort)
+}
+
+// probe attempts a TCP connection to host:port within sshProbeTimeout.
+func probe(ctx context.Context, host string, port int) error {
+	if port == 0 {
+		port = 22
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, sshProbeTimeout)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+// HTTP handlers for the rebuild and task routes.
+
+type rebuildRequest struct {
+	Script     string `json:"script"`
+	ReservedIP string `json:"reserved_ip"`
+	TokenID    int    `json:"token_id"`
+}
+
+type rebuildResponse struct {
+	TaskID string `json:"task_id"`
+}
+
+func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req rebuildRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
+		return
+	}
+	// 脚本解析顺序：请求体显式提供 → 该实例已配置的脚本 → 内置默认脚本。
+	script := req.Script
+	if script == "" {
+		if s2, ok := s.Store.InstanceScript(id); ok && s2 != "" {
+			script = s2
+		} else {
+			script = DefaultBootScript
+		}
+	}
+	if script == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "开机脚本不能为空"})
+		return
+	}
+	// 显式提供的脚本固化到该实例（成为该实例的配置）。
+	if req.Script != "" {
+		if err := s.Store.SetInstanceScript(id, req.Script); err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存实例脚本失败"})
+			return
+		}
+	}
+	// Agent path: queue the rebuild command instead of running the Manager.
+	if r.URL.Query().Get("via_agent") == "1" {
+		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdReboot, map[string]any{
+			"id":          id,
+			"script":      script,
+			"reserved_ip": req.ReservedIP,
+		})
+		if !ok {
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"command_id": cmdID})
+		return
+	}
+	user, _ := UserFrom(r.Context())
+	tokenID := ""
+	if req.TokenID > 0 {
+		tokenID = strconv.Itoa(req.TokenID)
+	}
+	pat, err := s.resolveToken(user, tokenID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+	taskID, err := s.Tasks.Start(id, script, req.ReservedIP, pat, s.tokenLabel(user, tokenID))
+	if err != nil {
+		if errors.Is(err, ErrBusy) {
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "已有重建任务进行中"})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	// Rebuild replaces the instance with a new one; drop the token's cached
+	// snapshot so the list refetches instead of showing the deleted instance.
+	if tid := s.tokenIDFor(user, tokenID); tid > 0 {
+		if err := s.Store.InvalidateInstanceCache(tid); err != nil {
+			slog.Warn("invalidate instance cache failed", "token_id", tid, "error", err)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, rebuildResponse{TaskID: taskID})
+}
+
+// tokenLabel returns the display label for user's selected token, or "PAT"
+// when the token cannot be found.
+func (s *Server) tokenLabel(user store.User, tokenID string) string {
+	for _, t := range s.Store.TokensOf(user.ID) {
+		if tokenID == "" || strconv.Itoa(t.ID) == tokenID {
+			return t.Label
+		}
+	}
+	return "PAT"
+}
+
+// handleRebuildTasks lists tasks (newest first, logs reversed).
+func (s *Server) handleRebuildTasks(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string][]Task{"tasks": s.Tasks.List()})
+}
+
+// handleRebuildTask returns one task.
+func (s *Server) handleRebuildTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t, err := s.Tasks.Get(id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "任务不存在"})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+// bootScriptRequest is the request body for saving an instance's script.
+type bootScriptRequest struct {
+	Script string `json:"script"`
+}
+
+// handleGetInstanceScript returns the script effective for one instance:
+// its configured script when set, otherwise the built-in default template.
+func (s *Server) handleGetInstanceScript(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if script, configured := s.Store.InstanceScript(id); configured && script != "" {
+		writeJSON(w, http.StatusOK, map[string]any{"script": script, "configured": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"script": DefaultBootScript, "configured": false})
+}
+
+// handlePutInstanceScript persists an instance's own boot script.
+func (s *Server) handlePutInstanceScript(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req bootScriptRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
+		return
+	}
+	if req.Script == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "脚本不能为空"})
+		return
+	}
+	if err := s.Store.SetInstanceScript(id, req.Script); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存实例脚本失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+// handleDeleteInstanceScript removes an instance's script so it uses the
+// built-in default template again.
+func (s *Server) handleDeleteInstanceScript(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteInstanceScript(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "删除实例脚本失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+// handleInstanceScriptStatus lists the ids of instances that have a custom
+// script configured, so the UI can mark them.
+func (s *Server) handleInstanceScriptStatus(w http.ResponseWriter, r *http.Request) {
+	ids := s.Store.InstanceScriptIDs()
+	if ids == nil {
+		ids = []int{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"configured": ids})
+}

@@ -1,0 +1,50 @@
+/* Shared UI components (components/ui) */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+.spinner-md {
+  width: 20px;
+  height: 20px;
+  border-width: 3px;
+}
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.btn-lg {
+  padding: 9px 18px;
+  font-size: 14px;
+}
+.error-state {
+  color: var(--danger);
+  padding: 20px 0;
+  text-align: center;
+}
+.error-state-message {
+  margin: 0 0 12px;
+  word-break: break-all;
+}
+.form-field {
+  margin-bottom: 12px;
+}
+.form-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.field-error {
+  display: block;
+  color: var(--danger);
+  font-size: 12px;
+  margin-top: 4px;
+  word-break: break-all;
+}

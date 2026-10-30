@@ -1,0 +1,73 @@
+/* Linode 开机面板 — 设计令牌（Design Tokens）
+   颜色、间距、字体、圆角、阴影、过渡统一在此定义。
+   dark theme 默认，light 通过 prefers-color-scheme 切换。 */
+
+:root {
+  /* ---------- 颜色 ---------- */
+  --bg: #12151c;
+  --bg-elevated: #1a1f29;
+  --bg-hover: #222834;
+  --border: #2e3542;
+  --text: #e6e9ef;
+  --text-muted: #9aa3b2;
+  --text-on-accent: #ffffff;
+  --accent: #4f8cff;
+  --accent-hover: #6ba0ff;
+  --danger: #e5534b;
+  --danger-hover: #f0706a;
+  --success: #3fb950;
+  --warning: #d29922;
+  --overlay: rgba(0, 0, 0, 0.55);
+
+  /* ---------- 间距（4px 网格） ---------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ---------- 字体 ---------- */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono",
+    Menlo, monospace;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-base: 14px;
+  --font-size-lg: 15px;
+  --font-size-xl: 17px;
+  --font-size-title: 18px;
+
+  /* ---------- 圆角 ---------- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-full: 999px;
+
+  /* ---------- 阴影 ---------- */
+  --shadow: rgba(0, 0, 0, 0.45);
+  --shadow-modal: 0 10px 40px var(--shadow);
+
+  /* ---------- 过渡 ---------- */
+  --transition-fast: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f6f8;
+    --bg-elevated: #ffffff;
+    --bg-hover: #eef1f5;
+    --border: #d5dbe3;
+    --text: #1c2330;
+    --text-muted: #5a6472;
+    --accent: #2f6fe0;
+    --accent-hover: #1f5ccc;
+    --danger: #c93c34;
+    --danger-hover: #a93028;
+    --success: #2e9c42;
+    --warning: #b07d0f;
+    --shadow: rgba(0, 0, 0, 0.12);
+  }
+}
