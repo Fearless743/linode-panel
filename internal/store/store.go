@@ -148,6 +148,22 @@ CREATE TABLE IF NOT EXISTS account_group_members (
 	group_id INTEGER NOT NULL,
 	token_id INTEGER NOT NULL,
 	PRIMARY KEY (group_id, token_id)
+);
+CREATE TABLE IF NOT EXISTS instance_failover (
+	instance_id  INTEGER PRIMARY KEY,
+	user_id      INTEGER NOT NULL DEFAULT 0,
+	group_id     INTEGER NOT NULL DEFAULT 0,
+	token_id     INTEGER NOT NULL DEFAULT 0,
+	enabled      INTEGER NOT NULL DEFAULT 0,
+	threshold    INTEGER NOT NULL DEFAULT 3,
+	interval_sec INTEGER NOT NULL DEFAULT 300,
+	fail_count   INTEGER NOT NULL DEFAULT 0,
+	last_status  TEXT NOT NULL DEFAULT '',
+	last_detail  TEXT NOT NULL DEFAULT '',
+	last_check_at TEXT NOT NULL DEFAULT '',
+	last_task_id TEXT NOT NULL DEFAULT '',
+	replaced_by  INTEGER NOT NULL DEFAULT 0,
+	updated_at   TEXT NOT NULL DEFAULT ''
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化表结构: %w", err)
