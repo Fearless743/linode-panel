@@ -243,3 +243,222 @@
   border-radius: var(--radius-sm);
   background: var(--bg);
 }
+
+/* ---------- 账号组 ---------- */
+.ag-content {
+  padding: var(--space-3) 14px;
+}
+
+.ag-hint {
+  margin: 0;
+  flex: 1;
+}
+
+.ag-notice {
+  margin: 0 0 var(--space-2);
+}
+
+.ag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+/* 卡片复用 .panel 的边框/背景，去掉其页面级外边距。 */
+.ag-card {
+  margin: 0;
+}
+
+.ag-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ag-card-heading {
+  min-width: 0;
+}
+
+.ag-card-title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.ag-card-meta {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.ag-card-empty {
+  padding: var(--space-3) 14px;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.ag-member-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 14px 10px;
+}
+
+.ag-member-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ag-member-row:last-child {
+  border-bottom: none;
+}
+
+.ag-member-label {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.ag-member-id {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  margin-left: 4px;
+}
+
+.ag-member-row .action-btn {
+  margin-left: auto;
+}
+
+.ag-status-count {
+  font-size: var(--font-size-xs);
+  opacity: 0.8;
+}
+
+/* failover 的 danger 色调（复用 status-pill 外观）。 */
+.status-danger {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+/* 管理成员弹窗内的账号列表。 */
+.ag-members {
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.ag-member {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ag-member:last-child {
+  border-bottom: none;
+}
+
+.ag-member-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.ag-member-check input[type="checkbox"] {
+  flex-shrink: 0;
+}
+
+.ag-member-busy {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+/* 替换配置弹窗内单个实例的配置块。 */
+.ag-failover-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  padding: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+
+.ag-failover-item:last-of-type {
+  margin-bottom: var(--space-2);
+}
+
+.ag-failover-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+}
+
+.ag-failover-title {
+  flex: 1;
+  min-width: 120px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.ag-failover-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ag-failover-fields {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-2);
+}
+
+.ag-failover-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.ag-failover-field .modal-input {
+  width: 130px;
+}
+
+.ag-failover-meta {
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  word-break: break-all;
+}
+
+.ag-failover-error {
+  margin-top: var(--space-1);
+  color: var(--danger);
+  font-size: var(--font-size-sm);
+  word-break: break-all;
+}
+
+.ag-failover-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}

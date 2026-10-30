@@ -330,3 +330,30 @@ export function removeAccountGroupToken(groupId, tokenId) {
     { method: "DELETE" }
   );
 }
+
+// ---------- 实例自动替换（账号组内跨账号） ----------
+// 按实例配置：某实例所在账号被封禁/余额不足时，在所属账号组内换另一个账号，
+// 用相同配置重建替换。
+// 返回 { failovers: [{ instance_id, user_id, group_id, token_id, enabled,
+//   threshold, interval_seconds, fail_count, last_status, last_detail,
+//   last_check_at, last_task_id, replaced_by_instance_id, updated_at }] }
+export function listFailovers() {
+  return apiFetch("/api/account/failover");
+}
+
+// 保存实例的替换配置；enabled=false 表示关闭但仍保留配置。
+// payload: { token_id, group_id, enabled, threshold, interval_seconds }
+export function setInstanceFailover(instanceId, payload) {
+  return jsonRequest(
+    "/api/account/failover/" + encodeURIComponent(instanceId),
+    "PUT",
+    payload
+  );
+}
+
+// 删除实例的替换配置。
+export function deleteInstanceFailover(instanceId) {
+  return apiFetch("/api/account/failover/" + encodeURIComponent(instanceId), {
+    method: "DELETE",
+  });
+}
