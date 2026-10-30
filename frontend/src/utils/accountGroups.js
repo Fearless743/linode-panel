@@ -22,7 +22,8 @@ const FAILOVER_STATUS_MAP = {
 
 export function describeFailover(cfg) {
   const status = cfg && cfg.last_status != null ? String(cfg.last_status) : "";
-  const hit = FAILOVER_STATUS_MAP[status];
+  // 只认自有键，避免命中 Object.prototype 上的继承属性（如 toString/constructor/__proto__）。
+  const hit = Object.hasOwn(FAILOVER_STATUS_MAP, status) ? FAILOVER_STATUS_MAP[status] : null;
   if (hit) return { ...hit };
   // 未知值：回退 muted，label 用原文，空则用「未知」。
   return { label: status || "未知", tone: "muted" };

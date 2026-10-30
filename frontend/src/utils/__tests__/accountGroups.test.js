@@ -31,6 +31,13 @@ describe("describeFailover", () => {
     expect(describeFailover({ last_status: "weird" })).toEqual({ label: "weird", tone: "muted" });
   });
 
+  it("原型链属性名不应被当作已知状态", () => {
+    expect(describeFailover({ last_status: "toString" })).toEqual({ label: "toString", tone: "muted" });
+    expect(describeFailover({ last_status: "constructor" })).toEqual({ label: "constructor", tone: "muted" });
+    expect(describeFailover({ last_status: "__proto__" })).toEqual({ label: "__proto__", tone: "muted" });
+    expect(describeFailover({ last_status: "hasOwnProperty" })).toEqual({ label: "hasOwnProperty", tone: "muted" });
+  });
+
   it("status 为 null 时按未检测处理，非空未知值用原文", () => {
     expect(describeFailover({ last_status: null })).toEqual({ label: "未检测", tone: "muted" });
     expect(describeFailover({ last_status: 0 })).toEqual({ label: "0", tone: "muted" });
