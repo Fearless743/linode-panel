@@ -26,6 +26,9 @@ import {
   deleteAccountGroup,
   addAccountGroupToken,
   removeAccountGroupToken,
+  listFailovers,
+  setInstanceFailover,
+  deleteInstanceFailover,
 } from "../api";
 
 function mockResponse(body, { ok = true, status = 200 } = {}) {
@@ -409,6 +412,77 @@ describe("端点封装", () => {
         name: "ApiError",
         status: 400,
         message: "bad group",
+      });
+    }
+  });
+
+  it("listFailovers GET /api/account/failover 并透传返回值", async () => {
+    const data = {
+      failovers: [
+        {
+          instance_id: 10,
+          user_id: 2,
+          group_id: 1,
+          token_id: 3,
+          enabled: true,
+          threshold: 3,
+          interval_seconds: 300,
+          fail_count: 0,
+          last_status: "ok",
+          last_detail: "",
+          last_check_at: "2026-01-01T00:00:00Z",
+          last_task_id: "",
+          replaced_by_instance_id: 0,
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    };
+    vi.mocked(fetch).mockResolvedValue(mockResponse(data));
+    await expect(listFailovers()).resolves.toEqual(data);
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/failover");
+    expect(opts.method).toBeUndefined();
+  });
+
+  it("setInstanceFailover PUT 编码 instanceId 并带 payload", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    const payload = {
+      token_id: 3,
+      group_id: 1,
+      enabled: true,
+      threshold: 3,
+      interval_seconds: 300,
+    };
+    await expect(setInstanceFailover("i/1", payload)).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/failover/i%2F1");
+    expect(opts.method).toBe("PUT");
+    expect(JSON.parse(opts.body)).toEqual(payload);
+  });
+
+  it("deleteInstanceFailover DELETE 编码 instanceId", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(deleteInstanceFailover("i 1")).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/failover/i%201");
+    expect(opts.method).toBe("DELETE");
+    expect(opts.body).toBeUndefined();
+  });
+
+  it("替换端点非 2xx 时抛 ApiError", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockResponse({ error: "bad failover" }, { ok: false, status: 400 })
+    );
+    const cases = [
+      () => listFailovers(),
+      () => setInstanceFailover(1, { enabled: true }),
+      () => deleteInstanceFailover(1),
+    ];
+    for (const call of cases) {
+      await expect(call()).rejects.toMatchObject({
+        name: "ApiError",
+        status: 400,
+        message: "bad failover",
       });
     }
   });
