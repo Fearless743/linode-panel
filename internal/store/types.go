@@ -101,6 +101,17 @@ type Group struct {
 	Perms []string `json:"perms"`
 }
 
+// AccountGroup 是一个命名的账号组：把同一 user 下的多个账号(Token)绑定在一起，
+// 当组内某账号的实例被封号或没余额时，可用相同配置在组内另一账号重建替换。
+// 与权限组 Group 无关。
+type AccountGroup struct {
+	ID        int    `json:"id"`
+	UserID    int    `json:"user_id"`
+	Name      string `json:"name"`
+	TokenIDs  []int  `json:"token_ids"`  // 组内账号(Token) id，升序
+	CreatedAt string `json:"created_at"` // RFC3339
+}
+
 // Masked renders a token for display: last 4 chars visible.
 func Masked(t string) string {
 	if len(t) <= 4 {
