@@ -141,6 +141,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/account/options", s.requireAuth(store.PermPower, s.handleAccountOptions))
 	mux.HandleFunc("POST /api/account/instances", s.requireAuth(store.PermPower, s.handleCreateInstance))
 
+	// 账号组：任何登录用户管理自己的账号组与成员。
+	mux.HandleFunc("GET /api/account/groups", s.requireAuth("", s.handleListAccountGroups))
+	mux.HandleFunc("POST /api/account/groups", s.requireAuth("", s.handleCreateAccountGroup))
+	mux.HandleFunc("PUT /api/account/groups/{gid}", s.requireAuth("", s.handleUpdateAccountGroup))
+	mux.HandleFunc("DELETE /api/account/groups/{gid}", s.requireAuth("", s.handleDeleteAccountGroup))
+	mux.HandleFunc("POST /api/account/groups/{gid}/tokens", s.requireAuth("", s.handleAddAccountGroupMember))
+	mux.HandleFunc("DELETE /api/account/groups/{gid}/tokens/{tid}", s.requireAuth("", s.handleRemoveAccountGroupMember))
+
 	// View permission.
 	mux.HandleFunc("GET /api/instances", s.requireAuth(store.PermView, s.handleListInstances))
 	mux.HandleFunc("GET /api/instances/{id}/refresh", s.requireAuth(store.PermView, s.handleInstanceRefresh))
