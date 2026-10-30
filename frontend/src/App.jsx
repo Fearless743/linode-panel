@@ -18,12 +18,14 @@ const Tasks = lazy(() => import("./pages/Tasks"));
 const Users = lazy(() => import("./pages/Users"));
 const Agents = lazy(() => import("./pages/Agents"));
 const Accounts = lazy(() => import("./pages/Accounts"));
+const AccountGroups = lazy(() => import("./pages/AccountGroups"));
 
 // 路由路径 → 页面名（用于 document.title）。
 const PAGE_TITLES = {
   "/login": "登录",
   "/": "实例",
   "/accounts": "账号管理",
+  "/account-groups": "账号组",
   "/ssh-keys": "SSH 公钥",
   "/tasks": "重建任务",
   "/users": "用户管理",
@@ -63,6 +65,7 @@ export default function App() {
               <Route path="/users" element={<Users />} />
               <Route path="/agents" element={<Agents />} />
               <Route path="/accounts" element={<Accounts />} />
+              <Route path="/account-groups" element={<AccountGroups />} />
             </Route>
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

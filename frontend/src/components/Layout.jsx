@@ -10,6 +10,7 @@ function Sidebar() {
   const links = [
     { to: "/", label: "实例", perm: "view" },
     { to: "/accounts", label: "账号管理", perm: null },
+    { to: "/account-groups", label: "账号组", perm: null },
     { to: "/ssh-keys", label: "SSH 公钥", perm: "view" },
     { to: "/tasks", label: "重建任务", perm: "rebuild" },
     { to: "/users", label: "用户管理", perm: "admin" },
