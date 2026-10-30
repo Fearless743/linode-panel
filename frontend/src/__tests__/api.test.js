@@ -20,6 +20,12 @@ import {
   listAgentCommands,
   listAccountAgents,
   setAccountAgent,
+  listAccountGroups,
+  createAccountGroup,
+  renameAccountGroup,
+  deleteAccountGroup,
+  addAccountGroupToken,
+  removeAccountGroupToken,
 } from "../api";
 
 function mockResponse(body, { ok = true, status = 200 } = {}) {
@@ -327,5 +333,83 @@ describe("端点封装", () => {
     const [url, opts] = await lastCall();
     expect(url).toBe("/api/account/tokens/7/agent");
     expect(JSON.parse(opts.body)).toEqual({ agent_id: 0 });
+  });
+
+  it("listAccountGroups GET /api/account/groups 并透传返回值", async () => {
+    const data = {
+      groups: [{ id: 1, user_id: 2, name: "g1", token_ids: [3], created_at: "2026-01-01" }],
+    };
+    vi.mocked(fetch).mockResolvedValue(mockResponse(data));
+    await expect(listAccountGroups()).resolves.toEqual(data);
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups");
+    expect(opts.method).toBeUndefined();
+  });
+
+  it("createAccountGroup POST /api/account/groups 带 name", async () => {
+    const group = { id: 1, user_id: 2, name: "g1", token_ids: [], created_at: "2026-01-01" };
+    vi.mocked(fetch).mockResolvedValue(mockResponse(group, { status: 201 }));
+    await expect(createAccountGroup("g1")).resolves.toEqual(group);
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual({ name: "g1" });
+  });
+
+  it("renameAccountGroup PUT 编码 groupId 并带 name", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(renameAccountGroup("g/1", "new")).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups/g%2F1");
+    expect(opts.method).toBe("PUT");
+    expect(JSON.parse(opts.body)).toEqual({ name: "new" });
+  });
+
+  it("deleteAccountGroup DELETE 编码 groupId", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(deleteAccountGroup("g 1")).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups/g%201");
+    expect(opts.method).toBe("DELETE");
+    expect(opts.body).toBeUndefined();
+  });
+
+  it("addAccountGroupToken POST 编码 groupId 并带 token_id", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(addAccountGroupToken(1, "t/2")).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups/1/tokens");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual({ token_id: "t/2" });
+  });
+
+  it("removeAccountGroupToken DELETE 编码 groupId 与 tokenId", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(removeAccountGroupToken("g 1", "t/2")).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/account/groups/g%201/tokens/t%2F2");
+    expect(opts.method).toBe("DELETE");
+  });
+
+  it("账号组端点非 2xx 时抛 ApiError", async () => {
+    const failing = { ok: false, status: 400 };
+    vi.mocked(fetch).mockResolvedValue(
+      mockResponse({ error: "bad group" }, failing)
+    );
+    const cases = [
+      () => listAccountGroups(),
+      () => createAccountGroup("g"),
+      () => renameAccountGroup(1, "g"),
+      () => deleteAccountGroup(1),
+      () => addAccountGroupToken(1, 2),
+      () => removeAccountGroupToken(1, 2),
+    ];
+    for (const call of cases) {
+      await expect(call()).rejects.toMatchObject({
+        name: "ApiError",
+        status: 400,
+        message: "bad group",
+      });
+    }
   });
 });

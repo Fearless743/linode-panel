@@ -288,3 +288,45 @@ export function setAccountAgent(tokenId, agentId) {
     { agent_id: agentId }
   );
 }
+
+// ---------- 账号组 ----------
+// 账号组：把多个账号（token）绑定成组；组内某账号实例被封号/无余额时，
+// 可用相同配置在组内另一账号重建替换。
+// 组对象：{ id, user_id, name, token_ids: [], created_at }
+export function listAccountGroups() {
+  return apiFetch("/api/account/groups");
+}
+
+// 新建账号组，返回创建好的组对象。
+export function createAccountGroup(name) {
+  return jsonRequest("/api/account/groups", "POST", { name });
+}
+
+// 重命名账号组。
+export function renameAccountGroup(groupId, name) {
+  return jsonRequest("/api/account/groups/" + encodeURIComponent(groupId), "PUT", { name });
+}
+
+export function deleteAccountGroup(groupId) {
+  return apiFetch("/api/account/groups/" + encodeURIComponent(groupId), { method: "DELETE" });
+}
+
+// 把账号（token）加入账号组。
+export function addAccountGroupToken(groupId, tokenId) {
+  return jsonRequest(
+    "/api/account/groups/" + encodeURIComponent(groupId) + "/tokens",
+    "POST",
+    { token_id: tokenId }
+  );
+}
+
+// 把账号（token）移出账号组。
+export function removeAccountGroupToken(groupId, tokenId) {
+  return apiFetch(
+    "/api/account/groups/" +
+      encodeURIComponent(groupId) +
+      "/tokens/" +
+      encodeURIComponent(tokenId),
+    { method: "DELETE" }
+  );
+}
