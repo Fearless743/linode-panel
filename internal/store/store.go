@@ -136,6 +136,18 @@ CREATE TABLE IF NOT EXISTS instance_cache (
 	updated     TEXT NOT NULL DEFAULT '',
 	fetched_at  TEXT NOT NULL,
 	PRIMARY KEY (token_id, instance_id)
+);
+CREATE TABLE IF NOT EXISTS account_groups (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id    INTEGER NOT NULL,
+	name       TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT '',
+	UNIQUE(user_id, name)
+);
+CREATE TABLE IF NOT EXISTS account_group_members (
+	group_id INTEGER NOT NULL,
+	token_id INTEGER NOT NULL,
+	PRIMARY KEY (group_id, token_id)
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化表结构: %w", err)
