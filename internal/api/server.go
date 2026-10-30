@@ -73,6 +73,14 @@ type Server struct {
 	// without configuring a registration code.
 	localAgentKey []byte
 
+	// AutoRebuildCheckAPI overrides the China-side probe URL used by the
+	// auto-rebuild monitor (empty = DefaultBlockCheckAPI).
+	AutoRebuildCheckAPI string
+
+	// monitor is the running auto-rebuild background monitor (nil until
+	// StartAutoRebuildMonitor is called). Handlers use it for on-demand checks.
+	monitor *AutoRebuildMonitor
+
 	clientMu sync.Mutex
 	clients  map[string]*linode.Client
 }
@@ -152,6 +160,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/instances/{id}/rebuild", s.requireAuth(store.PermRebuild, s.handleRebuild))
 	mux.HandleFunc("GET /api/rebuild/tasks", s.requireAuth(store.PermRebuild, s.handleRebuildTasks))
 	mux.HandleFunc("GET /api/rebuild/tasks/{id}", s.requireAuth(store.PermRebuild, s.handleRebuildTask))
+
+	// 被墙后自动重建换 IP（按实例配置）。
+	mux.HandleFunc("GET /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleGetAutoRebuild))
+	mux.HandleFunc("PUT /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handlePutAutoRebuild))
+	mux.HandleFunc("DELETE /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleDeleteAutoRebuild))
+	mux.HandleFunc("POST /api/instances/{id}/auto-rebuild/check", s.requireAuth(store.PermRebuild, s.handleCheckAutoRebuild))
+	mux.HandleFunc("GET /api/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleAutoRebuildList))
 
 	// Admin permission (users, groups & agents).
 	mux.HandleFunc("GET /api/users", s.requireAuth(store.PermAdmin, s.handleListUsers))

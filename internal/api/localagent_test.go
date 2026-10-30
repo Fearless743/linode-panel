@@ -142,6 +142,50 @@ func TestRenameRejectsRemoteAgent(t *testing.T) {
 	wantStatus(t, rr2, http.StatusBadRequest)
 }
 
+// TestRenameManualAgent verifies agents created from the panel UI can be
+// renamed (the panel owns their name), while still not being the self-agent.
+func TestRenameManualAgent(t *testing.T) {
+	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{})
+	if err := srv.Store.SetRegCode("regcode-1"); err != nil {
+		t.Fatalf("SetRegCode: %v", err)
+	}
+	// No self-agent: renaming must still work for a manually created agent.
+	rr := authedPost(t, srv, cookie, "/api/agents", `{"name":"manual-1"}`)
+	wantStatus(t, rr, http.StatusOK)
+	var created struct {
+		AgentID int `json:"agent_id"`
+	}
+	decodeJSON(t, rr, &created)
+
+	rr2 := authedPut(t, srv, cookie, "/api/agents/"+strconv.Itoa(created.AgentID)+"/name", `{"name":"机房A"}`)
+	wantStatus(t, rr2, http.StatusOK)
+	if agent, _ := srv.Hub.Agent(created.AgentID); agent.Name != "机房A" {
+		t.Fatalf("manual agent name = %q, want 机房A", agent.Name)
+	}
+
+	// The list endpoint flags it as manual.
+	list := authedGet(t, srv, cookie, "/api/agents")
+	wantStatus(t, list, http.StatusOK)
+	var resp struct {
+		Agents []struct {
+			ID     int  `json:"id"`
+			Manual bool `json:"manual"`
+			Local  bool `json:"local"`
+		} `json:"agents"`
+	}
+	decodeJSON(t, list, &resp)
+	if len(resp.Agents) != 1 || !resp.Agents[0].Manual || resp.Agents[0].Local {
+		t.Fatalf("agents = %+v, want one manual non-local agent", resp.Agents)
+	}
+
+	// Empty names are rejected for manual agents too.
+	rr3 := authedPut(t, srv, cookie, "/api/agents/"+strconv.Itoa(created.AgentID)+"/name", `{"name":"  "}`)
+	wantStatus(t, rr3, http.StatusBadRequest)
+	if agent, _ := srv.Hub.Agent(created.AgentID); agent.Name != "机房A" {
+		t.Fatalf("name changed after rejected rename: %q", agent.Name)
+	}
+}
+
 func TestSelfAgentExecutesPower(t *testing.T) {
 	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{
 		"pat1": {{ID: 7, Label: "web", Status: "running", IPv4: []string{"10.0.0.1"}}},

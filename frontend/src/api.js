@@ -167,6 +167,34 @@ export function getRebuildTask(id) {
   return apiFetch("/api/rebuild/tasks/" + encodeURIComponent(id));
 }
 
+// ---------- 被墙后自动重建换 IP ----------
+export function getAutoRebuild(id) {
+  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild");
+}
+
+// payload: { enabled, port, threshold, interval_seconds, token_id }
+export function setAutoRebuild(id, payload) {
+  return jsonRequest("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild", "PUT", payload);
+}
+
+export function deleteAutoRebuild(id) {
+  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild", {
+    method: "DELETE",
+  });
+}
+
+// 立即探测一次并返回最新状态。
+export function checkAutoRebuild(id) {
+  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild/check", {
+    method: "POST",
+  });
+}
+
+// 已配置自动换 IP 的实例列表（用于行内标记）。
+export function listAutoRebuild() {
+  return apiFetch("/api/auto-rebuild");
+}
+
 // ---------- 用户 / Token ----------
 export function listUsers() {
   return apiFetch("/api/users");

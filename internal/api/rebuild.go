@@ -97,16 +97,18 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 		Region:         old.Region,
 		Type:           old.Type,
 		Image:          old.Image,
+		Label:          old.Label,
 		AuthorizedKeys: []string{pubKey},
 		Booted:         &booted,
 	}
-	m.log(t, "step 4: create new instance (region=%s type=%s image=%s)", old.Region, old.Type, old.Image)
+	m.log(t, "step 4: create new instance (region=%s type=%s image=%s label=%s)", old.Region, old.Type, old.Image, old.Label)
 	newInst, err := api.CreateInstance(ctx, createOpts)
 	if err != nil {
 		m.fail(t, fmt.Errorf("创建新实例失败: %w", err))
 		return
 	}
 	newID := newInst.ID
+	m.setNewInstanceID(t, newID)
 
 	m.log(t, "step 5: wait for instance %d to be running", newID)
 	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
@@ -174,9 +176,12 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 		m.fail(t, fmt.Errorf("新实例没有可用的公网 IP"))
 		return
 	}
+	m.mu.Lock()
+	sshPort := m.sshPort
+	m.mu.Unlock()
 	res, runErr := m.RunFn(ctx, sshrun.Options{
 		Host:               host,
-		Port:               m.sshPort,
+		Port:               sshPort,
 		PrivateKey:         privPEM,
 		InsecureSkipVerify: true,
 		Timeout:            5 * time.Minute,
@@ -243,7 +248,10 @@ func (m *Manager) waitStatus(t *Task, api LinodeAPI, ctx context.Context, id int
 // probeHost is the default ProbeFn: a TCP dial to host at the Manager's
 // configured SSH port, bounded by sshProbeTimeout.
 func (m *Manager) probeHost(ctx context.Context, host string) error {
-	return probe(ctx, host, m.sshPort)
+	m.mu.Lock()
+	port := m.sshPort
+	m.mu.Unlock()
+	return probe(ctx, host, port)
 }
 
 // probe attempts a TCP connection to host:port within sshProbeTimeout.
@@ -285,11 +293,7 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	// 脚本解析顺序：请求体显式提供 → 该实例已配置的脚本 → 内置默认脚本。
 	script := req.Script
 	if script == "" {
-		if s2, ok := s.Store.InstanceScript(id); ok && s2 != "" {
-			script = s2
-		} else {
-			script = DefaultBootScript
-		}
+		script = s.rebuildScriptFor(id)
 	}
 	if script == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "开机脚本不能为空"})

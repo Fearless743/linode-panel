@@ -18,6 +18,7 @@ import ActionModal from "../components/instances/ActionModal";
 import RebuildModal from "../components/instances/RebuildModal";
 import CreateInstanceModal from "../components/instances/CreateInstanceModal";
 import InstanceScriptModal from "../components/InstanceScriptModal";
+import AutoRebuildModal from "../components/instances/AutoRebuildModal";
 
 export default function Instances() {
   const { hasPerm } = useAuth();
@@ -31,6 +32,9 @@ export default function Instances() {
   const [rebuildModal, setRebuildModal] = useState(null); // inst
   const [scriptModal, setScriptModal] = useState(null); // inst
   const [customScriptIds, setCustomScriptIds] = useState(() => new Set());
+  // 已开启「被墙后自动换 IP」的实例 id 集合（用于行内标记）。
+  const [autoRebuildIds, setAutoRebuildIds] = useState(() => new Set());
+  const [autoRebuildModal, setAutoRebuildModal] = useState(null); // inst
   const [tokens, setTokens] = useState([]); // 已绑定账号（PAT），用于创建实例
   const [createOpen, setCreateOpen] = useState(false); // 创建实例模态框
 
@@ -60,6 +64,18 @@ export default function Instances() {
     }
   }, [hasPerm]);
 
+  // 哪些实例开启了「被墙后自动换 IP」（用于行内标记）。
+  const loadAutoRebuildStatus = useCallback(async () => {
+    if (!hasPerm("rebuild")) return;
+    try {
+      const data = await apiFetch("/api/auto-rebuild");
+      const items = Array.isArray(data.auto_rebuild) ? data.auto_rebuild : [];
+      setAutoRebuildIds(new Set(items.filter((i) => i.enabled).map((i) => i.instance_id)));
+    } catch {
+      // 标记加载失败可忽略：自动换 IP 按钮仍可点击。
+    }
+  }, [hasPerm]);
+
   // 已绑定账号（PAT）：供创建实例模态框选择目标账号。
   const loadTokens = useCallback(async () => {
     try {
@@ -82,12 +98,13 @@ export default function Instances() {
       resetRowStates();
       bump();
       loadScriptStatus();
+      loadAutoRebuildStatus();
     } catch (err) {
       showBanner("加载失败：" + (err.message || "未知错误"), false);
     } finally {
       setLoading(false);
     }
-  }, [hideBanner, showBanner, loadScriptStatus, resetRowStates, bump]);
+  }, [hideBanner, showBanner, loadScriptStatus, loadAutoRebuildStatus, resetRowStates, bump]);
 
   // 重建任务运行中时轮询任务列表，以更新重建按钮可用状态。
   const checkRebuildTasks = useCallback(async () => {
@@ -213,10 +230,12 @@ export default function Instances() {
           getRowState={getRowState}
           rebuildTaskRunning={rebuildTaskRunning}
           customScriptIds={customScriptIds}
+          autoRebuildIds={autoRebuildIds}
           hasPerm={hasPerm}
           onAction={(inst, action) => setActionModal({ inst, action })}
           onRebuild={(inst) => setRebuildModal(inst)}
           onScript={(inst) => setScriptModal(inst)}
+          onAutoRebuild={(inst) => setAutoRebuildModal(inst)}
           onRefresh={refreshRow}
         />
       )}
@@ -243,6 +262,13 @@ export default function Instances() {
           inst={scriptModal}
           onClose={() => setScriptModal(null)}
           onChanged={loadScriptStatus}
+        />
+      )}
+      {autoRebuildModal && (
+        <AutoRebuildModal
+          inst={autoRebuildModal}
+          onClose={() => setAutoRebuildModal(null)}
+          onChanged={loadAutoRebuildStatus}
         />
       )}
       {createOpen && (

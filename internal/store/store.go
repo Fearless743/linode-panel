@@ -105,6 +105,22 @@ CREATE TABLE IF NOT EXISTS instance_scripts (
 	instance_id INTEGER PRIMARY KEY,
 	script      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS instance_auto_rebuild (
+	instance_id     INTEGER PRIMARY KEY,
+	user_id         INTEGER NOT NULL DEFAULT 0,
+	token_id        INTEGER NOT NULL DEFAULT 0,
+	enabled         INTEGER NOT NULL DEFAULT 0,
+	port            INTEGER NOT NULL DEFAULT 22,
+	threshold       INTEGER NOT NULL DEFAULT 3,
+	interval_sec    INTEGER NOT NULL DEFAULT 300,
+	fail_count      INTEGER NOT NULL DEFAULT 0,
+	last_status     TEXT NOT NULL DEFAULT '',
+	last_detail     TEXT NOT NULL DEFAULT '',
+	last_check_at   TEXT NOT NULL DEFAULT '',
+	last_blocked_at TEXT NOT NULL DEFAULT '',
+	last_task_id    TEXT NOT NULL DEFAULT '',
+	updated_at      TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS instance_cache (
 	token_id    INTEGER NOT NULL,
 	instance_id INTEGER NOT NULL,

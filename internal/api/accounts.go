@@ -153,8 +153,14 @@ func (s *Server) handleAccountOptions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "查询镜像失败: " + err.Error()})
 		return
 	}
-	// 按 id 字母升序排序，保证前端下拉框顺序稳定。
-	slices.SortFunc(regions, func(a, b linode.Region) int { return strings.Compare(a.ID, b.ID) })
+	// regions 按国家(country)升序排序，同国家内再按 id 升序保证顺序稳定；
+	// types/images 按 id 字母升序排序。均保证前端下拉框顺序稳定。
+	slices.SortFunc(regions, func(a, b linode.Region) int {
+		if c := strings.Compare(a.Country, b.Country); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
 	slices.SortFunc(types, func(a, b linode.LinodeType) int { return strings.Compare(a.ID, b.ID) })
 	slices.SortFunc(images, func(a, b linode.Image) int { return strings.Compare(a.ID, b.ID) })
 	writeJSON(w, http.StatusOK, map[string]any{

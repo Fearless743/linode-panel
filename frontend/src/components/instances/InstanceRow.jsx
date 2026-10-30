@@ -10,10 +10,12 @@ export default function InstanceRow({
   st,
   rebuildTaskRunning,
   hasCustomScript,
+  autoRebuildEnabled,
   hasPerm,
   onAction,
   onRebuild,
   onScript,
+  onAutoRebuild,
   onRefresh,
 }) {
   const status = st.lastStatus || inst.status;
@@ -99,6 +101,23 @@ export default function InstanceRow({
           onClick={() => onScript(inst)}
         >
           {hasCustomScript ? "脚本 •" : "脚本"}
+        </button>
+      );
+    }
+    if (hasPerm("rebuild")) {
+      buttons.push(
+        <button
+          key="auto-rebuild"
+          className={autoRebuildEnabled ? "action-btn primary" : "action-btn"}
+          type="button"
+          title={
+            autoRebuildEnabled
+              ? "已开启：被墙后自动删机重建换 IP"
+              : "被墙后自动删机重建换 IP"
+          }
+          onClick={() => onAutoRebuild(inst)}
+        >
+          {autoRebuildEnabled ? "自动换IP •" : "自动换IP"}
         </button>
       );
     }

@@ -63,4 +63,8 @@ type Agent struct {
 	TokenHash string `json:"-"` // sha256 hex; token itself is shown once at register
 	Hostname  string `json:"hostname,omitempty"`
 	LastSeen  string `json:"last_seen,omitempty"`
+	// Manual marks an agent created from the panel UI (新增 Agent) rather than
+	// self-registered by an agent process. The panel owns such an agent's name,
+	// so it can be renamed like the panel's own self-agent.
+	Manual bool `json:"-"`
 }

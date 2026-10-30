@@ -232,3 +232,14 @@
   text-align: right;
   white-space: nowrap;
 }
+
+/* ---------- 被墙后自动换 IP 配置弹窗 ---------- */
+.auto-rebuild-state {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}

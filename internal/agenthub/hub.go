@@ -117,6 +117,20 @@ func (h *Hub) Rename(id int, name string) bool {
 	return true
 }
 
+// MarkManual flags an agent as created from the panel UI (rather than
+// self-registered by an agent process), so the panel may rename it. Unknown
+// IDs return false.
+func (h *Hub) MarkManual(id int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	a, ok := h.agents[id]
+	if !ok {
+		return false
+	}
+	a.Manual = true
+	return true
+}
+
 // Agents returns all agents ordered by ID ascending.
 func (h *Hub) Agents() []Agent {
 	h.mu.Lock()

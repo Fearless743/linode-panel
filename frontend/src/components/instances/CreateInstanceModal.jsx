@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import Modal from "../Modal";
 import { apiFetch, jsonRequest } from "../../api";
+import { regionLabel, typeLabel } from "../../utils/linodeLabels";
 
 // ---------- 创建实例模态框 ----------
 // 账号切换时加载可用的 region / type / image 选项。
@@ -121,7 +122,7 @@ export default function CreateInstanceModal({ tokens, onClose, onCreated }) {
               <option value="">选择地区…</option>
               {options.regions.map((r) => (
                 <option key={r.id} value={r.id}>
-                  {r.label || r.id}
+                  {regionLabel(r.id, r.label)}
                 </option>
               ))}
             </select>
@@ -137,7 +138,7 @@ export default function CreateInstanceModal({ tokens, onClose, onCreated }) {
               <option value="">选择机型…</option>
               {options.types.map((t) => (
                 <option key={t.id} value={t.id}>
-                  {t.label || t.id}
+                  {typeLabel(t.id, t.label)}
                 </option>
               ))}
             </select>

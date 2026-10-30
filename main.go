@@ -36,6 +36,9 @@ func main() {
 	agentCode := flag.String("agent-code", "", "初始 agent 注册码（可选；若数据库已有注册码则优先使用）")
 	selfAgent := flag.Bool("self-agent", true, "面板自身也作为 agent：注册一个本地面板 agent，使经 agent 操作可由面板进程直接执行")
 	selfAgentName := flag.String("self-agent-name", "本地面板", "本地面板 agent 的名称（配合 --self-agent 使用；后台重命名后默认沿用持久化的名称）")
+	autoRebuild := flag.Bool("auto-rebuild", true, "启用「被墙后自动删机重建换 IP」后台监测")
+	autoRebuildTick := flag.Duration("auto-rebuild-tick", time.Minute, "自动换 IP 监听的轮询间隔（每个实例仍按自身配置的检测间隔探测）")
+	autoRebuildCheckAPI := flag.String("auto-rebuild-check-api", defaultAutoRebuildCheckAPI(), "国产 IP 连通性探测接口（被墙判定用，环境变量 AUTO_REBUILD_CHECK_API）")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -63,6 +66,7 @@ func main() {
 	apiSrv := api.New(client, st)
 	apiSrv.SSHPort = *sshPort
 	apiSrv.APIBase = *apiBase
+	apiSrv.AutoRebuildCheckAPI = *autoRebuildCheckAPI
 	apiSrv.Tasks.APIBase = *apiBase
 	apiSrv.Tasks.SetSSHPort(*sshPort)
 
@@ -70,6 +74,13 @@ func main() {
 	// 该 agent 与远程 agent 一样出现在 Agent 列表中，可被账号绑定。
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
+
+	// 被墙后自动删机重建换 IP 的后台监测。
+	if *autoRebuild {
+		apiSrv.StartAutoRebuildMonitor(rootCtx, *autoRebuildTick)
+		log.Info("自动换 IP 监测已启动", "tick", autoRebuildTick.String(), "check_api", *autoRebuildCheckAPI)
+	}
+
 	if *selfAgent {
 		// 名称优先级：命令行显式指定的 --self-agent-name > 后台重命名
 		// 持久化的名称 > 默认「本地面板」。
@@ -161,6 +172,15 @@ func defaultAPIPrefix() string {
 		return v
 	}
 	return "https://api.linode.com/v4"
+}
+
+// defaultAutoRebuildCheckAPI returns the China-side reachability probe used by
+// the auto-rebuild monitor, overridable via AUTO_REBUILD_CHECK_API.
+func defaultAutoRebuildCheckAPI() string {
+	if v := strings.TrimSpace(os.Getenv("AUTO_REBUILD_CHECK_API")); v != "" {
+		return v
+	}
+	return api.DefaultBlockCheckAPI
 }
 
 // defaultStatePath returns the default SQLite database location under the

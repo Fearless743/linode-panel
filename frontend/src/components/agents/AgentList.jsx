@@ -1,5 +1,6 @@
 // Agent 列表：新增按钮（弹窗）+ 表格（名称 / hostname / 最近心跳 / 待执行 / 重命名 / 删除）。
 // 删除使用 ConfirmDialog 确认；本地面板 Agent 可重命名、不可删除。
+// 手动创建的 Agent（manual）同样可重命名，且可删除；远程自注册 Agent 仅可删除。
 // onCreate / onDelete / onRename 由页面编排（API 调用 + 刷新）。
 import { useState } from "react";
 import Button from "../ui/Button.jsx";
@@ -38,17 +39,24 @@ export default function AgentList({ agents, onCreate, onDelete, onRename }) {
                 <td>
                   {a.name}
                   {a.local && <span className="tag tag-local">本地</span>}
+                  {a.manual && <span className="tag tag-local">手动</span>}
                 </td>
                 <td className="agents-muted">{a.hostname || "—"}</td>
                 <td className="agents-muted">{fmtDateTime(a.last_seen)}</td>
                 <td className="agents-muted">{String(a.pending || 0)}</td>
                 <td>
-                  {a.local ? (
+                  {a.local || a.manual ? (
                     <div className="actions">
                       <Button variant="ghost" onClick={() => setRenaming(a)}>
                         重命名
                       </Button>
-                      <span className="agents-muted">内置</span>
+                      {a.local ? (
+                        <span className="agents-muted">内置</span>
+                      ) : (
+                        <Button variant="ghost" className="btn-danger" onClick={() => setPending(a)}>
+                          删除
+                        </Button>
+                      )}
                     </div>
                   ) : (
                     <Button variant="ghost" className="btn-danger" onClick={() => setPending(a)}>

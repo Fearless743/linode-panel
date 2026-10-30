@@ -6,10 +6,12 @@ export default function InstanceTable({
   getRowState,
   rebuildTaskRunning,
   customScriptIds,
+  autoRebuildIds,
   hasPerm,
   onAction,
   onRebuild,
   onScript,
+  onAutoRebuild,
   onRefresh,
 }) {
   return (
@@ -32,10 +34,12 @@ export default function InstanceTable({
               st={getRowState(inst.id)}
               rebuildTaskRunning={rebuildTaskRunning}
               hasCustomScript={customScriptIds.has(inst.id)}
+              autoRebuildEnabled={autoRebuildIds.has(inst.id)}
               hasPerm={hasPerm}
               onAction={onAction}
               onRebuild={onRebuild}
               onScript={onScript}
+              onAutoRebuild={onAutoRebuild}
               onRefresh={onRefresh}
             />
           ))}

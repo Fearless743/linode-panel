@@ -1,0 +1,133 @@
+// Linode 地区 / 机型 ID → 中文展示名。
+// 映射按 Linode API 的 /v4/regions 与 /v4/linode/types 目录维护；
+// 未收录的新 ID 回退到调用方传入的标签（通常是 API 返回的 label），最后回退到原始 ID。
+
+// ---------- 地区 ----------
+export const REGION_LABELS = {
+  "ap-northeast": "东京 2（日本）",
+  "ap-south": "新加坡",
+  "ap-southeast": "悉尼（澳大利亚）",
+  "ap-west": "孟买（印度）",
+  "au-mel": "墨尔本（澳大利亚）",
+  "br-gru": "圣保罗（巴西）",
+  "ca-central": "多伦多（加拿大）",
+  "de-fra-2": "法兰克福 2（德国）",
+  "es-mad": "马德里（西班牙）",
+  "eu-central": "法兰克福（德国）",
+  "eu-west": "伦敦（英国）",
+  "fr-par": "巴黎（法国）",
+  "fr-par-2": "巴黎 2（法国）",
+  "gb-lon": "伦敦 2（英国）",
+  "id-cgk": "雅加达（印度尼西亚）",
+  "in-bom-2": "孟买 2（印度）",
+  "in-maa": "金奈（印度）",
+  "it-mil": "米兰（意大利）",
+  "jp-osa": "大阪（日本）",
+  "jp-tyo-3": "东京 3（日本）",
+  "nl-ams": "阿姆斯特丹（荷兰）",
+  "se-sto": "斯德哥尔摩（瑞典）",
+  "sg-sin-2": "新加坡 2",
+  "us-central": "达拉斯（美国·得州）",
+  "us-east": "纽瓦克（美国·新泽西）",
+  "us-iad": "华盛顿特区（美国）",
+  "us-iad-2": "华盛顿 2（美国）",
+  "us-lax": "洛杉矶（美国·加州）",
+  "us-mia": "迈阿密（美国·佛罗里达）",
+  "us-ord": "芝加哥（美国·伊利诺伊）",
+  "us-sea": "西雅图（美国·华盛顿州）",
+  "us-southeast": "亚特兰大（美国·佐治亚）",
+  "us-west": "弗里蒙特（美国·加州）",
+};
+
+// ---------- 机型 ----------
+// 展示名 = 类别 + 内存（部分带 GPU / 加速卡型号与核数），便于在列表里快速辨认。
+export const TYPE_LABELS = {
+  "g6-nanode-1": "入门型 1GB",
+  "g6-standard-1": "标准型 2GB",
+  "g6-standard-2": "标准型 4GB",
+  "g6-standard-4": "标准型 8GB",
+  "g6-standard-6": "标准型 16GB",
+  "g6-standard-8": "标准型 32GB",
+  "g6-standard-16": "标准型 64GB",
+  "g6-standard-20": "标准型 96GB",
+  "g6-standard-24": "标准型 128GB",
+  "g6-standard-32": "标准型 192GB",
+  "g6-dedicated-2": "独享型 4GB",
+  "g6-dedicated-4": "独享型 8GB",
+  "g6-dedicated-8": "独享型 16GB",
+  "g6-dedicated-16": "独享型 32GB",
+  "g6-dedicated-32": "独享型 64GB",
+  "g6-dedicated-48": "独享型 96GB",
+  "g6-dedicated-50": "独享型 128GB",
+  "g6-dedicated-56": "独享型 256GB",
+  "g7-dedicated-4-2": "独享型 4GB / 2 核",
+  "g7-dedicated-8-4": "独享型 8GB / 4 核",
+  "g7-dedicated-16-8": "独享型 16GB / 8 核",
+  "g7-dedicated-32-16": "独享型 32GB / 16 核",
+  "g7-dedicated-64-32": "独享型 64GB / 32 核",
+  "g7-dedicated-96-48": "独享型 96GB / 48 核",
+  "g7-dedicated-128-50": "独享型 128GB / 50 核",
+  "g7-dedicated-256-56": "独享型 256GB / 56 核",
+  "g8-dedicated-4-2": "独享型 4GB / 2 核",
+  "g8-dedicated-8-2": "独享型 8GB / 2 核",
+  "g8-dedicated-8-4": "独享型 8GB / 4 核",
+  "g8-dedicated-16-4": "独享型 16GB / 4 核",
+  "g8-dedicated-16-8": "独享型 16GB / 8 核",
+  "g8-dedicated-32-8": "独享型 32GB / 8 核",
+  "g8-dedicated-32-16": "独享型 32GB / 16 核",
+  "g8-dedicated-64-16": "独享型 64GB / 16 核",
+  "g8-dedicated-64-32": "独享型 64GB / 32 核",
+  "g8-dedicated-96-24": "独享型 96GB / 24 核",
+  "g8-dedicated-96-48": "独享型 96GB / 48 核",
+  "g8-dedicated-128-32": "独享型 128GB / 32 核",
+  "g8-dedicated-128-64": "独享型 128GB / 64 核",
+  "g8-dedicated-256-64": "独享型 256GB / 64 核",
+  "g8-dedicated-256-128": "独享型 256GB / 128 核",
+  "g8-dedicated-512-128": "独享型 512GB / 128 核",
+  "g8-dedicated-512-256": "独享型 512GB / 256 核",
+  "g7-highmem-1": "高内存型 24GB",
+  "g7-highmem-2": "高内存型 48GB",
+  "g7-highmem-4": "高内存型 90GB",
+  "g7-highmem-8": "高内存型 150GB",
+  "g7-highmem-16": "高内存型 300GB",
+  "g7-premium-2": "高级型 4GB",
+  "g7-premium-4": "高级型 8GB",
+  "g7-premium-8": "高级型 16GB",
+  "g7-premium-16": "高级型 32GB",
+  "g7-premium-32": "高级型 64GB",
+  "g7-premium-48": "高级型 96GB",
+  "g7-premium-50": "高级型 128GB",
+  "g7-premium-56": "高级型 256GB",
+  "g1-gpu-rtx6000-1": "GPU 型 32GB（RTX 6000 ×1）",
+  "g1-gpu-rtx6000-2": "GPU 型 64GB（RTX 6000 ×2）",
+  "g1-gpu-rtx6000-3": "GPU 型 96GB（RTX 6000 ×3）",
+  "g1-gpu-rtx6000-4": "GPU 型 128GB（RTX 6000 ×4）",
+  "g2-gpu-rtx4000a1-s": "GPU 型 16GB（RTX 4000 Ada ×1 小）",
+  "g2-gpu-rtx4000a1-m": "GPU 型 32GB（RTX 4000 Ada ×1 中）",
+  "g2-gpu-rtx4000a1-l": "GPU 型 64GB（RTX 4000 Ada ×1 大）",
+  "g2-gpu-rtx4000a1-xl": "GPU 型 128GB（RTX 4000 Ada ×1 超大）",
+  "g2-gpu-rtx4000a2-s": "GPU 型 32GB（RTX 4000 Ada ×2 小）",
+  "g2-gpu-rtx4000a2-m": "GPU 型 64GB（RTX 4000 Ada ×2 中）",
+  "g2-gpu-rtx4000a2-hs": "GPU 型 64GB（RTX 4000 Ada ×2 中·高存储）",
+  "g2-gpu-rtx4000a4-s": "GPU 型 128GB（RTX 4000 Ada ×4 小）",
+  "g2-gpu-rtx4000a4-m": "GPU 型 196GB（RTX 4000 Ada ×4 中）",
+  "g1-accelerated-netint-vpu-t1u1-s": "加速型 16GB（NETINT Quadra T1U ×1 小）",
+  "g1-accelerated-netint-vpu-t1u1-m": "加速型 24GB（NETINT Quadra T1U ×1 中）",
+  "g1-accelerated-netint-vpu-t1u2-s": "加速型 24GB（NETINT Quadra T1U ×2 小）",
+  "g1-accelerated-netint-vpu-t1u8-s": "加速型 96GB（NETINT Quadra T1U ×8 小）",
+  "g1-accelerated-netint-vpu-t1u8-m": "加速型 128GB（NETINT Quadra T1U ×8 中）",
+  "g1-accelerated-netint-vpu-t1u8-l": "加速型 192GB（NETINT Quadra T1U ×8 大）",
+};
+
+// regionLabel 返回地区的中文名；映射缺失时使用 fallback（通常是 API 的 label），
+// 最后回退到原始 ID，保证界面不会出现空白。
+export function regionLabel(id, fallback) {
+  if (!id) return fallback || "";
+  return REGION_LABELS[id] || fallback || id;
+}
+
+// typeLabel 返回机型的中文名，回退规则同 regionLabel。
+export function typeLabel(id, fallback) {
+  if (!id) return fallback || "";
+  return TYPE_LABELS[id] || fallback || id;
+}

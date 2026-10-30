@@ -109,25 +109,29 @@ func (s *Server) handleAgentResult(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListAgents returns all registered agents with pending command counts.
-// The panel's own self-agent is flagged as local=true.
+// The panel's own self-agent is flagged as local=true; agents created from the
+// UI are flagged as manual=true (both are renameable by the panel).
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents := s.Hub.Agents()
 	resp := make([]map[string]any, 0, len(agents))
 	for _, a := range agents {
+		local := a.ID == s.localAgentID
 		resp = append(resp, map[string]any{
 			"id":        a.ID,
 			"name":      a.Name,
 			"hostname":  a.Hostname,
 			"last_seen": a.LastSeen,
 			"pending":   s.Hub.PendingFor(a.ID),
-			"local":     a.ID == s.localAgentID,
+			"local":     local,
+			"manual":    a.Manual && !local,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": resp})
 }
 
 // handleCreateAgent registers a new agent and returns its token plus the
-// current registration code (so an operator can hand both to the agent).
+// current registration code (so an operator can hand both to the agent). The
+// agent is flagged manual so the panel can rename it later.
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
@@ -141,6 +145,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		name = "agent"
 	}
 	agent, token := s.Hub.Register(name)
+	s.Hub.MarkManual(agent.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_id":          agent.ID,
 		"agent_token":       token,
@@ -167,18 +172,28 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-// handleRenameAgent renames the panel's own self-agent. The new name is
-// persisted (surviving restarts); remote agents cannot be renamed — their
-// name is chosen by the agent process at registration.
+// handleRenameAgent renames an agent the panel owns: its own self-agent (new
+// name persisted, surviving restarts) or one created from the UI (manual).
+// Agents that self-registered with the registration code cannot be renamed —
+// their name is chosen by the agent process at registration and reclaimed on
+// every poll.
 func (s *Server) handleRenameAgent(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "无效的 agent ID"})
 		return
 	}
-	if id != s.localAgentID {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "只能重命名本地面板 agent"})
-		return
+	isLocal := id == s.localAgentID
+	if !isLocal {
+		a, ok := s.Hub.Agent(id)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "agent 不存在"})
+			return
+		}
+		if !a.Manual {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "只能重命名本地面板 agent 或手动创建的 agent"})
+			return
+		}
 	}
 	var req struct {
 		Name string `json:"name"`
@@ -196,9 +211,11 @@ func (s *Server) handleRenameAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "agent 不存在"})
 		return
 	}
-	if err := s.Store.SetSelfAgentName(name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存名称失败"})
-		return
+	if isLocal {
+		if err := s.Store.SetSelfAgentName(name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存名称失败"})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
 }

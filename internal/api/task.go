@@ -45,6 +45,11 @@ type Task struct {
 	Log        []string `json:"log"`
 	StartedAt  string   `json:"started_at"`
 	EndedAt    string   `json:"ended_at"`
+
+	// NewInstanceID is the id of the instance created by the rebuild, set as
+	// soon as it exists (InstanceID keeps the old, since-deleted id). 0 when
+	// the rebuild failed before creating it.
+	NewInstanceID int `json:"new_instance_id"`
 }
 
 // snapshot returns a copy with the log reversed (newest first) for JSON output.
@@ -196,4 +201,12 @@ func (m *Manager) fail(t *Task, err error) {
 	t.Err = err.Error()
 	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	m.busy = false
+}
+
+// setNewInstanceID records the instance created by a rebuild, so callers
+// (e.g. the auto-rebuild monitor) can follow the instance to its new id.
+func (m *Manager) setNewInstanceID(t *Task, id int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t.NewInstanceID = id
 }

@@ -32,8 +32,8 @@ func mockLinodeAPI(t *testing.T) *httptest.Server {
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/networking/firewalls/") && strings.HasSuffix(r.URL.Path, "/devices"):
 			_, _ = io.WriteString(w, `{"id":1,"entity":{"id":100,"type":"linode","label":"myinst"}}`)
 		case r.URL.Path == "/regions":
-			// 故意乱序返回，验证 handler 按 id 排序。
-			_, _ = io.WriteString(w, `{"data":[{"id":"us-west","label":"Fremont"},{"id":"us-east","label":"Newark"},{"id":"eu-central","label":"Frankfurt"}],"page":1,"pages":1}`)
+			// 故意乱序返回，验证 handler 按 country 排序（同国家内按 id）。
+			_, _ = io.WriteString(w, `{"data":[{"id":"us-west","label":"Fremont","country":"us"},{"id":"de-fra-2","label":"Frankfurt 2","country":"de"},{"id":"us-east","label":"Newark","country":"us"},{"id":"eu-central","label":"Frankfurt","country":"de"}],"page":1,"pages":1}`)
 		case r.URL.Path == "/linode/types":
 			_, _ = io.WriteString(w, `{"data":[{"id":"g6-standard-4","label":"Linode 8GB"},{"id":"g6-standard-1","label":"Linode 2GB"},{"id":"g6-standard-2","label":"Linode 4GB"}],"page":1,"pages":1}`)
 		case r.URL.Path == "/images":
@@ -133,11 +133,11 @@ func TestAccountOptionsAndCreateHTTP(t *testing.T) {
 		Images  []linode.Image      `json:"images"`
 	}
 	decodeJSON(t, rr2, &opts)
-	if len(opts.Regions) != 3 || len(opts.Types) != 3 || len(opts.Images) != 3 {
+	if len(opts.Regions) != 4 || len(opts.Types) != 3 || len(opts.Images) != 3 {
 		t.Fatalf("opts = %+v", opts)
 	}
-	// 三个列表均应按 id 字母升序排序。
-	wantRegionIDs := []string{"eu-central", "us-east", "us-west"}
+	// 三个列表均按固定顺序排序：regions 按 country 升序（同国按 id），types/images 按 id 升序。
+	wantRegionIDs := []string{"de-fra-2", "eu-central", "us-east", "us-west"}
 	for i, want := range wantRegionIDs {
 		if opts.Regions[i].ID != want {
 			t.Fatalf("regions[%d] = %q, want %q (sorted)", i, opts.Regions[i].ID, want)

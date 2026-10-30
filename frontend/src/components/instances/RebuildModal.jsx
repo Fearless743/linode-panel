@@ -5,6 +5,7 @@ import { useAuth } from "../../auth";
 import { apiFetch } from "../../api";
 import Modal from "../Modal";
 import { Button, FormField } from "../ui";
+import { regionLabel, typeLabel } from "../../utils/linodeLabels";
 
 export default function RebuildModal({ inst, onClose, onConfirm }) {
   const { hasPerm } = useAuth();
@@ -61,7 +62,8 @@ export default function RebuildModal({ inst, onClose, onConfirm }) {
     <Modal title="重建实例" onClose={onClose}>
       <p className="modal-warning">将删除并重建该实例，所有数据丢失！</p>
       <p className="modal-detail">
-        将保留 Region / 型号 / 镜像：region={inst.region || "—"}，type={inst.type || "—"}
+        将保留地区 / 机型 / 镜像：地区={inst.region ? regionLabel(inst.region) : "—"}
+        ，机型={inst.type ? typeLabel(inst.type) : "—"}
         ，image={inst.image || "—"}。重建后新实例的 IP 不保证与原来相同。
       </p>
       <FormField label="保留 IP（选填，预留的 reserved IP 地址）" htmlFor="rebuild-ip-input">
