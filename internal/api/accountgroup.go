@@ -46,7 +46,7 @@ func (s *Server) handleCreateAccountGroup(w http.ResponseWriter, r *http.Request
 // handleUpdateAccountGroup renames one of the calling user's account groups.
 func (s *Server) handleUpdateAccountGroup(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
-	gid, ok := parseGroupID(w, r)
+	gid, ok := parseAccountGroupID(w, r)
 	if !ok {
 		return
 	}
@@ -68,7 +68,7 @@ func (s *Server) handleUpdateAccountGroup(w http.ResponseWriter, r *http.Request
 // together with its member rows.
 func (s *Server) handleDeleteAccountGroup(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
-	gid, ok := parseGroupID(w, r)
+	gid, ok := parseAccountGroupID(w, r)
 	if !ok {
 		return
 	}
@@ -83,7 +83,7 @@ func (s *Server) handleDeleteAccountGroup(w http.ResponseWriter, r *http.Request
 // the calling user's account groups.
 func (s *Server) handleAddAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
-	gid, ok := parseGroupID(w, r)
+	gid, ok := parseAccountGroupID(w, r)
 	if !ok {
 		return
 	}
@@ -109,7 +109,7 @@ func (s *Server) handleAddAccountGroupMember(w http.ResponseWriter, r *http.Requ
 // account groups.
 func (s *Server) handleRemoveAccountGroupMember(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
-	gid, ok := parseGroupID(w, r)
+	gid, ok := parseAccountGroupID(w, r)
 	if !ok {
 		return
 	}
@@ -125,9 +125,9 @@ func (s *Server) handleRemoveAccountGroupMember(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
-// parseGroupID parses the {gid} path parameter, writing a 400 and returning
+// parseAccountGroupID parses the {gid} path parameter, writing a 400 and returning
 // false when it is missing or not a positive integer.
-func parseGroupID(w http.ResponseWriter, r *http.Request) (int, bool) {
+func parseAccountGroupID(w http.ResponseWriter, r *http.Request) (int, bool) {
 	gid, err := strconv.Atoi(r.PathValue("gid"))
 	if err != nil || gid <= 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "组 ID 无效"})
