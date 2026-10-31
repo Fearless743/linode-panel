@@ -149,12 +149,29 @@ func (m *FailoverMonitor) check(ctx context.Context, cfg store.Failover) {
 	}
 }
 
+// usableInstanceStatuses 列出「实例可用」的状态：除 running 外还包含 booting/
+// rebooting/provisioning/migrating 等瞬态，避免把正在启动/迁移中的实例误判为
+// 不可用而多计失败。
+var usableInstanceStatuses = []string{"running", "booting", "rebooting", "provisioning", "migrating"}
+
+// isUsableInstanceStatus 报告状态是否属于「可用」集合。
+func isUsableInstanceStatus(status string) bool {
+	for _, s := range usableInstanceStatuses {
+		if status == s {
+			return true
+		}
+	}
+	return false
+}
+
 // checkNoBalance 处理「账号无余额」：资金预警本身不算故障，只有实例确实不可用
 // 才计失败。返回判定状态与可读详情：
-//   - HealthOK：实例 running，或 stopped 但能成功启动 → 可用，不累计；
-//   - HealthBanned / HealthNoBalance：实例不可用（无法启动，或读取实例时报账号
-//     不可用）→ 累计（后续 replace 会用缓存快照回退读取配置）；
-//   - HealthError：其他读取失败（网络等）→ 检测本身失败，不累计。
+//   - HealthOK：实例处于可用状态（running/booting 等瞬态），或 stopped 但能成功
+//     启动 → 可用，不累计；
+//   - HealthBanned / HealthNoBalance：实例不可用（无法启动，或读取/启动实例时报
+//     账号不可用）→ 累计（后续 replace 会用缓存快照回退读取配置）；
+//   - HealthError：其他读取/启动失败（瞬时 5xx、网络抖动等）→ 检测本身失败，
+//     不累计，等待下一轮。
 //
 // Boot 在 Linode 侧是异步任务，只要调用成功即视为「能启动」，不等待状态变为
 // running，避免把宽限期中的正常实例误判为不可用。
@@ -166,12 +183,21 @@ func (m *FailoverMonitor) checkNoBalance(ctx context.Context, cfg store.Failover
 		}
 		return HealthError, "账号无余额且读取实例失败: " + err.Error()
 	}
-	if inst.Status == "running" {
-		return HealthOK, "账号无余额但实例运行中，视为可用"
+	if isUsableInstanceStatus(inst.Status) {
+		return HealthOK, "账号无余额但实例状态 " + inst.Status + "，视为可用"
 	}
 	// 实例未运行：尝试启动；能启动即视为可用。
 	if err := m.clientFor(pat).Boot(ctx, inst.ID); err != nil {
-		return HealthNoBalance, "账号无余额且实例无法启动: " + err.Error()
+		switch ClassifyAccountError(err) {
+		case HealthBanned:
+			return HealthBanned, "账号不可用: " + err.Error()
+		case HealthNoBalance:
+			// 欠费导致无法启动：实例确实不可用，按 no_balance 累计。
+			return HealthNoBalance, "账号无余额且实例无法启动: " + err.Error()
+		default:
+			// 瞬时 5xx / 网络抖动：无法归类，不累计，等待下一轮。
+			return HealthError, "启动实例失败: " + err.Error()
+		}
 	}
 	return HealthOK, "账号无余额，实例已尝试启动，视为可用"
 }
