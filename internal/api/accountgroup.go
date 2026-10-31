@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"linode-panel/internal/store"
 )
@@ -145,4 +146,70 @@ func parseAccountGroupID(w http.ResponseWriter, r *http.Request) (int, bool) {
 		return 0, false
 	}
 	return gid, true
+}
+
+// handleGetAccountGroupInstanceConfig 返回账号组的目标开机配置。
+// GET /api/account/groups/{gid}/instance-config
+func (s *Server) handleGetAccountGroupInstanceConfig(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFrom(r.Context())
+	gid, ok := parseAccountGroupID(w, r)
+	if !ok {
+		return
+	}
+	cfg, found := s.Store.InstanceConfig(user.ID, gid)
+	// 若组不存在或不属于当前 user，InstanceConfig 返回 false；
+	// 区分"组不存在"和"组存在但未配置"两种 false。
+	if !found {
+		_, groupExists := s.Store.AccountGroup(user.ID, gid)
+		if !groupExists {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "账号组不存在"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+// handlePutAccountGroupInstanceConfig 设置或清除账号组的目标开机配置。
+// PUT /api/account/groups/{gid}/instance-config
+// 请求体：{"config":{"region":"","type":"","image":"","label":"","script":"","booted":true}|null}
+func (s *Server) handlePutAccountGroupInstanceConfig(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFrom(r.Context())
+	gid, ok := parseAccountGroupID(w, r)
+	if !ok {
+		return
+	}
+	// 先校验组属于当前 user
+	if _, groupExists := s.Store.AccountGroup(user.ID, gid); !groupExists {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "账号组不存在"})
+		return
+	}
+	var req struct {
+		Config *store.InstanceConfigJSON `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
+		return
+	}
+	// config == nil 表示清除配置。
+	if req.Config != nil {
+		cfg := req.Config
+		// 校验必填字段
+		if strings.TrimSpace(cfg.Region) == "" ||
+			strings.TrimSpace(cfg.Type) == "" ||
+			strings.TrimSpace(cfg.Image) == "" ||
+			strings.TrimSpace(cfg.Label) == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "region/type/image/label 均不能为空"})
+			return
+		}
+		// booted 缺省默认 true
+		if cfg.Booted == nil {
+			v := true
+			cfg.Booted = &v
+		}
+	}
+	if err := s.Store.UpdateAccountGroupConfig(user.ID, gid, req.Config); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
