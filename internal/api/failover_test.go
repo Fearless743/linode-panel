@@ -334,15 +334,18 @@ func TestFailoverNoBalanceInstanceStoppedBootsOk(t *testing.T) {
 }
 
 // TestFailoverNoBalanceInstanceStoppedBootFails verifies a stopped instance
-// that cannot be booted is genuinely unusable: the fail count accrues and a
-// replacement happens at the threshold.
+// whose boot is rejected for lack of funds is genuinely unusable: the fail
+// count accrues and a replacement happens at the threshold.
 func TestFailoverNoBalanceInstanceStoppedBootFails(t *testing.T) {
 	h := newFailoverHarness(t)
 	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
 	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
 		return linode.Instance{ID: id, Status: "stopped", Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
 	}
-	h.api.boot = func(context.Context, int) error { return errors.New("boot failed") }
+	// 启动被拒且错误可归类为余额不足 → 走 no_balance 累计。
+	h.api.boot = func(context.Context, int) error {
+		return &linode.APIError{StatusCode: 400, Reason: "insufficient balance to boot"}
+	}
 	h.enable(t, 42, 1, 1)
 
 	h.monitor.tickOnce(context.Background())
@@ -356,5 +359,87 @@ func TestFailoverNoBalanceInstanceStoppedBootFails(t *testing.T) {
 	}
 	if !h.api.called("CreateInstance") {
 		t.Fatal("实例确实不可用时应创建替换实例")
+	}
+}
+
+// TestFailoverNoBalanceBootTransientErrorNotCounted verifies a boot failure
+// that cannot be classified (transient 5xx / network) is not counted as
+// evidence of an unusable instance.
+func TestFailoverNoBalanceBootTransientErrorNotCounted(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+		return linode.Instance{ID: id, Status: "stopped", Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
+	}
+	h.api.boot = func(context.Context, int) error { return errors.New("502 bad gateway") }
+	h.enable(t, 42, 1, 1)
+	if err := h.srv.Store.UpdateFailoverState(42, 1, HealthNoBalance, "x", "", ""); err != nil {
+		t.Fatalf("UpdateFailoverState: %v", err)
+	}
+
+	h.monitor.tickOnce(context.Background())
+
+	cfg, _ := h.srv.Store.Failover(42)
+	if cfg.FailCount != 1 || cfg.LastStatus != "error" {
+		t.Fatalf("启动瞬时失败后 = %+v, want error/1（不累计）", cfg)
+	}
+	if !strings.Contains(cfg.LastDetail, "启动实例失败") {
+		t.Fatalf("详情 = %q, want 含「启动实例失败」", cfg.LastDetail)
+	}
+	if h.api.called("CreateInstance") {
+		t.Fatal("瞬时启动失败不应触发替换")
+	}
+}
+
+// TestFailoverNoBalanceTransientStatusNotCounted verifies that instances in
+// transient (but usable) states are treated as available, not as failures.
+func TestFailoverNoBalanceTransientStatusNotCounted(t *testing.T) {
+	for _, status := range []string{"running", "booting", "rebooting", "provisioning", "migrating"} {
+		t.Run(status, func(t *testing.T) {
+			h := newFailoverHarness(t)
+			h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+			h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+				return linode.Instance{ID: id, Status: status, Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
+			}
+			h.enable(t, 42, 1, 1)
+
+			h.monitor.tickOnce(context.Background())
+
+			cfg, _ := h.srv.Store.Failover(42)
+			if cfg.FailCount != 0 || cfg.LastStatus != HealthOK {
+				t.Fatalf("状态 %s 应视为可用, got %+v", status, cfg)
+			}
+			if h.api.called("Boot") {
+				t.Fatalf("状态 %s 不应尝试启动", status)
+			}
+			if h.api.called("CreateInstance") {
+				t.Fatalf("状态 %s 不应触发替换", status)
+			}
+		})
+	}
+}
+
+// TestFailoverNoBalanceStoppedStatusBoots verifies a non-usable status (e.g.
+// stopped/offline/degraded) goes down the boot path.
+func TestFailoverNoBalanceStoppedStatusBoots(t *testing.T) {
+	for _, status := range []string{"stopped", "offline", "degraded", ""} {
+		t.Run(status, func(t *testing.T) {
+			h := newFailoverHarness(t)
+			h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+			h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+				return linode.Instance{ID: id, Status: status, Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
+			}
+			h.enable(t, 42, 1, 1)
+
+			h.monitor.tickOnce(context.Background())
+
+			if !h.api.called("Boot") {
+				t.Fatalf("状态 %q 应尝试启动", status)
+			}
+			cfg, _ := h.srv.Store.Failover(42)
+			if cfg.FailCount != 0 || cfg.LastStatus != HealthOK {
+				t.Fatalf("状态 %q 能启动应视为可用, got %+v", status, cfg)
+			}
+		})
 	}
 }
