@@ -138,10 +138,11 @@ CREATE TABLE IF NOT EXISTS instance_cache (
 	PRIMARY KEY (token_id, instance_id)
 );
 CREATE TABLE IF NOT EXISTS account_groups (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id    INTEGER NOT NULL,
-	name       TEXT NOT NULL,
-	created_at TEXT NOT NULL DEFAULT '',
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id        INTEGER NOT NULL,
+	name           TEXT NOT NULL,
+	created_at     TEXT NOT NULL DEFAULT '',
+	instance_config TEXT NOT NULL DEFAULT '',
 	UNIQUE(user_id, name)
 );
 CREATE TABLE IF NOT EXISTS account_group_members (
@@ -172,6 +173,10 @@ CREATE TABLE IF NOT EXISTS instance_failover (
 	if err := s.ensureTokenAgentColumn(); err != nil {
 		return fmt.Errorf("迁移 tokens 表: %w", err)
 	}
+	// 旧库的 account_groups 表缺少 instance_config 列（目标开机配置），需要补列。
+	if err := s.ensureAccountGroupInstanceConfigColumn(); err != nil {
+		return fmt.Errorf("迁移 account_groups 表: %w", err)
+	}
 	return nil
 }
 
@@ -187,6 +192,22 @@ func (s *Store) ensureTokenAgentColumn() error {
 		return nil
 	}
 	_, err = s.db.Exec(`ALTER TABLE tokens ADD COLUMN agent_id INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// ensureAccountGroupInstanceConfigColumn adds the instance_config column to an
+// existing account_groups table created before the pre-filled boot-config
+// feature. New databases get the column from the schema above; this is a no-op
+// guard for old ones.
+func (s *Store) ensureAccountGroupInstanceConfigColumn() error {
+	has, err := s.columnExists("account_groups", "instance_config")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE account_groups ADD COLUMN instance_config TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 

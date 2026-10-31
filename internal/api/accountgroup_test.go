@@ -299,3 +299,83 @@ func TestAccountGroupCrossUserIsolation(t *testing.T) {
 		t.Fatalf("alice tokens after bob attempts = %+v", toks)
 	}
 }
+
+func TestAccountGroupInstanceConfigEndpoints(t *testing.T) {
+	srv := testServer(t, &fakeAPI{})
+	session := loginAlice(t, srv)
+	g := createAccountGroupForTest(t, srv, session, "prod")
+	base := "/api/account/groups/" + strconv.Itoa(g.ID) + "/instance-config"
+
+	// 初始未配置：GET 返回 {"config":null}
+	rr := authedGet(t, srv, session, base)
+	wantStatus(t, rr, http.StatusOK)
+	var resp struct {
+		Config *store.InstanceConfigJSON `json:"config"`
+	}
+	decodeJSON(t, rr, &resp)
+	if resp.Config != nil {
+		t.Fatalf("未配置时 config 应为 null, got %+v", resp.Config)
+	}
+
+	// PUT 设置配置（完整字段）
+	trueVal := true
+	putBody := fmt.Sprintf(
+		`{"config":{"region":"us-east","type":"g6-standard-1","image":"linode/debian12","label":"web-1","script":"#!/bin/bash\necho hi","booted":%v}}`,
+		trueVal,
+	)
+	rr = authedPut(t, srv, session, base, putBody)
+	wantStatus(t, rr, http.StatusOK)
+
+	// GET 读回
+	rr = authedGet(t, srv, session, base)
+	wantStatus(t, rr, http.StatusOK)
+	decodeJSON(t, rr, &resp)
+	if resp.Config == nil {
+		t.Fatal("设置后 config 不应为 null")
+	}
+	if resp.Config.Region != "us-east" || resp.Config.Type != "g6-standard-1" ||
+		resp.Config.Image != "linode/debian12" || resp.Config.Label != "web-1" {
+		t.Fatalf("读回 config = %+v", resp.Config)
+	}
+	if resp.Config.Booted == nil || !*resp.Config.Booted {
+		t.Fatalf("Booted 应为 true, got %v", resp.Config.Booted)
+	}
+
+	// PUT 清除配置（config: null）
+	rr = authedPut(t, srv, session, base, `{"config":null}`)
+	wantStatus(t, rr, http.StatusOK)
+	rr = authedGet(t, srv, session, base)
+	wantStatus(t, rr, http.StatusOK)
+	decodeJSON(t, rr, &resp)
+	if resp.Config != nil {
+		t.Fatalf("清除后 config 应为 null, got %+v", resp.Config)
+	}
+
+	// 空 region 校验
+	rr = authedPut(t, srv, session, base,
+		`{"config":{"region":"","type":"g6-standard-1","image":"linode/debian12","label":"web"}}`)
+	wantStatus(t, rr, http.StatusBadRequest)
+	var e errorResponse
+	decodeJSON(t, rr, &e)
+	if !strings.Contains(e.Error, "region/type/image/label") {
+		t.Fatalf("空 region 错误 = %q", e.Error)
+	}
+
+	// 越权：bob 的组
+	other, err := srv.Store.CreateUser("bob2", "bob123", 1)
+	if err != nil {
+		t.Fatalf("CreateUser bob2: %v", err)
+	}
+	bobG, err := srv.Store.CreateAccountGroup(other.ID, "bob-grp")
+	if err != nil {
+		t.Fatalf("CreateAccountGroup bob2: %v", err)
+	}
+	_ = bobG
+	bobSession := loginAs(t, srv, "bob2", "bob123")
+	rr = authedGet(t, srv, bobSession, "/api/account/groups/"+strconv.Itoa(g.ID)+"/instance-config")
+	wantStatus(t, rr, http.StatusBadRequest)
+	decodeJSON(t, rr, &e)
+	if e.Error != "账号组不存在" {
+		t.Fatalf("越权 GET 错误 = %q", e.Error)
+	}
+}

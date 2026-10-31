@@ -1,8 +1,10 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -126,7 +128,7 @@ func (s *Store) AccountGroupsOfToken(userID, tokenID int) []AccountGroup {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT g.id, g.user_id, g.name, g.created_at
+		`SELECT g.id, g.user_id, g.name, g.created_at, g.instance_config
 		   FROM account_groups g
 		   JOIN account_group_members m ON m.group_id = g.id
 		  WHERE g.user_id=? AND m.token_id=?
@@ -137,10 +139,12 @@ func (s *Store) AccountGroupsOfToken(userID, tokenID int) []AccountGroup {
 	var out []AccountGroup
 	for rows.Next() {
 		var g AccountGroup
-		if err := rows.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt); err != nil {
+		var raw string
+		if err := rows.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt, &raw); err != nil {
 			rows.Close()
 			return nil
 		}
+		g.InstanceConfig = parseInstanceConfig(raw)
 		out = append(out, g)
 	}
 	rows.Close()
@@ -155,28 +159,32 @@ func (s *Store) AccountGroupsOfToken(userID, tokenID int) []AccountGroup {
 
 func (s *Store) accountGroupLocked(userID, id int) (AccountGroup, bool) {
 	row := s.db.QueryRow(
-		`SELECT id, user_id, name, created_at FROM account_groups WHERE id=? AND user_id=?`, id, userID)
+		`SELECT id, user_id, name, created_at, instance_config FROM account_groups WHERE id=? AND user_id=?`, id, userID)
 	var g AccountGroup
-	if err := row.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt); err != nil {
+	var raw string
+	if err := row.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt, &raw); err != nil {
 		return AccountGroup{}, false
 	}
 	g.TokenIDs = s.accountGroupMembersLocked(g.ID)
+	g.InstanceConfig = parseInstanceConfig(raw)
 	return g, true
 }
 
 func (s *Store) accountGroupsLocked(userID int) []AccountGroup {
 	rows, err := s.db.Query(
-		`SELECT id, user_id, name, created_at FROM account_groups WHERE user_id=? ORDER BY id`, userID)
+		`SELECT id, user_id, name, created_at, instance_config FROM account_groups WHERE user_id=? ORDER BY id`, userID)
 	if err != nil {
 		return nil
 	}
 	var out []AccountGroup
 	for rows.Next() {
 		var g AccountGroup
-		if err := rows.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt); err != nil {
+		var raw string
+		if err := rows.Scan(&g.ID, &g.UserID, &g.Name, &g.CreatedAt, &raw); err != nil {
 			rows.Close()
 			return nil
 		}
+		g.InstanceConfig = parseInstanceConfig(raw)
 		out = append(out, g)
 	}
 	rows.Close()
@@ -224,4 +232,57 @@ func (s *Store) tokenBelongsLocked(userID, tokenID int) bool {
 	var n int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE id=? AND user_id=?`, tokenID, userID).Scan(&n)
 	return n > 0
+}
+
+// parseInstanceConfig 将 instance_config 列（JSON 字符串）解析为指针。
+// 空字符串返回 nil；解析失败打 slog.Warn 并返回 nil（保持调用方语义不变）。
+func parseInstanceConfig(raw string) *InstanceConfigJSON {
+	if raw == "" {
+		return nil
+	}
+	var cfg InstanceConfigJSON
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		slog.Warn("解析账号组 instance_config 失败，视为未配置", "raw", raw, "error", err)
+		return nil
+	}
+	return &cfg
+}
+
+// UpdateAccountGroupConfig 设置或清除账号组的目标开机配置。
+// cfg 为 nil 表示清除配置（存储空字符串）。
+func (s *Store) UpdateAccountGroupConfig(userID, groupID int, cfg *InstanceConfigJSON) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.accountGroupLocked(userID, groupID); !ok {
+		return fmt.Errorf("账号组 %d 不存在", groupID)
+	}
+	var raw string
+	if cfg != nil {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			return err
+		}
+		raw = string(data)
+	}
+	_, err := s.db.Exec(`UPDATE account_groups SET instance_config=? WHERE id=? AND user_id=?`, raw, groupID, userID)
+	return err
+}
+
+// InstanceConfig 读取账号组的目标开机配置；未配置（空字符串）时返回 nil, false。
+func (s *Store) InstanceConfig(userID, groupID int) (*InstanceConfigJSON, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 先校验组属于该 user
+	if _, ok := s.accountGroupLocked(userID, groupID); !ok {
+		return nil, false
+	}
+	var raw string
+	if err := s.db.QueryRow(`SELECT instance_config FROM account_groups WHERE id=? AND user_id=?`, groupID, userID).Scan(&raw); err != nil {
+		return nil, false
+	}
+	cfg := parseInstanceConfig(raw)
+	if cfg == nil {
+		return nil, false
+	}
+	return cfg, true
 }

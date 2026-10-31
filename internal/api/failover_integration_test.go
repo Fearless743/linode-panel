@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
+	"linode-panel/internal/store"
 )
 
 // ---------- 多账号假 Linode API（端到端用） ----------
@@ -215,6 +216,25 @@ func e2eEnableFailover(t *testing.T, srv *Server, cookie *http.Cookie, iid, toke
 	wantStatus(t, rr, http.StatusOK)
 }
 
+// boolPtr returns a pointer to the given bool value.
+func boolPtr(v bool) *bool { return &v }
+
+// e2eSetGroupInstanceConfig 通过 PUT /api/account/groups/{gid}/instance-config
+// 设置账号组的目标开机配置。
+func e2eSetGroupInstanceConfig(t *testing.T, srv *Server, cookie *http.Cookie, groupID int, cfg *store.InstanceConfigJSON) {
+	t.Helper()
+	booted := true
+	if cfg.Booted != nil {
+		booted = *cfg.Booted
+	}
+	body := fmt.Sprintf(
+		`{"config":{"region":"%s","type":"%s","image":"%s","label":"%s","script":%q,"booted":%v}}`,
+		cfg.Region, cfg.Type, cfg.Image, cfg.Label, cfg.Script, booted)
+	rr := authedPut(t, srv, cookie,
+		fmt.Sprintf("/api/account/groups/%d/instance-config", groupID), body)
+	wantStatus(t, rr, http.StatusOK)
+}
+
 // newE2EFailoverMonitor 构造一个不启动 goroutine 的替换监控：probe/clientFor
 // 都指向 Server 的真实实现，因此探测与创建都会实际请求 srv.APIBase。
 func newE2EFailoverMonitor(srv *Server) *FailoverMonitor {
@@ -228,31 +248,40 @@ func newE2EFailoverMonitor(srv *Server) *FailoverMonitor {
 
 // TestFailoverE2EReplacesBannedAccount 走完整链路：HTTP 接口添加账号 A/B、
 // 建组、把 A 上实例 42 开启替换（threshold=1），再用真实探测/客户端跑一轮
-// tickOnce，断言 B 收到与旧实例完全一致的创建请求、配置迁移且状态为 ok，
+// tickOnce，断言 B 收到与组配置一致的创建请求、配置迁移且状态为 ok，
 // 同时 A 从未被用于创建、旧实例清理失败也不影响替换。
 func TestFailoverE2EReplacesBannedAccount(t *testing.T) {
-	// 旧实例配置：region/type/image/label 是替换必须原样复制的字段。
-	old := linode.Instance{
+	// 组预填目标开机配置：region/type/image/label 是替换所用的字段。
+	groupCfg := &store.InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web-1",
+		Script: "#!/bin/bash\necho e2e",
+		Booted: boolPtr(true),
+	}
+	api := newE2ELinodeAPI(t, linode.Instance{
 		ID: 42, Label: "web-1", Status: "running", Region: "us-east",
 		Type: "g6-standard-1", Image: "linode/debian12", IPv4: []string{"192.0.2.10"},
-	}
-	api := newE2ELinodeAPI(t, old, 200)
+	}, 200)
 	srv := testServer(t, &fakeAPI{})
 	srv.APIBase = api.ts.URL
 	cookie := loginAlice(t, srv)
 
-	// 端到端准备：账号 → 组 → 组员 → 实例替换配置，全部走真实 HTTP 接口。
+	// 端到端准备：账号 → 组 → 组员 → 目标开机配置 → 实例替换配置，全部走真实 HTTP 接口。
 	tokA := e2eAddToken(t, srv, cookie, "main", e2ePATMain)
 	tokB := e2eAddToken(t, srv, cookie, "backup", e2ePATBackup)
 	gid := e2eCreateGroup(t, srv, cookie, "grp", tokA, tokB)
-	e2eEnableFailover(t, srv, cookie, old.ID, tokA, gid, 1)
+	e2eSetGroupInstanceConfig(t, srv, cookie, gid, groupCfg)
+
+	e2eEnableFailover(t, srv, cookie, 42, tokA, gid, 1)
 
 	// 一轮监控：账号 A 探测为 banned（403），达到阈值 1 后替换到账号 B。
 	newE2EFailoverMonitor(srv).tickOnce(context.Background())
 
 	// 1) 旧实例配置必须已迁移走。
-	if _, ok := srv.Store.Failover(old.ID); ok {
-		t.Fatalf("旧实例 %d 的替换配置应已迁移", old.ID)
+	if _, ok := srv.Store.Failover(42); ok {
+		t.Fatalf("旧实例 42 的替换配置应已迁移")
 	}
 
 	// 2) 新实例上存在配置：承载账号改为 B、Enabled 保留、状态 ok、失败计数归零。
@@ -273,26 +302,33 @@ func TestFailoverE2EReplacesBannedAccount(t *testing.T) {
 		t.Fatalf("GroupID 应保留为 %d, got %d", gid, cfg.GroupID)
 	}
 
-	// 3) 账号 B 恰好收到一次创建请求，且 region/type/image/label 与旧实例一致。
+	// 3) 账号 B 恰好收到一次创建请求，且 region/type/image/label 与组配置一致。
 	createsB := api.createsFor(e2ePATBackup)
 	if len(createsB) != 1 {
 		t.Fatalf("账号 B 应收到 1 次创建请求, got %d", len(createsB))
 	}
 	got := createsB[0]
-	if got.Region != old.Region || got.Type != old.Type || got.Image != old.Image || got.Label != old.Label {
-		t.Fatalf("创建请求应与旧实例一致: got %+v, want region=%q type=%q image=%q label=%q",
-			got, old.Region, old.Type, old.Image, old.Label)
+	if got.Region != groupCfg.Region || got.Type != groupCfg.Type ||
+		got.Image != groupCfg.Image || got.Label != groupCfg.Label {
+		t.Fatalf("创建请求应与组配置一致: got %+v, want region=%q type=%q image=%q label=%q",
+			got, groupCfg.Region, groupCfg.Type, groupCfg.Image, groupCfg.Label)
 	}
 	if got.Booted == nil || !*got.Booted {
 		t.Fatalf("替换实例应带 booted=true, got %+v", got.Booted)
 	}
 
-	// 4) 账号 A 从未被用于创建实例。
+	// 4) 组配置里的 script 应写入新实例。
+	script, ok := srv.Store.InstanceScript(200)
+	if !ok || !strings.Contains(script, "echo e2e") {
+		t.Fatalf("新实例 200 应有组配置的开机脚本, got %q ok=%v", script, ok)
+	}
+
+	// 5) 账号 A 从未被用于创建实例。
 	if n := len(api.createsFor(e2ePATMain)); n != 0 {
 		t.Fatalf("故障账号 A 不应收到创建请求, got %d", n)
 	}
 
-	// 5) 两个账号都真正被探测过；A 的清理请求发出且失败，但替换仍然成功。
+	// 6) 两个账号都真正被探测过；A 的清理请求发出且失败，但替换仍然成功。
 	if api.accountCallsFor(e2ePATMain) == 0 || api.accountCallsFor(e2ePATBackup) == 0 {
 		t.Fatal("两个账号都应经过 GET /account 健康探测")
 	}
@@ -319,6 +355,16 @@ func TestFailoverE2ENoHealthyAccountKeepsConfig(t *testing.T) {
 	tokA := e2eAddToken(t, srv, cookie, "main", e2ePATMain)
 	tokC := e2eAddToken(t, srv, cookie, "poor", e2ePATPoor)
 	gid := e2eCreateGroup(t, srv, cookie, "grp", tokA, tokC)
+
+	// 设置组配置（这样替换流程能通过配置检查，到达无可用账号分支）。
+	e2eSetGroupInstanceConfig(t, srv, cookie, gid, &store.InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web-1",
+		Booted: boolPtr(true),
+	})
+
 	e2eEnableFailover(t, srv, cookie, old.ID, tokA, gid, 1)
 
 	newE2EFailoverMonitor(srv).tickOnce(context.Background())
@@ -343,5 +389,40 @@ func TestFailoverE2ENoHealthyAccountKeepsConfig(t *testing.T) {
 	// 故障账号与欠费账号都确实被探测过（证明不是「没跑」）。
 	if api.accountCallsFor(e2ePATMain) == 0 || api.accountCallsFor(e2ePATPoor) == 0 {
 		t.Fatal("故障账号与候选账号都应经过健康探测")
+	}
+}
+
+// TestFailoverE2ENoGroupConfigNoCreate 验证组未配置目标开机配置时：
+// 即使有健康候选账号，replace 也不建机，状态记 error。
+func TestFailoverE2ENoGroupConfigNoCreate(t *testing.T) {
+	old := linode.Instance{
+		ID: 42, Label: "web-1", Status: "running", Region: "us-east",
+		Type: "g6-standard-1", Image: "linode/debian12", IPv4: []string{"192.0.2.10"},
+	}
+	api := newE2ELinodeAPI(t, old, 200)
+	srv := testServer(t, &fakeAPI{})
+	srv.APIBase = api.ts.URL
+	cookie := loginAlice(t, srv)
+
+	tokA := e2eAddToken(t, srv, cookie, "main", e2ePATMain)
+	tokB := e2eAddToken(t, srv, cookie, "backup", e2ePATBackup)
+	gid := e2eCreateGroup(t, srv, cookie, "grp", tokA, tokB)
+	e2eEnableFailover(t, srv, cookie, old.ID, tokA, gid, 1)
+	// 注意：未设置组配置——严格模式下 replace 应直接报 error。
+
+	newE2EFailoverMonitor(srv).tickOnce(context.Background())
+
+	cfg, ok := srv.Store.Failover(old.ID)
+	if !ok {
+		t.Fatal("未配置组目标开机配置时配置不应被迁移走")
+	}
+	if cfg.LastStatus != "error" || cfg.FailCount != 0 {
+		t.Fatalf("应为 error/0, got status=%q fail=%d", cfg.LastStatus, cfg.FailCount)
+	}
+	if !strings.Contains(cfg.LastDetail, "未填写账号组目标开机配置") {
+		t.Fatalf("详情应含「未填写账号组目标开机配置」, got %q", cfg.LastDetail)
+	}
+	if n := api.totalCreates(); n != 0 {
+		t.Fatalf("未配置时不应创建实例, got %d 次", n)
 	}
 }

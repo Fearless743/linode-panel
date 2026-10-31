@@ -19,8 +19,15 @@ export default function AccountGroupCard({
   onRename,
   onDelete,
   onConfigureFailover,
+  onOpenInstanceConfig,
 }) {
   const members = groupMembers(group, tokens);
+  const ic = group.instance_config;
+
+  // 组配置摘要：已配置时显示 region/type，未配置时显示提示标签。
+  const configLabel = ic
+    ? ic.region + " / " + ic.type
+    : "未填写目标开机配置";
 
   return (
     <article className="panel ag-card">
@@ -44,6 +51,25 @@ export default function AccountGroupCard({
             删除
           </button>
         </div>
+      </div>
+
+      {/* 目标开机配置状态标签 */}
+      <div className="ag-card-config-row">
+        <span
+          className={
+            "perm-chip" + (ic ? "" : " ag-config-missing")
+          }
+          title={ic ? "目标开机配置：" + configLabel : "未填写目标开机配置，替换时将报 error"}
+        >
+          {ic ? "目标开机配置：" + configLabel : configLabel}
+        </span>
+        <button
+          className="action-btn ag-config-btn"
+          type="button"
+          onClick={() => onOpenInstanceConfig(group)}
+        >
+          目标开机配置
+        </button>
       </div>
 
       {members.length === 0 ? (

@@ -105,11 +105,22 @@ type Group struct {
 // 当组内某账号的实例被封号或没余额时，可用相同配置在组内另一账号重建替换。
 // 与权限组 Group 无关。
 type AccountGroup struct {
-	ID        int    `json:"id"`
-	UserID    int    `json:"user_id"`
-	Name      string `json:"name"`
-	TokenIDs  []int  `json:"token_ids"`  // 组内账号(Token) id，升序
-	CreatedAt string `json:"created_at"` // RFC3339
+	ID             int                 `json:"id"`
+	UserID         int                 `json:"user_id"`
+	Name           string              `json:"name"`
+	TokenIDs       []int               `json:"token_ids"`  // 组内账号(Token) id，升序
+	CreatedAt      string              `json:"created_at"` // RFC3339
+	InstanceConfig *InstanceConfigJSON `json:"instance_config,omitempty"`
+}
+
+// InstanceConfigJSON 是账号组预填的目标开机配置。nil 或空字符串表示未配置。
+type InstanceConfigJSON struct {
+	Region string `json:"region"`
+	Type   string `json:"type"`
+	Image  string `json:"image"`
+	Label  string `json:"label"`
+	Script string `json:"script"`
+	Booted *bool  `json:"booted"` // nil 视为 true
 }
 
 // Masked renders a token for display: last 4 chars visible.
