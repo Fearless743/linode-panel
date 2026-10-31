@@ -298,3 +298,104 @@ func TestAccountGroupsOrderingAndIsolation(t *testing.T) {
 		t.Fatal("bob can read alice's group")
 	}
 }
+
+func TestUpdateAccountGroupConfig(t *testing.T) {
+	s, _ := newTestStore(t)
+	u, _ := newTestUserToken(t, s, "alice")
+
+	g, err := s.CreateAccountGroup(u.ID, "grp")
+	if err != nil {
+		t.Fatalf("CreateAccountGroup: %v", err)
+	}
+
+	// 未配置时应返回 nil, false
+	if cfg, ok := s.InstanceConfig(u.ID, g.ID); ok || cfg != nil {
+		t.Fatalf("未配置时 InstanceConfig = %+v, %v; want nil, false", cfg, ok)
+	}
+
+	// 设置配置
+	trueBool := true
+	cfg := &InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web-1",
+		Script: "#!/bin/bash\necho hi",
+		Booted: &trueBool,
+	}
+	if err := s.UpdateAccountGroupConfig(u.ID, g.ID, cfg); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig set: %v", err)
+	}
+
+	// 读回
+	got, ok := s.InstanceConfig(u.ID, g.ID)
+	if !ok {
+		t.Fatal("设置后 InstanceConfig 应返回 ok=true")
+	}
+	if got.Region != "us-east" || got.Type != "g6-standard-1" ||
+		got.Image != "linode/debian12" || got.Label != "web-1" ||
+		got.Script != "#!/bin/bash\necho hi" {
+		t.Fatalf("读回配置 = %+v, want %+v", got, cfg)
+	}
+	if got.Booted == nil || !*got.Booted {
+		t.Fatalf("Booted 应为 true, got %v", got.Booted)
+	}
+
+	// 清除配置
+	if err := s.UpdateAccountGroupConfig(u.ID, g.ID, nil); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig clear: %v", err)
+	}
+	if _, ok := s.InstanceConfig(u.ID, g.ID); ok {
+		t.Fatal("清除后 InstanceConfig 应返回 ok=false")
+	}
+
+	// 越权：其他 user 设置/读取失败
+	other, _ := newTestUserToken(t, s, "bob")
+	if _, ok := s.InstanceConfig(other.ID, g.ID); ok {
+		t.Fatal("越权读取不应成功")
+	}
+	if err := s.UpdateAccountGroupConfig(other.ID, g.ID, cfg); err == nil {
+		t.Fatal("越权设置不应成功")
+	}
+}
+
+func TestAccountGroupInstanceConfigJSONRoundtrip(t *testing.T) {
+	s, _ := newTestStore(t)
+	u, _ := newTestUserToken(t, s, "alice")
+	g, _ := s.CreateAccountGroup(u.ID, "grp")
+
+	falseBool := false
+	cfg := &InstanceConfigJSON{
+		Region: "eu-west",
+		Type:   "g6-standard-2",
+		Image:  "linode/rocky9",
+		Label:  "db",
+		Booted: &falseBool,
+	}
+	if err := s.UpdateAccountGroupConfig(u.ID, g.ID, cfg); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig: %v", err)
+	}
+
+	got, ok := s.InstanceConfig(u.ID, g.ID)
+	if !ok {
+		t.Fatal("InstanceConfig 未返回配置")
+	}
+	if got.Booted == nil || *got.Booted != false {
+		t.Fatalf("Booted = %v, want false", got.Booted)
+	}
+	if got.Script != "" {
+		t.Fatalf("Script 应保留为空串, got %q", got.Script)
+	}
+
+	// AccountGroup 读取也应带 instance_config
+	ag, found := s.AccountGroup(u.ID, g.ID)
+	if !found {
+		t.Fatal("AccountGroup 读取失败")
+	}
+	if ag.InstanceConfig == nil {
+		t.Fatal("AccountGroup.InstanceConfig 应为非 nil")
+	}
+	if ag.InstanceConfig.Region != "eu-west" || ag.InstanceConfig.Booted == nil || *ag.InstanceConfig.Booted != false {
+		t.Fatalf("AccountGroup.InstanceConfig = %+v, want region=eu-west booted=false", ag.InstanceConfig)
+	}
+}
