@@ -10,9 +10,10 @@ import (
 	"linode-panel/internal/store"
 )
 
-// FailoverMonitor 周期性地检查每个已启用替换的实例，当承载它的账号被封号或
-// 没有余额、且连续失败达到阈值时，用相同配置在所属账号组内的另一个健康账号上
-// 创建一个替换实例，并把替换配置迁移到新实例。
+// FailoverMonitor 周期性地检查每个已启用替换的实例，当承载它的账号被封禁、
+// 或账号无余额且实例确实不可用（无法运行/启动）、且连续失败达到阈值时，用相同
+// 配置在所属账号组内的另一个健康账号上创建一个替换实例，并把替换配置迁移到新
+// 实例。
 //
 // 结构仿照 AutoRebuildMonitor：同样的 tickOnce/due/check 节奏、slog 中文日志
 // 与可注入的探测/客户端，便于单测。
@@ -96,7 +97,14 @@ func (m *FailoverMonitor) due(cfg store.Failover) bool {
 // now 返回当前 UTC 时间（RFC3339），用作状态时间戳。
 func (m *FailoverMonitor) now() string { return time.Now().UTC().Format(time.RFC3339) }
 
-// check 探测一个实例承载账号的健康状况，并在连续失败达到阈值时触发替换。
+// check 探测一个实例承载账号的健康状况，并在实例确实不可用、且连续失败达到
+// 阈值时触发替换。
+//
+// 判定口径（账号无余额 ≠ 实例不能用：Linode 欠费有宽限期，不会立刻停机）：
+//   - HealthOK：账号与实例均正常，归零 FailCount。
+//   - HealthBanned：账号被封禁，直接累计 FailCount，达阈值即替换。
+//   - HealthNoBalance：只是资金预警，需叠加「实例不可用」才累计，见 checkNoBalance。
+//   - HealthError：检测本身失败，不累计（保持原有语义）。
 func (m *FailoverMonitor) check(ctx context.Context, cfg store.Failover) {
 	id := cfg.InstanceID
 	pat, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
@@ -113,26 +121,78 @@ func (m *FailoverMonitor) check(ctx context.Context, cfg store.Failover) {
 			m.log.Info("账号替换: 账号恢复正常", "instance_id", id, "token_id", cfg.TokenID)
 		}
 		_ = m.srv.Store.UpdateFailoverState(id, 0, HealthOK, detail, m.now(), "")
-	case HealthNoBalance, HealthBanned:
-		fails := cfg.FailCount + 1
-		threshold := cfg.Threshold
-		if threshold <= 0 {
-			threshold = DefaultFailoverThreshold
+	case HealthBanned:
+		// 封号：账号层即可判定，直接累计。
+		m.accumulate(ctx, cfg, HealthBanned, detail)
+	case HealthNoBalance:
+		// 无余额：不以资金预警为准，只在实例确实不可用时才累计。
+		st, d := m.checkNoBalance(ctx, cfg, pat)
+		switch st {
+		case HealthOK:
+			if cfg.FailCount > 0 {
+				m.log.Info("账号替换: 账号无余额但实例可用，失败计数归零",
+					"instance_id", id, "token_id", cfg.TokenID, "detail", d)
+			}
+			_ = m.srv.Store.UpdateFailoverState(id, 0, HealthOK, d, m.now(), "")
+		case HealthBanned, HealthNoBalance:
+			m.accumulate(ctx, cfg, st, d)
+		default:
+			m.log.Warn("账号替换: 实例检测出错（不计入失败）",
+				"instance_id", id, "token_id", cfg.TokenID, "detail", d)
+			_ = m.srv.Store.UpdateFailoverState(id, cfg.FailCount, "error", d, m.now(), "")
 		}
-		m.log.Info("账号替换: 账号不可用",
-			"instance_id", id, "token_id", cfg.TokenID,
-			"status", status, "fails", fails, "threshold", threshold, "detail", detail)
-		if fails < threshold {
-			_ = m.srv.Store.UpdateFailoverState(id, fails, status, detail, m.now(), "")
-			return
-		}
-		m.replace(ctx, cfg, status, detail)
 	default:
 		// HealthError：检测本身失败，不构成「账号不可用」的证据，不累计失败。
 		m.log.Warn("账号替换: 账号检测出错（不计入失败）",
 			"instance_id", id, "token_id", cfg.TokenID, "detail", detail)
 		_ = m.srv.Store.UpdateFailoverState(id, cfg.FailCount, "error", detail, m.now(), "")
 	}
+}
+
+// checkNoBalance 处理「账号无余额」：资金预警本身不算故障，只有实例确实不可用
+// 才计失败。返回判定状态与可读详情：
+//   - HealthOK：实例 running，或 stopped 但能成功启动 → 可用，不累计；
+//   - HealthBanned / HealthNoBalance：实例不可用（无法启动，或读取实例时报账号
+//     不可用）→ 累计（后续 replace 会用缓存快照回退读取配置）；
+//   - HealthError：其他读取失败（网络等）→ 检测本身失败，不累计。
+//
+// Boot 在 Linode 侧是异步任务，只要调用成功即视为「能启动」，不等待状态变为
+// running，避免把宽限期中的正常实例误判为不可用。
+func (m *FailoverMonitor) checkNoBalance(ctx context.Context, cfg store.Failover, pat string) (string, string) {
+	inst, err := m.clientFor(pat).GetInstance(ctx, cfg.InstanceID)
+	if err != nil {
+		if ClassifyAccountError(err) == HealthBanned {
+			return HealthBanned, "账号不可用: " + err.Error()
+		}
+		return HealthError, "账号无余额且读取实例失败: " + err.Error()
+	}
+	if inst.Status == "running" {
+		return HealthOK, "账号无余额但实例运行中，视为可用"
+	}
+	// 实例未运行：尝试启动；能启动即视为可用。
+	if err := m.clientFor(pat).Boot(ctx, inst.ID); err != nil {
+		return HealthNoBalance, "账号无余额且实例无法启动: " + err.Error()
+	}
+	return HealthOK, "账号无余额，实例已尝试启动，视为可用"
+}
+
+// accumulate 在账号/实例确不可用时累计失败次数，达阈值触发替换；阈值取自配置，
+// 缺省用 DefaultFailoverThreshold。
+func (m *FailoverMonitor) accumulate(ctx context.Context, cfg store.Failover, status, detail string) {
+	id := cfg.InstanceID
+	fails := cfg.FailCount + 1
+	threshold := cfg.Threshold
+	if threshold <= 0 {
+		threshold = DefaultFailoverThreshold
+	}
+	m.log.Info("账号替换: 账号不可用",
+		"instance_id", id, "token_id", cfg.TokenID,
+		"status", status, "fails", fails, "threshold", threshold, "detail", detail)
+	if fails < threshold {
+		_ = m.srv.Store.UpdateFailoverState(id, fails, status, detail, m.now(), "")
+		return
+	}
+	m.replace(ctx, cfg, status, detail)
 }
 
 // replace 在账号组内另选一个健康账号，用原实例的相同配置创建替换实例，并把
