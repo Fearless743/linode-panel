@@ -331,6 +331,24 @@ export function removeAccountGroupToken(groupId, tokenId) {
   );
 }
 
+// 获取账号组的目标开机配置。
+// 返回 { config: { region, type, image, label, script, booted } | null }
+export function getInstanceConfig(groupId) {
+  return apiFetch(
+    "/api/account/groups/" + encodeURIComponent(groupId) + "/instance-config"
+  );
+}
+
+// 设置或清除账号组的目标开机配置。
+// config 为 null 表示清除配置；否则须含 region/type/image/label。
+export function setInstanceConfig(groupId, config) {
+  return jsonRequest(
+    "/api/account/groups/" + encodeURIComponent(groupId) + "/instance-config",
+    "PUT",
+    { config }
+  );
+}
+
 // ---------- 实例自动替换（账号组内跨账号） ----------
 // 按实例配置：某实例所在账号被封禁/余额不足时，在所属账号组内换另一个账号，
 // 用相同配置重建替换。

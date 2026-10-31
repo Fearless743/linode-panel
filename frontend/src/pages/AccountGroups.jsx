@@ -14,6 +14,7 @@ import CreateAccountGroupModal from "../components/accountgroups/CreateAccountGr
 import RenameAccountGroupModal from "../components/accountgroups/RenameAccountGroupModal";
 import ManageMembersModal from "../components/accountgroups/ManageMembersModal";
 import FailoverConfigModal from "../components/accountgroups/FailoverConfigModal";
+import InstanceConfigModal from "../components/accountgroups/InstanceConfigModal";
 
 function errMsg(err, fallback) {
   return err && err.message ? err.message : fallback;
@@ -39,6 +40,7 @@ export default function AccountGroups() {
   const [manageGroup, setManageGroup] = useState(null);
   const [failoverTarget, setFailoverTarget] = useState(null); // { group, member }
   const [delGroup, setDelGroup] = useState(null);
+  const [instanceConfigGroup, setInstanceConfigGroup] = useState(null);
 
   const load = useCallback(async () => {
     setLoadError("");
@@ -164,6 +166,7 @@ export default function AccountGroups() {
                 onConfigureFailover={(group, member) =>
                   setFailoverTarget({ group, member })
                 }
+                onOpenInstanceConfig={setInstanceConfigGroup}
               />
             ))}
           </div>
@@ -217,6 +220,14 @@ export default function AccountGroups() {
           danger
           onConfirm={doDelete}
           onCancel={() => setDelGroup(null)}
+        />
+      )}
+
+      {instanceConfigGroup && (
+        <InstanceConfigModal
+          group={instanceConfigGroup}
+          onClose={() => setInstanceConfigGroup(null)}
+          onChanged={() => afterMutate("目标开机配置已更新")}
         />
       )}
     </section>
