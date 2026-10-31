@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"linode-panel/internal/linode"
@@ -169,7 +170,7 @@ func isUsableInstanceStatus(status string) bool {
 //   - HealthOK：实例处于可用状态（running/booting 等瞬态），或 stopped 但能成功
 //     启动 → 可用，不累计；
 //   - HealthBanned / HealthNoBalance：实例不可用（无法启动，或读取/启动实例时报
-//     账号不可用）→ 累计（后续 replace 会用缓存快照回退读取配置）；
+//     账号不可用）→ 累计（后续 replace 使用组预填配置建机）；
 //   - HealthError：其他读取/启动失败（瞬时 5xx、网络抖动等）→ 检测本身失败，
 //     不累计，等待下一轮。
 //
@@ -221,12 +222,16 @@ func (m *FailoverMonitor) accumulate(ctx context.Context, cfg store.Failover, st
 	m.replace(ctx, cfg, status, detail)
 }
 
-// replace 在账号组内另选一个健康账号，用原实例的相同配置创建替换实例，并把
-// 替换配置迁移到新实例。过程中旧实例的清理是尽力而为，失败不影响替换成功。
+// replace 在账号组内另选一个健康账号，用组预填的目标开机配置创建替换实例，
+// 并把替换配置迁移到新实例。过程中旧实例的清理是尽力而为，失败不影响替换成功。
+//
+// 严格模式：不再读取旧实例配置，而是直接读取组内预填的 InstanceConfig。
+// 若组未配置目标开机配置，则不触发替换，状态记 error，详情为「未填写账号组目标开机配置」。
 func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, status, detail string) {
 	id := cfg.InstanceID
 	m.log.Info("账号替换: 达到阈值，开始替换",
 		"instance_id", id, "token_id", cfg.TokenID, "status", status, "detail", detail)
+
 	oldPAT, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
 	if err != nil {
 		// 理论上 check 已取过一次；这里兜底，重置计数等待下一轮。
@@ -240,6 +245,16 @@ func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, statu
 		m.log.Warn("账号替换: 账号组不存在，停止替换", "instance_id", id, "group_id", cfg.GroupID)
 		_ = m.srv.Store.UpdateFailoverState(id, 0, "error",
 			"账号组不存在，已停止替换", m.now(), "")
+		return
+	}
+
+	// 读取组预填目标开机配置；严格模式下必须有配置才继续。
+	cfgJSON, hasConfig := m.srv.Store.InstanceConfig(cfg.UserID, cfg.GroupID)
+	if !hasConfig || cfgJSON == nil {
+		m.log.Warn("账号替换: 组未填写目标开机配置，停止替换",
+			"instance_id", id, "group_id", cfg.GroupID)
+		_ = m.srv.Store.UpdateFailoverState(id, 0, "error",
+			"未填写账号组目标开机配置", m.now(), "")
 		return
 	}
 
@@ -275,31 +290,19 @@ func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, statu
 		return
 	}
 
-	// 读取旧实例配置；账号被封时 GetInstance 可能失败，回退到本地缓存快照。
-	old, err := m.clientFor(oldPAT).GetInstance(ctx, id)
-	if err != nil {
-		if cached, ok := cachedInstance(m.srv.Store.CachedInstances(cfg.TokenID), id); ok {
-			m.log.Warn("账号替换: 读取旧实例失败，回退缓存快照", "instance_id", id, "error", err)
-			old = cached
-			err = nil
-		}
-	}
-	if err != nil {
-		m.log.Warn("账号替换: 无法读取原实例配置", "instance_id", id, "error", err)
-		_ = m.srv.Store.UpdateFailoverState(id, 0, "error",
-			"无法读取原实例配置: "+err.Error(), m.now(), "")
-		return
-	}
-
+	// 按组预填配置创建替换实例。
 	booted := true
+	if cfgJSON.Booted != nil {
+		booted = *cfgJSON.Booted
+	}
 	m.log.Info("账号替换: 在新账号创建替换实例",
 		"instance_id", id, "from_token", cfg.TokenID, "to_token", newTokenID,
-		"region", old.Region, "type", old.Type, "image", old.Image, "label", old.Label)
+		"region", cfgJSON.Region, "type", cfgJSON.Type, "image", cfgJSON.Image, "label", cfgJSON.Label)
 	newInst, err := m.clientFor(newPAT).CreateInstance(ctx, linode.CreateOptions{
-		Region: old.Region,
-		Type:   old.Type,
-		Image:  old.Image,
-		Label:  old.Label,
+		Region: cfgJSON.Region,
+		Type:   cfgJSON.Type,
+		Image:  cfgJSON.Image,
+		Label:  cfgJSON.Label,
 		Booted: &booted,
 	})
 	if err != nil {
@@ -317,17 +320,17 @@ func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, statu
 	// 默认开放所有端口：绑定失败不阻塞替换。
 	region := newInst.Region
 	if region == "" {
-		region = old.Region
+		region = cfgJSON.Region
 	}
 	if err := m.clientFor(newPAT).AttachAllowAllFirewall(ctx, region, newID); err != nil {
 		m.log.Warn("账号替换: 开放所有端口防火墙绑定失败（继续）",
 			"new_instance_id", newID, "error", err)
 	}
 
-	// 迁移旧实例的开机脚本到新实例。
-	if script, ok := m.srv.Store.InstanceScript(id); ok {
+	// 把组预填的开机脚本写入新实例（空脚本则跳过）。
+	if script := strings.TrimSpace(cfgJSON.Script); script != "" {
 		if err := m.srv.Store.SetInstanceScript(newID, script); err != nil {
-			m.log.Warn("账号替换: 迁移开机脚本失败", "from", id, "to", newID, "error", err)
+			m.log.Warn("账号替换: 写入开机脚本失败", "to", newID, "error", err)
 		}
 	}
 
@@ -379,14 +382,4 @@ func (m *FailoverMonitor) candidateLabel(userID, tokenID int) string {
 		}
 	}
 	return strconv.Itoa(tokenID)
-}
-
-// cachedInstance 在缓存快照里按 id 查找实例。
-func cachedInstance(insts []linode.Instance, id int) (linode.Instance, bool) {
-	for _, in := range insts {
-		if in.ID == id {
-			return in, true
-		}
-	}
-	return linode.Instance{}, false
 }
