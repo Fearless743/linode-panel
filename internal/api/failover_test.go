@@ -90,12 +90,12 @@ func (h *failoverHarness) enable(t *testing.T, instanceID, tokenID, threshold in
 	}
 }
 
-// TestFailoverReplacesWhenThresholdReached covers the happy path: a no_balance
+// TestFailoverReplacesWhenThresholdReached covers the happy path: a banned
 // account at the threshold is replaced on the group's healthy account, the
 // config is moved (with the token updated), and the boot script follows.
 func TestFailoverReplacesWhenThresholdReached(t *testing.T) {
 	h := newFailoverHarness(t)
-	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
 	h.enable(t, 42, 1, 1)
 	if err := h.srv.Store.SetInstanceScript(42, "#!/bin/bash\necho hi"); err != nil {
 		t.Fatalf("SetInstanceScript: %v", err)
@@ -146,14 +146,14 @@ func TestFailoverReplacesWhenThresholdReached(t *testing.T) {
 // threshold only bumps FailCount and does not create an instance.
 func TestFailoverBelowThresholdAccumulates(t *testing.T) {
 	h := newFailoverHarness(t)
-	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance})
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned})
 	h.enable(t, 42, 1, 3)
 
 	h.monitor.tickOnce(context.Background())
 
 	cfg, _ := h.srv.Store.Failover(42)
-	if cfg.FailCount != 1 || cfg.LastStatus != HealthNoBalance {
-		t.Fatalf("第一次失败后 = %+v, want fail=1 no_balance", cfg)
+	if cfg.FailCount != 1 || cfg.LastStatus != HealthBanned {
+		t.Fatalf("第一次失败后 = %+v, want fail=1 banned", cfg)
 	}
 	if h.api.called("CreateInstance") {
 		t.Fatal("未达阈值不应创建实例")
@@ -164,7 +164,7 @@ func TestFailoverBelowThresholdAccumulates(t *testing.T) {
 // the config is left in an error state and no instance is created.
 func TestFailoverNoAvailableAccount(t *testing.T) {
 	h := newFailoverHarness(t)
-	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthBanned})
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthBanned})
 	h.enable(t, 42, 1, 1)
 
 	h.monitor.tickOnce(context.Background())
@@ -225,9 +225,9 @@ func TestFailoverHealthErrorNotCounted(t *testing.T) {
 func TestFailoverCachedFallbackOnGetInstanceError(t *testing.T) {
 	h := newFailoverHarness(t)
 	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
-	// 旧账号已不可达：直接取实例会失败。
+	// 旧账号已不可达：读取实例时报封号错误（归类为 banned），仍应累计并替换。
 	h.api.getInstance = func(context.Context, int) (linode.Instance, error) {
-		return linode.Instance{}, errors.New("account suspended")
+		return linode.Instance{}, &linode.APIError{StatusCode: 403, Reason: "account suspended"}
 	}
 	// 本地缓存里保留旧实例的配置，替换应回退到这里。
 	if err := h.srv.Store.CacheInstances(1, []linode.Instance{{
@@ -261,7 +261,7 @@ func TestFailoverCachedFallbackOnGetInstanceError(t *testing.T) {
 // stops in an error state without creating an instance.
 func TestFailoverMissingGroup(t *testing.T) {
 	h := newFailoverHarness(t)
-	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
 	if err := h.srv.Store.SetFailover(store.Failover{
 		InstanceID: 42, UserID: 1, GroupID: 99999, TokenID: 1,
 		Enabled: true, Threshold: 1, IntervalSec: 60,
@@ -280,5 +280,81 @@ func TestFailoverMissingGroup(t *testing.T) {
 	}
 	if h.api.called("CreateInstance") {
 		t.Fatal("组不存在不应创建实例")
+	}
+}
+
+// TestFailoverNoBalanceInstanceRunningNotCounted verifies that a no_balance
+// account whose instance is still running is treated as healthy: the fail count
+// is reset and no replacement happens (欠费宽限期实例仍服务中).
+func TestFailoverNoBalanceInstanceRunningNotCounted(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.enable(t, 42, 1, 1)
+	// 预置一个失败计数，验证会被归零。
+	if err := h.srv.Store.UpdateFailoverState(42, 2, HealthNoBalance, "x", "", ""); err != nil {
+		t.Fatalf("UpdateFailoverState: %v", err)
+	}
+
+	h.monitor.tickOnce(context.Background())
+
+	cfg, _ := h.srv.Store.Failover(42)
+	if cfg.FailCount != 0 || cfg.LastStatus != HealthOK {
+		t.Fatalf("实例 running 时 = %+v, want ok/0", cfg)
+	}
+	if h.api.called("Boot") {
+		t.Fatal("实例 running 不应尝试启动")
+	}
+	if h.api.called("CreateInstance") {
+		t.Fatal("实例 running 不应触发替换")
+	}
+}
+
+// TestFailoverNoBalanceInstanceStoppedBootsOk verifies a stopped instance that
+// can be booted is considered available: no fail count, no replacement.
+func TestFailoverNoBalanceInstanceStoppedBootsOk(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+		return linode.Instance{ID: id, Status: "stopped", Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
+	}
+	h.enable(t, 42, 1, 1)
+
+	h.monitor.tickOnce(context.Background())
+
+	if !h.api.called("Boot") {
+		t.Fatal("实例 stopped 应尝试启动")
+	}
+	cfg, _ := h.srv.Store.Failover(42)
+	if cfg.FailCount != 0 || cfg.LastStatus != HealthOK {
+		t.Fatalf("实例能启动时 = %+v, want ok/0", cfg)
+	}
+	if h.api.called("CreateInstance") {
+		t.Fatal("实例能启动不应触发替换")
+	}
+}
+
+// TestFailoverNoBalanceInstanceStoppedBootFails verifies a stopped instance
+// that cannot be booted is genuinely unusable: the fail count accrues and a
+// replacement happens at the threshold.
+func TestFailoverNoBalanceInstanceStoppedBootFails(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
+	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+		return linode.Instance{ID: id, Status: "stopped", Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12"}, nil
+	}
+	h.api.boot = func(context.Context, int) error { return errors.New("boot failed") }
+	h.enable(t, 42, 1, 1)
+
+	h.monitor.tickOnce(context.Background())
+
+	if _, ok := h.srv.Store.Failover(42); ok {
+		t.Fatal("实例无法启动应触发替换并迁移配置")
+	}
+	cfg, ok := h.srv.Store.Failover(100)
+	if !ok || cfg.TokenID != 2 || cfg.LastStatus != HealthOK {
+		t.Fatalf("替换后新配置 = %+v ok=%v", cfg, ok)
+	}
+	if !h.api.called("CreateInstance") {
+		t.Fatal("实例确实不可用时应创建替换实例")
 	}
 }
