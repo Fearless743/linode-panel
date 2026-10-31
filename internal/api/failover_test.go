@@ -80,6 +80,22 @@ func probeByPAT(byPAT map[string]string) func(context.Context, string) (string, 
 	}
 }
 
+// setGroupInstanceConfig sets the group's pre-filled boot config so that
+// replace() can proceed in strict mode.
+func setGroupInstanceConfig(t *testing.T, h *failoverHarness) {
+	t.Helper()
+	booted := true
+	if err := h.srv.Store.UpdateAccountGroupConfig(1, h.groupID, &store.InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web",
+		Booted: &booted,
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig: %v", err)
+	}
+}
+
 func (h *failoverHarness) enable(t *testing.T, instanceID, tokenID, threshold int) {
 	t.Helper()
 	if err := h.srv.Store.SetFailover(store.Failover{
@@ -91,15 +107,17 @@ func (h *failoverHarness) enable(t *testing.T, instanceID, tokenID, threshold in
 }
 
 // TestFailoverReplacesWhenThresholdReached covers the happy path: a banned
-// account at the threshold is replaced on the group's healthy account, the
-// config is moved (with the token updated), and the boot script follows.
+// account at the threshold is replaced on the group's healthy account using
+// the group's pre-filled boot config, the config is moved (with the token
+// updated), and the boot script follows.
 func TestFailoverReplacesWhenThresholdReached(t *testing.T) {
 	h := newFailoverHarness(t)
 	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
+	// 先设置组的目标开机配置（严格模式：replace 只读组配置，不读旧实例）。
+	setGroupInstanceConfig(t, h)
 	h.enable(t, 42, 1, 1)
-	if err := h.srv.Store.SetInstanceScript(42, "#!/bin/bash\necho hi"); err != nil {
-		t.Fatalf("SetInstanceScript: %v", err)
-	}
+	// 旧实例的开机脚本——在严格模式下不再迁移旧脚本，而是用组配置里的脚本。
+	// 组配置里未设置 script，所以新实例不应有脚本。
 
 	h.monitor.tickOnce(context.Background())
 
@@ -119,26 +137,27 @@ func TestFailoverReplacesWhenThresholdReached(t *testing.T) {
 	if !strings.Contains(cfg.LastDetail, "backup") {
 		t.Fatalf("替换详情应含候选账号名, got %q", cfg.LastDetail)
 	}
-	if script, ok := h.srv.Store.InstanceScript(100); !ok || !strings.Contains(script, "echo hi") {
-		t.Fatalf("开机脚本应迁移到新实例, got %q ok=%v", script, ok)
-	}
 	if !h.api.called("CreateInstance") {
 		t.Fatal("应在候选账号创建替换实例")
 	}
-	// 替换实例必须沿用旧实例的相同配置，且开机启动。
+	// 替换实例必须沿用组配置。
 	if len(*h.createOpts) != 1 {
 		t.Fatalf("CreateInstance 调用次数 = %d, want 1", len(*h.createOpts))
 	}
 	opts := (*h.createOpts)[0]
 	if opts.Region != "us-east" || opts.Type != "g6-standard-1" ||
 		opts.Image != "linode/debian12" || opts.Label != "web" {
-		t.Fatalf("CreateOptions 应与旧实例一致, got %+v", opts)
+		t.Fatalf("CreateOptions 应与组配置一致, got %+v", opts)
 	}
 	if opts.Booted == nil || !*opts.Booted {
 		t.Fatalf("CreateOptions.Booted 应为 true, got %v", opts.Booted)
 	}
 	if !h.api.called("DeleteInstance") {
 		t.Fatal("应尽力清理旧实例")
+	}
+	// 严格模式下不再迁移旧实例脚本；新实例不应有脚本（组配置未设置 script）。
+	if _, ok := h.srv.Store.InstanceScript(100); ok {
+		t.Fatal("新实例不应有开机脚本（组配置未设置 script）")
 	}
 }
 
@@ -161,10 +180,12 @@ func TestFailoverBelowThresholdAccumulates(t *testing.T) {
 }
 
 // TestFailoverNoAvailableAccount verifies that when no group member is healthy
-// the config is left in an error state and no instance is created.
+// (but a group config is set) the config is left in an error state and no instance
+// is created.
 func TestFailoverNoAvailableAccount(t *testing.T) {
 	h := newFailoverHarness(t)
 	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthBanned})
+	setGroupInstanceConfig(t, h) // 设置组配置，让流程走到无可用账号分支
 	h.enable(t, 42, 1, 1)
 
 	h.monitor.tickOnce(context.Background())
@@ -219,41 +240,87 @@ func TestFailoverHealthErrorNotCounted(t *testing.T) {
 	}
 }
 
-// TestFailoverCachedFallbackOnGetInstanceError verifies that when the old
-// account is unreachable (GetInstance fails) the replacement still proceeds
-// using the locally cached instance snapshot.
-func TestFailoverCachedFallbackOnGetInstanceError(t *testing.T) {
+// TestFailoverNoGroupConfigErrors verifies that when the group has no
+// pre-filled boot config, replace() does not create an instance and leaves
+// the failover state in error with the specific message.
+func TestFailoverNoGroupConfigErrors(t *testing.T) {
 	h := newFailoverHarness(t)
-	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthNoBalance, "pat2": HealthOK})
-	// 旧账号已不可达：读取实例时报封号错误（归类为 banned），仍应累计并替换。
-	h.api.getInstance = func(context.Context, int) (linode.Instance, error) {
-		return linode.Instance{}, &linode.APIError{StatusCode: 403, Reason: "account suspended"}
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
+	// 故意不设置组配置——严格模式下应直接报 error。
+	h.enable(t, 42, 1, 1)
+
+	h.monitor.tickOnce(context.Background())
+
+	cfg, _ := h.srv.Store.Failover(42)
+	if cfg.LastStatus != "error" || cfg.FailCount != 0 {
+		t.Fatalf("未配置组目标开机配置后 = %+v, want error/0", cfg)
 	}
-	// 本地缓存里保留旧实例的配置，替换应回退到这里。
-	if err := h.srv.Store.CacheInstances(1, []linode.Instance{{
-		ID: 42, Label: "cached-web", Status: "running", Region: "eu-west",
-		Type: "g6-standard-2", Image: "linode/debian11",
-	}}); err != nil {
-		t.Fatalf("CacheInstances: %v", err)
+	if !strings.Contains(cfg.LastDetail, "未填写账号组目标开机配置") {
+		t.Fatalf("详情 = %q, want 含「未填写账号组目标开机配置」", cfg.LastDetail)
+	}
+	if h.api.called("CreateInstance") {
+		t.Fatal("未配置组目标开机配置不应创建实例")
+	}
+}
+
+// TestFailoverGroupConfigScriptWritten verifies that the boot script
+// pre-filled in the group config is written to the new instance.
+func TestFailoverGroupConfigScriptWritten(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
+	// 组配置里带 script
+	booted := true
+	if err := h.srv.Store.UpdateAccountGroupConfig(1, h.groupID, &store.InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web",
+		Script: "#!/bin/bash\necho from-group-config",
+		Booted: &booted,
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig: %v", err)
 	}
 	h.enable(t, 42, 1, 1)
 
 	h.monitor.tickOnce(context.Background())
 
-	cfg, found := h.srv.Store.Failover(100)
-	if !found {
-		t.Fatal("回退缓存后应成功创建并迁移到新实例")
+	if _, ok := h.srv.Store.Failover(100); !ok {
+		t.Fatal("新实例应存在替换配置")
 	}
-	if cfg.LastStatus != HealthOK || cfg.TokenID != 2 {
-		t.Fatalf("新配置 = %+v, want ok/token=2", cfg)
+	script, ok := h.srv.Store.InstanceScript(100)
+	if !ok {
+		t.Fatal("新实例应有开机脚本")
 	}
+	if !strings.Contains(script, "echo from-group-config") {
+		t.Fatalf("脚本 = %q, want 含组配置里的脚本", script)
+	}
+}
+
+// TestFailoverGroupConfigBootedFalse verifies that when the group config sets
+// booted=false the CreateInstance call passes booted=false.
+func TestFailoverGroupConfigBootedFalse(t *testing.T) {
+	h := newFailoverHarness(t)
+	h.monitor.probe = probeByPAT(map[string]string{"pat1": HealthBanned, "pat2": HealthOK})
+	falseVal := false
+	if err := h.srv.Store.UpdateAccountGroupConfig(1, h.groupID, &store.InstanceConfigJSON{
+		Region: "us-east",
+		Type:   "g6-standard-1",
+		Image:  "linode/debian12",
+		Label:  "web",
+		Booted: &falseVal,
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroupConfig: %v", err)
+	}
+	h.enable(t, 42, 1, 1)
+
+	h.monitor.tickOnce(context.Background())
+
 	if len(*h.createOpts) != 1 {
 		t.Fatalf("CreateInstance 调用次数 = %d, want 1", len(*h.createOpts))
 	}
 	opts := (*h.createOpts)[0]
-	if opts.Region != "eu-west" || opts.Type != "g6-standard-2" ||
-		opts.Image != "linode/debian11" || opts.Label != "cached-web" {
-		t.Fatalf("应使用缓存快照创建, got %+v", opts)
+	if opts.Booted == nil || *opts.Booted {
+		t.Fatalf("CreateOptions.Booted 应为 false, got %v", opts.Booted)
 	}
 }
 
@@ -346,6 +413,8 @@ func TestFailoverNoBalanceInstanceStoppedBootFails(t *testing.T) {
 	h.api.boot = func(context.Context, int) error {
 		return &linode.APIError{StatusCode: 400, Reason: "insufficient balance to boot"}
 	}
+	// 严格模式：替换必须用组配置，需先设置。
+	setGroupInstanceConfig(t, h)
 	h.enable(t, 42, 1, 1)
 
 	h.monitor.tickOnce(context.Background())
@@ -359,6 +428,14 @@ func TestFailoverNoBalanceInstanceStoppedBootFails(t *testing.T) {
 	}
 	if !h.api.called("CreateInstance") {
 		t.Fatal("实例确实不可用时应创建替换实例")
+	}
+	// 创建请求应使用组配置（region=us-east 等）。
+	if len(*h.createOpts) != 1 {
+		t.Fatalf("CreateInstance 调用次数 = %d, want 1", len(*h.createOpts))
+	}
+	opts := (*h.createOpts)[0]
+	if opts.Region != "us-east" || opts.Type != "g6-standard-1" || opts.Image != "linode/debian12" || opts.Label != "web" {
+		t.Fatalf("CreateOptions 应与组配置一致, got %+v", opts)
 	}
 }
 
