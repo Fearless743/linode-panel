@@ -314,6 +314,15 @@ cd frontend && npm run dev
 
 镜像标签：分支名、`v*` 标签及其语义化版本（`1.2.3`、`1.2`）、commit sha；默认分支额外打 `latest`。
 
+Release 工作流直接使用仓库中已提交的 `web/` 前端产物（由 `//go:embed` 打进二进制），不再在 CI 重复构建前端。**修改前端后请先在本地构建并提交 `web/`**，否则发布出的二进制会带旧 UI：
+
+```bash
+cd frontend && npm run build && cd ..
+git add web && git commit -m "web: 重新构建前端产物"
+```
+
+Docker 工作流不受影响：镜像构建阶段仍会从 `frontend/` 重新构建前端。
+
 面板容器（数据持久化在 `/data`）：
 
 ```bash
