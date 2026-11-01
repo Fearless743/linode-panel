@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -112,11 +113,22 @@ func (s *Server) handleAgentResult(w http.ResponseWriter, r *http.Request) {
 // per-instance configuration is inherited even when the rebuild ran on an
 // agent.
 func (s *Server) completeAgentCommand(cmd agenthub.Command, result agenthub.Result) {
-	if cmd.Type == agenthub.CmdReboot {
+	switch {
+	case cmd.Type == agenthub.CmdReboot:
 		oldID, oldOK := agenthub.IntParam(cmd.Params["id"])
 		newID, newOK := agenthub.IntParam(result.Payload["new_instance_id"])
 		if oldOK && newOK && newID > 0 {
 			s.repointInstanceCache(oldID, newID)
+		}
+	case cmd.Type == agenthub.CmdDelete && result.OK:
+		// The agent deleted the instance upstream; drop the panel record too so
+		// it does not come back as an unavailable row after the next list.
+		id, idOK := agenthub.IntParam(cmd.Params["id"])
+		tid, tidOK := agenthub.IntParam(cmd.Params["token_id"])
+		if idOK && tidOK && tid > 0 {
+			if err := s.Store.DeleteInstanceCache(tid, id); err != nil {
+				slog.Warn("agent 删除实例后清理缓存失败", "token_id", tid, "instance_id", id, "error", err)
+			}
 		}
 	}
 	s.Hub.CompleteCommand(cmd.ID, result)

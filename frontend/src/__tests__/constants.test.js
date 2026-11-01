@@ -28,12 +28,13 @@ describe("PERM_LABELS", () => {
 });
 
 describe("STATUS_LABELS", () => {
-  it("覆盖 running/offline/booting/rebooting/shutting_down", () => {
+  it("覆盖 running/offline/booting/rebooting/shutting_down/unavailable", () => {
     expect(Object.keys(STATUS_LABELS).sort()).toEqual(
-      ["booting", "offline", "rebooting", "running", "shutting_down"].sort()
+      ["booting", "offline", "rebooting", "running", "shutting_down", "unavailable"].sort()
     );
     expect(STATUS_LABELS.running).toBe("运行中");
     expect(STATUS_LABELS.offline).toBe("已关机");
+    expect(STATUS_LABELS.unavailable).toBe("不可用");
   });
 });
 

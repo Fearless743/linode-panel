@@ -35,6 +35,7 @@ export default function InstanceTable({
   onAction,
   onRebuild,
   onEdit,
+  onMigrate,
   onRefreshGroup,
   onDelete,
   refreshingKey,
@@ -93,6 +94,7 @@ export default function InstanceTable({
                   onAction={onAction}
                   onRebuild={onRebuild}
                   onEdit={onEdit}
+                  onMigrate={onMigrate}
                   onDelete={onDelete}
                 />
               ))}

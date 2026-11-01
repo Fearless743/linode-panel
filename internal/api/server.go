@@ -205,6 +205,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/instances/{id}/boot", s.requireAuth(store.PermPower, s.handleBoot))
 	mux.HandleFunc("POST /api/instances/{id}/shutdown", s.requireAuth(store.PermPower, s.handleShutdown))
 	mux.HandleFunc("POST /api/instances/{id}/reboot", s.requireAuth(store.PermPower, s.handleReboot))
+	// 手动迁移：在上游已不存在的实例可凭缓存配置在另一个账号上重建并迁移面板配置。
+	mux.HandleFunc("POST /api/instances/{id}/migrate", s.requireAuth(store.PermPower, s.handleMigrateInstance))
 	mux.HandleFunc("DELETE /api/instances/{id}", s.requireAuth(store.PermPower, s.handleDeleteInstance))
 
 	// Rebuild permission.
@@ -285,11 +287,12 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	for _, tok := range s.Store.TokensOf(user.ID) {
 		client := s.clientFor(tok.Token)
 
+		rows := s.Store.CachedInstanceRows(tok.ID)
 		cached := s.Store.CachedInstances(tok.ID)
 		// A mutating action marks the snapshot stale without dropping rows, so
 		// the stable cache ids (and thus per-instance configuration) survive.
 		if !forceRefresh && len(cached) > 0 && !s.Store.InstanceCacheStale(tok.ID) {
-			s.appendInstances(&resp, cached, tok, "")
+			s.appendCachedRows(&resp, rows, tok, "")
 			continue
 		}
 
@@ -298,40 +301,93 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 			// A single failed PAT must not break the whole list; fall back to
 			// the last cached snapshot when one exists.
 			slog.Warn("list instances failed", "token_id", tok.ID, "error", err)
-			if len(cached) > 0 {
-				s.appendInstances(&resp, cached, tok, "Linode API 暂不可用，显示缓存数据")
+			if len(rows) > 0 {
+				s.appendCachedRows(&resp, rows, tok, "Linode API 暂不可用，显示缓存数据")
 			}
 			continue
 		}
-		// Persist the freshly fetched snapshot for future reads.
+		// Persist the freshly fetched snapshot for future reads. Missing rows
+		// are kept (marked unavailable) instead of being dropped.
 		if err := s.Store.CacheInstances(tok.ID, insts); err != nil {
 			slog.Warn("cache instances failed", "token_id", tok.ID, "error", err)
+			s.appendInstances(&resp, insts, tok, "")
+			s.appendCachedRows(&resp, missingRowsExcept(rows, insts), tok, "")
+			continue
 		}
-		s.appendInstances(&resp, insts, tok, "")
+		s.appendCachedRows(&resp, s.Store.CachedInstanceRows(tok.ID), tok, "")
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// missingRowsExcept filters a snapshot down to instances that no longer exist
+// upstream, excluding instance ids present in insts (used when a fresh cache
+// write failed, so a revived instance is not listed twice).
+func missingRowsExcept(rows []store.CachedInstanceRow, insts []linode.Instance) []store.CachedInstanceRow {
+	seen := make(map[int]bool, len(insts))
+	for _, in := range insts {
+		seen[in.ID] = true
+	}
+	out := make([]store.CachedInstanceRow, 0, len(rows))
+	for _, row := range rows {
+		if !row.Alive && !seen[row.Instance.ID] {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// appendCachedRows appends a token's cached snapshot rows. Missing rows are
+// reported with status "unavailable" and missing=true so the UI keeps them
+// visible and offers manual migration.
+func (s *Server) appendCachedRows(resp *listInstancesResponse, rows []store.CachedInstanceRow, tok store.Token, fetchErr string) {
+	for _, row := range rows {
+		if row.Alive {
+			s.appendInstance(&resp.Instances, row.Instance, tok, fetchErr)
+			continue
+		}
+		// Never claim a running state for an instance that is gone upstream.
+		inst := row.Instance
+		inst.Status = "unavailable"
+		s.appendMissingInstance(&resp.Instances, inst, tok, "该实例在 Linode 已不存在，可迁移到其他账号")
+	}
 }
 
 // appendInstances converts linode instances into the response shape and
 // appends them to resp, tagging each with fetchErr when served from cache.
 func (s *Server) appendInstances(resp *listInstancesResponse, insts []linode.Instance, tok store.Token, fetchErr string) {
 	for _, in := range insts {
-		resp.Instances = append(resp.Instances, instanceJSON{
-			ID:         in.ID,
-			Label:      in.Label,
-			Status:     in.Status,
-			Region:     in.Region,
-			Type:       in.Type,
-			Image:      in.Image,
-			IPv4:       orEmpty(in.IPv4),
-			IPv6:       in.IPv6,
-			SSHCommand: s.sshCommand(s.listHost(in)),
-			Tags:       orEmpty(in.Tags),
-			Created:    in.Created,
-			TokenID:    tok.ID,
-			TokenLabel: tok.Label,
-			FetchError: fetchErr,
-		})
+		s.appendInstance(&resp.Instances, in, tok, fetchErr)
+	}
+}
+
+// appendInstance appends one live instance row.
+func (s *Server) appendInstance(out *[]instanceJSON, in linode.Instance, tok store.Token, fetchErr string) {
+	*out = append(*out, s.instanceJSONFor(in, tok, fetchErr, false))
+}
+
+// appendMissingInstance appends one unavailable (gone upstream) instance row.
+func (s *Server) appendMissingInstance(out *[]instanceJSON, in linode.Instance, tok store.Token, fetchErr string) {
+	*out = append(*out, s.instanceJSONFor(in, tok, fetchErr, true))
+}
+
+// instanceJSONFor builds the shared instance response row.
+func (s *Server) instanceJSONFor(in linode.Instance, tok store.Token, fetchErr string, missing bool) instanceJSON {
+	return instanceJSON{
+		ID:         in.ID,
+		Label:      in.Label,
+		Status:     in.Status,
+		Region:     in.Region,
+		Type:       in.Type,
+		Image:      in.Image,
+		IPv4:       orEmpty(in.IPv4),
+		IPv6:       in.IPv6,
+		SSHCommand: s.sshCommand(s.listHost(in)),
+		Tags:       orEmpty(in.Tags),
+		Created:    in.Created,
+		TokenID:    tok.ID,
+		TokenLabel: tok.Label,
+		FetchError: fetchErr,
+		Missing:    missing,
 	}
 }
 
@@ -497,20 +553,35 @@ func (s *Server) powerAction(w http.ResponseWriter, r *http.Request, action stri
 }
 
 // handleDeleteInstance permanently removes an instance upstream (DELETE
-// /linode/instances/{id}) and evicts it from the token's cached snapshot so the
-// next list no longer shows the deleted row. The execution channel follows the
-// account binding: a bound account deletes through its agent, otherwise the
-// panel calls the Linode API directly.
+// /linode/instances/{id}) and deletes it from the token's cached snapshot. If
+// the cached row is already marked missing upstream (unmigratable stale
+// record), only the panel-side row and its configuration are purged.
+// The execution channel follows the account binding: a bound account deletes
+// through its agent, otherwise the panel calls the Linode API directly.
 func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
 	user, _ := UserFrom(r.Context())
+	sourceTID := s.tokenIDFor(user, r.URL.Query().Get("token_id"))
+	// A missing instance cannot be deleted upstream (it is already gone), so
+	// only purge the panel record instead of failing with a 404.
+	if sourceTID > 0 {
+		if row, found := s.Store.InstanceCacheRow(sourceTID, id); found && !row.Alive {
+			if err := s.Store.DeleteInstanceCache(sourceTID, id); err != nil {
+				slog.Warn("purge missing instance cache failed", "token_id", sourceTID, "instance_id", id, "error", err)
+			}
+			writeJSON(w, http.StatusOK, okResponse{OK: true})
+			return
+		}
+	}
 	if s.viaAgentForRequest(user, r.URL.Query().Get("token_id"), r.URL.Query().Get("via_agent")) {
-		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdDelete, map[string]any{
-			"id": id,
-		})
+		params := map[string]any{"id": id}
+		if sourceTID > 0 {
+			params["token_id"] = sourceTID
+		}
+		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdDelete, params)
 		if !ok {
 			return
 		}
@@ -525,9 +596,9 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if tid := s.tokenIDFor(user, r.URL.Query().Get("token_id")); tid > 0 {
-		if err := s.Store.RemoveInstanceCache(tid, id); err != nil {
-			slog.Warn("remove instance cache failed", "token_id", tid, "instance_id", id, "error", err)
+	if sourceTID > 0 {
+		if err := s.Store.DeleteInstanceCache(sourceTID, id); err != nil {
+			slog.Warn("delete instance cache failed", "token_id", sourceTID, "instance_id", id, "error", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
@@ -542,10 +613,11 @@ func parseID(w http.ResponseWriter, r *http.Request) (int, bool) {
 	return id, true
 }
 
-// evictMissingInstance removes id from the request token's cached snapshot when
-// the Linode API reports it as not found (deleted upstream, or no longer owned
-// by the account). Without this, the cache-first list keeps showing the row
-// while every per-row refresh returns 404 — a "stuck" instance.
+// evictMissingInstance marks id as unavailable in the request token's cached
+// snapshot when the Linode API reports it as not found (deleted upstream, or no
+// longer owned by the account). The row is kept so the list still shows it as
+// unavailable and the user can migrate it to another account; it returns to
+// alive after a successful refresh/relist.
 func (s *Server) evictMissingInstance(r *http.Request, id int, err error) {
 	var apiErr *linode.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
@@ -556,8 +628,8 @@ func (s *Server) evictMissingInstance(r *http.Request, id int, err error) {
 	if tid <= 0 {
 		return
 	}
-	if err := s.Store.RemoveInstanceCache(tid, id); err != nil {
-		slog.Warn("remove stale instance cache failed", "token_id", tid, "instance_id", id, "error", err)
+	if err := s.Store.MarkInstanceMissing(tid, id); err != nil {
+		slog.Warn("mark instance missing failed", "token_id", tid, "instance_id", id, "error", err)
 	}
 }
 
@@ -611,6 +683,9 @@ type instanceJSON struct {
 	TokenID    int      `json:"token_id"`
 	TokenLabel string   `json:"token_label"`
 	FetchError string   `json:"fetch_error,omitempty"`
+	// Missing marks an instance that no longer exists upstream. It stays in
+	// the list as unavailable so the user can migrate it to another account.
+	Missing bool `json:"missing,omitempty"`
 }
 
 type statusResponse struct {

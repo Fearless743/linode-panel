@@ -7,6 +7,7 @@ import {
   instanceAction,
   listInstances,
   listRebuildTasks,
+  migrateInstance,
   rebuildInstance,
   refreshInstance,
 } from "../api";
@@ -19,6 +20,7 @@ import ActionModal from "../components/instances/ActionModal";
 import RebuildModal from "../components/instances/RebuildModal";
 import CreateInstanceModal from "../components/instances/CreateInstanceModal";
 import InstanceEditModal from "../components/instances/InstanceEditModal";
+import MigrateInstanceModal from "../components/instances/MigrateInstanceModal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 
 export default function Instances() {
@@ -32,6 +34,7 @@ export default function Instances() {
   const [actionModal, setActionModal] = useState(null); // { inst, action }
   const [rebuildModal, setRebuildModal] = useState(null); // inst
   const [editModal, setEditModal] = useState(null); // inst
+  const [migrateModal, setMigrateModal] = useState(null); // inst
   const [deleteModal, setDeleteModal] = useState(null); // inst
   const [customScriptIds, setCustomScriptIds] = useState(() => new Set());
   // 已开启「被墙后自动换 IP」的实例 id 集合（用于行内标记）。
@@ -49,9 +52,21 @@ export default function Instances() {
     []
   );
 
-  // 实例在上游已不存在（404）时从列表移除，避免「卡实例」一直显示。
-  const removeInstance = useCallback((id) => {
-    setInstances((prev) => prev.filter((i) => i.id !== id));
+  // 实例在上游已不存在（404）时保留该行并标记为不可用（可手动迁移），
+  // 不再从列表中移除。
+  const markInstanceMissing = useCallback((id) => {
+    setInstances((prev) =>
+      prev.map((i) =>
+        i.id === id
+          ? {
+              ...i,
+              missing: true,
+              status: "unavailable",
+              fetch_error: "该实例在 Linode 已不存在，可迁移到其他账号",
+            }
+          : i
+      )
+    );
   }, []);
 
   // 行状态（timer/sshReady/startedAt/…）+ 状态轮询 + SSH 探测，集中在 hook 中。
@@ -59,7 +74,7 @@ export default function Instances() {
     useInstancePolling({
       findInstance,
       showBanner,
-      onInstanceMissing: removeInstance,
+      onInstanceMissing: markInstanceMissing,
     });
 
   // 哪些实例配置了自定义脚本（用于在行内标记）。
@@ -187,11 +202,21 @@ export default function Instances() {
     });
 
     if (refreshed.length > 0 || missingIds.length > 0) {
+      const missingSet = new Set(missingIds);
       setInstances((prev) => {
         const byId = new Map(refreshed.map((i) => [i.id, i]));
-        return prev
-          .filter((i) => !missingIds.includes(i.id))
-          .map((i) => byId.get(i.id) || i);
+        return prev.map((i) => {
+          if (missingSet.has(i.id)) {
+            // 上游已不存在：保留该行并标记不可用，允许手动迁移。
+            return {
+              ...i,
+              missing: true,
+              status: "unavailable",
+              fetch_error: "该实例在 Linode 已不存在，可迁移到其他账号",
+            };
+          }
+          return byId.get(i.id) || i;
+        });
       });
       bump();
     }
@@ -199,7 +224,9 @@ export default function Instances() {
 
     const notes = [];
     if (missingIds.length > 0) {
-      notes.push("有 " + missingIds.length + " 个实例在 Linode 已不存在，已从列表移除");
+      notes.push(
+        "有 " + missingIds.length + " 个实例在 Linode 已不存在，已标记为不可用（可迁移到其他账号）"
+      );
     }
     if (failed.length > 0) {
       notes.push("刷新失败：" + failed.join("；"));
@@ -276,8 +303,24 @@ export default function Instances() {
     loadInstances();
   };
 
+  // ---------- 手动迁移（上游已不存在的实例） ----------
+  const confirmMigrate = async ({ targetTokenId, rootPassword, label }) => {
+    const inst = migrateModal;
+    if (!inst) return;
+    hideBanner();
+    await migrateInstance(inst.id, {
+      token_id: inst.token_id,
+      target_token_id: targetTokenId,
+      root_password: rootPassword || undefined,
+      label: label || undefined,
+    });
+    await loadInstances();
+    showBanner("实例已迁移到目标账号；开机脚本将在新实例启动后自动执行", false);
+  };
+
   // ---------- 删除实例 ----------
   // 确认后调用 API 永久删除实例；执行通道跟随账号绑定。
+  // 对不可用实例，删除只会清理面板中的缓存记录及其配置。
   const confirmDelete = async () => {
     const inst = deleteModal;
     if (!inst) return;
@@ -285,15 +328,15 @@ export default function Instances() {
     const tokenId = inst.token_id != null ? inst.token_id : "";
     try {
       const res = await deleteInstance(inst.id, tokenId);
-      // 经 Agent 下发时删除是异步的，不立即移除行（后续刷新会因 404 自动移除）。
+      // 经 Agent 下发时删除是异步的，不立即移除行（Agent 成功后后端清理缓存）。
       if (res && res.command_id != null) {
         showBanner("删除命令已下发至 Agent（命令 #" + res.command_id + "）", false);
       } else {
         stopPolling(inst.id);
         resetRowState(inst.id);
-        removeInstance(inst.id);
+        setInstances((prev) => prev.filter((i) => i.id !== inst.id));
         bump();
-        showBanner("实例已删除", false);
+        showBanner(inst.missing ? "缓存记录已删除" : "实例已删除", false);
       }
     } catch (err) {
       showBanner("删除失败：" + (err.message || "未知错误"), false);
@@ -334,6 +377,7 @@ export default function Instances() {
           onAction={(inst, action) => setActionModal({ inst, action })}
           onRebuild={(inst) => setRebuildModal(inst)}
           onEdit={(inst) => setEditModal(inst)}
+          onMigrate={(inst) => setMigrateModal(inst)}
           onRefreshGroup={refreshGroup}
           refreshingKey={refreshingKey}
           onDelete={(inst) => setDeleteModal(inst)}
@@ -369,18 +413,30 @@ export default function Instances() {
           onAutoRebuildChanged={loadAutoRebuildStatus}
         />
       )}
+      {migrateModal && (
+        <MigrateInstanceModal
+          inst={migrateModal}
+          tokens={tokens}
+          onClose={() => setMigrateModal(null)}
+          onConfirm={confirmMigrate}
+        />
+      )}
       {deleteModal && (
         <ConfirmDialog
-          title="删除实例"
+          title={deleteModal.missing ? "删除缓存记录" : "删除实例"}
           message={
-            "确定删除实例 " +
-            (deleteModal.label || "#" + deleteModal.id) +
-            " 吗？该操作不可恢复，实例及其磁盘将被永久删除。" +
-            (deleteAgentName
-              ? "将通过 Agent「" + deleteAgentName + "」执行。"
-              : "将通过面板直发执行。")
+            deleteModal.missing
+              ? "实例 " +
+                (deleteModal.label || "#" + deleteModal.id) +
+                " 在 Linode 已不存在。删除只会清理面板中的缓存记录及其配置，不影响任何运行中的实例。"
+              : "确定删除实例 " +
+                (deleteModal.label || "#" + deleteModal.id) +
+                " 吗？该操作不可恢复，实例及其磁盘将被永久删除。" +
+                (deleteAgentName
+                  ? "将通过 Agent「" + deleteAgentName + "」执行。"
+                  : "将通过面板直发执行。")
           }
-          confirmText="删除"
+          confirmText={deleteModal.missing ? "删除记录" : "删除"}
           danger
           onConfirm={confirmDelete}
           onCancel={() => setDeleteModal(null)}

@@ -16,70 +16,92 @@ export default function InstanceRow({
   onAction,
   onRebuild,
   onEdit,
+  onMigrate,
   onDelete,
 }) {
+  const missing = inst.missing === true;
   const status = st.lastStatus || inst.status;
   const tags = Array.isArray(inst.tags) ? inst.tags : [];
   const ipv4 = Array.isArray(inst.ipv4) ? inst.ipv4 : [];
   // 运行中且已有探测结果（就绪/超时/出错）时展示 SSH 卡片。
   const showSSH =
-    status === "running" && st.statusData && (st.sshReady || st.sshProbeDone || st.sshError);
+    !missing &&
+    status === "running" &&
+    st.statusData &&
+    (st.sshReady || st.sshProbeDone || st.sshError);
 
   const renderActions = () => {
     const busy = isTransition(status);
     const canPower = hasPerm("power");
     // 刷新按钮已上移到账号分组行（按账号批量刷新），行内不再提供。
     const buttons = [];
-    if (canPower && status === "offline") {
-      buttons.push(
-        <button
-          key="boot"
-          className="action-btn primary"
-          type="button"
-          onClick={() => onAction(inst, "boot")}
-        >
-          开机
-        </button>
-      );
-    } else if (canPower && status === "running") {
-      buttons.push(
-        <button
-          key="shutdown"
-          className="action-btn"
-          type="button"
-          onClick={() => onAction(inst, "shutdown")}
-        >
-          关机
-        </button>,
-        <button
-          key="reboot"
-          className="action-btn danger"
-          type="button"
-          onClick={() => onAction(inst, "reboot")}
-        >
-          重启
-        </button>
-      );
-    } else if (busy) {
-      buttons.push(
-        <button key="busy" className="action-btn" type="button" disabled>
-          处理中…
-        </button>
-      );
-    }
-    if (hasPerm("rebuild")) {
-      buttons.push(
-        <button
-          key="rebuild"
-          className="action-btn danger"
-          type="button"
-          disabled={busy || rebuildRunning}
-          title={rebuildRunning ? "该实例已有重建任务进行中" : ""}
-          onClick={() => onRebuild(inst)}
-        >
-          重建
-        </button>
-      );
+    if (missing) {
+      // 上游已不存在：不提供开关机/重建，只允许迁移到其他账号或删除记录。
+      if (canPower) {
+        buttons.push(
+          <button
+            key="migrate"
+            className="action-btn primary"
+            type="button"
+            title="用缓存配置在另一个账号上重建该实例并迁移面板配置"
+            onClick={() => onMigrate(inst)}
+          >
+            迁移
+          </button>
+        );
+      }
+    } else {
+      if (canPower && status === "offline") {
+        buttons.push(
+          <button
+            key="boot"
+            className="action-btn primary"
+            type="button"
+            onClick={() => onAction(inst, "boot")}
+          >
+            开机
+          </button>
+        );
+      } else if (canPower && status === "running") {
+        buttons.push(
+          <button
+            key="shutdown"
+            className="action-btn"
+            type="button"
+            onClick={() => onAction(inst, "shutdown")}
+          >
+            关机
+          </button>,
+          <button
+            key="reboot"
+            className="action-btn danger"
+            type="button"
+            onClick={() => onAction(inst, "reboot")}
+          >
+            重启
+          </button>
+        );
+      } else if (busy) {
+        buttons.push(
+          <button key="busy" className="action-btn" type="button" disabled>
+            处理中…
+          </button>
+        );
+      }
+      if (hasPerm("rebuild")) {
+        buttons.push(
+          <button
+            key="rebuild"
+            className="action-btn danger"
+            type="button"
+            disabled={busy || rebuildRunning}
+            title={rebuildRunning ? "该实例已有重建任务进行中" : ""}
+            onClick={() => onRebuild(inst)}
+          >
+            重建
+          </button>
+        );
+      }
     }
     // 「编辑」按钮：合并开机脚本与自动换 IP 两个编辑区；需要其中任一权限才显示。
     if (hasPerm("script") || hasPerm("rebuild")) {
@@ -106,6 +128,7 @@ export default function InstanceRow({
       );
     }
     // 「删除」按钮：需 power 权限；过渡态（操作进行中）禁用，避免误删。
+    // 对不可用实例，删除只会清理面板中的缓存记录及其配置。
     if (canPower) {
       buttons.push(
         <button
@@ -115,7 +138,7 @@ export default function InstanceRow({
           disabled={busy}
           onClick={() => onDelete(inst)}
         >
-          删除
+          {missing ? "删除记录" : "删除"}
         </button>
       );
     }

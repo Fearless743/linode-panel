@@ -124,6 +124,17 @@ export function refreshInstance(id, tokenId) {
   );
 }
 
+// 手动迁移：上游已不存在的实例用缓存配置在另一个账号上重建，并把面板配置
+// （脚本、root 密码、自动换 IP、替换配置）迁移到新账号/新实例。
+// payload: { token_id（来源账号）, target_token_id, root_password?, label? }
+export function migrateInstance(id, payload) {
+  return jsonRequest(
+    "/api/instances/" + encodeURIComponent(id) + "/migrate",
+    "POST",
+    payload
+  );
+}
+
 // 永久删除实例（DELETE /linode/instances/{id}），并清空后端缓存。
 export function deleteInstance(id, tokenId) {
   return apiFetch(

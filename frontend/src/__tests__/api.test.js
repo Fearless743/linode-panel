@@ -12,6 +12,7 @@ import {
   getInstanceStatus,
   instanceAction,
   deleteInstance,
+  migrateInstance,
   rebuildInstance,
   createUser,
   listGroups,
@@ -273,6 +274,16 @@ describe("端点封装", () => {
     expect(url).toBe("/api/instances/i%2F1?token_id=7");
     expect(opts.method).toBe("DELETE");
     expect(opts.body).toBeUndefined();
+  });
+
+  it("migrateInstance POST JSON 到 migrate 端点", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ instance: { id: 100 } }));
+    const payload = { token_id: 1, target_token_id: 2, root_password: "pw" };
+    await migrateInstance("i/1", payload);
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/instances/i%2F1/migrate");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual(payload);
   });
 
   it("rebuildInstance POST JSON + via_agent", async () => {

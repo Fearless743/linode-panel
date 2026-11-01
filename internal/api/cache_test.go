@@ -107,6 +107,7 @@ type listResult struct {
 		Label      string `json:"label"`
 		Status     string `json:"status"`
 		FetchError string `json:"fetch_error"`
+		Missing    bool   `json:"missing"`
 	} `json:"instances"`
 }
 
@@ -285,11 +286,11 @@ func TestInstanceRefreshUpdatesRowAndCache(t *testing.T) {
 	}
 }
 
-// TestInstanceRefreshEvictsMissingFromCache covers the "stuck instance" bug:
-// when the row-level refresh learns the instance no longer exists upstream
-// (404), it must drop the stale cached row, otherwise the cache-first list
-// keeps showing it while every refresh keeps failing.
-func TestInstanceRefreshEvictsMissingFromCache(t *testing.T) {
+// TestInstanceRefreshMarksMissingInCache covers the "unavailable instance"
+// behavior: when the row-level refresh learns the instance no longer exists
+// upstream (404), the cached row is kept (marked unavailable) instead of being
+// dropped, so the user can still see it and migrate it to another account.
+func TestInstanceRefreshMarksMissingInCache(t *testing.T) {
 	cl := &cacheLinode{insts: []linode.Instance{
 		{ID: 1, Label: "web", Status: "running", IPv4: []string{"1.2.3.4"}},
 	}}
@@ -305,18 +306,17 @@ func TestInstanceRefreshEvictsMissingFromCache(t *testing.T) {
 	rr := authedGet(t, srv, cookie, "/api/instances/1/refresh")
 	wantStatus(t, rr, http.StatusNotFound)
 
-	// The stale row is evicted, so the cache-first list no longer shows it
-	// (without eviction it would still serve instance 1 from the cache).
+	// The row is kept and reported as unavailable, not evicted.
 	res := getList(t, srv, cookie, false)
-	if len(res.Instances) != 0 {
-		t.Fatalf("list after 404 refresh = %+v, want empty (stale row evicted)", res.Instances)
+	if len(res.Instances) != 1 || !res.Instances[0].Missing || res.Instances[0].Status != "unavailable" {
+		t.Fatalf("list after 404 refresh = %+v, want kept unavailable instance", res.Instances)
 	}
 }
 
-// TestInstanceStatusEvictsMissingFromCache verifies the status endpoint drops a
-// stale cached row on 404 too, so polling a deleted instance cannot leave it
-// stuck in the list.
-func TestInstanceStatusEvictsMissingFromCache(t *testing.T) {
+// TestInstanceStatusMarksMissingInCache verifies the status endpoint marks a
+// stale cached row unavailable on 404 too, so polling a deleted instance
+// cannot leave it looking healthy.
+func TestInstanceStatusMarksMissingInCache(t *testing.T) {
 	cl := &cacheLinode{insts: []linode.Instance{
 		{ID: 1, Label: "web", Status: "running", IPv4: []string{"1.2.3.4"}},
 	}}
@@ -331,7 +331,7 @@ func TestInstanceStatusEvictsMissingFromCache(t *testing.T) {
 	wantStatus(t, rr, http.StatusNotFound)
 
 	res := getList(t, srv, cookie, false)
-	if len(res.Instances) != 0 {
-		t.Fatalf("list after 404 status = %+v, want empty (stale row evicted)", res.Instances)
+	if len(res.Instances) != 1 || !res.Instances[0].Missing || res.Instances[0].Status != "unavailable" {
+		t.Fatalf("list after 404 status = %+v, want kept unavailable instance", res.Instances)
 	}
 }

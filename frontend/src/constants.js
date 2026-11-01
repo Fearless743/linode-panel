@@ -17,6 +17,8 @@ export const STATUS_LABELS = {
   booting: "启动中",
   rebooting: "重启中",
   shutting_down: "关机中",
+  // 实例在 Linode 上游已不存在；缓存行保留并可手动迁移到其他账号。
+  unavailable: "不可用",
 };
 
 // 账号健康状态（GET /api/account/tokens 返回的 health_status）。

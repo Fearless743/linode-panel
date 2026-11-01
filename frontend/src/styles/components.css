@@ -46,6 +46,13 @@
   border-color: color-mix(in srgb, var(--text-muted) 35%, transparent);
 }
 
+/* 实例在 Linode 上游已不存在（缓存保留，可手动迁移）。 */
+.status-unavailable {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
 /* ---------- 标签 ---------- */
 .tags {
   display: flex;

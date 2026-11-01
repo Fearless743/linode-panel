@@ -11,6 +11,7 @@ export default function StatusPill({ status }) {
   let cls = "status-pill status-unknown";
   if (status === "running") cls = "status-pill status-running";
   else if (status === "offline") cls = "status-pill status-offline";
+  else if (status === "unavailable") cls = "status-pill status-unavailable";
   else if (YELLOW_STATES.has(status)) cls = "status-pill status-transition";
   return (
     <span className={cls}>

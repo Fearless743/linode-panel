@@ -1037,8 +1037,21 @@ func (s *Store) InstanceScript(instanceID int) (string, bool) {
 	if err != nil || !ok {
 		return "", false
 	}
+	return s.instanceScriptLocked(cacheID)
+}
+
+// InstanceScriptForCacheID is InstanceScript addressed by the stable cache id,
+// avoiding ambiguity when several tokens' snapshots reference the same Linode
+// instance id.
+func (s *Store) InstanceScriptForCacheID(cacheID int) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.instanceScriptLocked(cacheID)
+}
+
+func (s *Store) instanceScriptLocked(cacheID int) (string, bool) {
 	var script string
-	err = s.db.QueryRow(`SELECT script FROM instance_scripts WHERE cache_id=?`, cacheID).Scan(&script)
+	err := s.db.QueryRow(`SELECT script FROM instance_scripts WHERE cache_id=?`, cacheID).Scan(&script)
 	if err != nil {
 		return "", false
 	}
@@ -1082,8 +1095,20 @@ func (s *Store) InstanceRootPassword(instanceID int) (string, bool) {
 	if err != nil || !ok {
 		return "", false
 	}
+	return s.instanceRootPasswordLocked(cacheID)
+}
+
+// InstanceRootPasswordForCacheID is InstanceRootPassword addressed by the
+// stable cache id (unambiguous across tokens' snapshots).
+func (s *Store) InstanceRootPasswordForCacheID(cacheID int) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.instanceRootPasswordLocked(cacheID)
+}
+
+func (s *Store) instanceRootPasswordLocked(cacheID int) (string, bool) {
 	var password string
-	err = s.db.QueryRow(
+	err := s.db.QueryRow(
 		`SELECT password FROM instance_root_passwords WHERE cache_id=?`, cacheID).Scan(&password)
 	if err != nil {
 		return "", false
@@ -1152,8 +1177,9 @@ func (s *Store) InstanceScriptIDs() []int {
 // CacheInstances replaces the cached instance snapshot for a token with the
 // given instances, recording the fetch time. Rows are upserted (not deleted
 // and re-inserted) so each instance keeps its stable auto-increment id across
-// refreshes; rows that disappeared from the snapshot are marked dead but kept
-// while any per-instance configuration still references them.
+// refreshes; rows that disappeared from the snapshot are marked dead (alive=0)
+// but always kept. The list still shows them as unavailable and the user can
+// migrate them to another account, so dropping them would lose the record.
 func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1201,7 +1227,8 @@ func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 	}
 	// Mark rows missing from this snapshot as dead instead of deleting them:
 	// a stable id must survive both a rebuild (instance temporarily absent)
-	// and configuration that still points at it.
+	// and configuration that still points at it. Missing rows stay in the
+	// snapshot so the UI can list them as unavailable and offer migration.
 	if len(seen) == 0 {
 		if _, err := tx.Exec(`UPDATE instance_cache SET alive=0 WHERE token_id=?`, tokenID); err != nil {
 			return err
@@ -1219,21 +1246,83 @@ func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 			return err
 		}
 	}
-	// Dead rows with no per-instance configuration can be discarded safely.
-	if _, err := tx.Exec(
-		`DELETE FROM instance_cache
-		  WHERE token_id=? AND alive=0
-		    AND id NOT IN (SELECT cache_id FROM instance_scripts
-		                   UNION SELECT cache_id FROM instance_root_passwords
-		                   UNION SELECT cache_id FROM instance_auto_rebuild
-		                   UNION SELECT cache_id FROM instance_failover)`, tokenID); err != nil {
-		return err
-	}
 	return tx.Commit()
 }
 
+// CachedInstanceRow is one row of a token's instance snapshot: the last known
+// Linode instance plus the panel's stable cache id and whether the instance
+// still existed upstream when the snapshot was last refreshed. Alive=false
+// means the upstream instance is gone (shown as unavailable, kept for manual
+// migration).
+type CachedInstanceRow struct {
+	CacheID  int
+	Instance linode.Instance
+	Alive    bool
+}
+
+// CachedInstanceRows returns every row of a token's snapshot (alive first),
+// including missing instances kept for display and manual migration.
+func (s *Store) CachedInstanceRows(tokenID int) []CachedInstanceRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT id, instance_id, label, status, region, type, image, ipv4, ipv6,
+		        tags, created, updated, alive
+		   FROM instance_cache WHERE token_id=?
+		  ORDER BY alive DESC, instance_id`, tokenID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []CachedInstanceRow
+	for rows.Next() {
+		var r CachedInstanceRow
+		var ipv4, tags string
+		var alive int
+		if err := rows.Scan(&r.CacheID, &r.Instance.ID, &r.Instance.Label,
+			&r.Instance.Status, &r.Instance.Region, &r.Instance.Type,
+			&r.Instance.Image, &ipv4, &r.Instance.IPv6, &tags,
+			&r.Instance.Created, &r.Instance.Updated, &alive); err != nil {
+			return out
+		}
+		r.Alive = alive != 0
+		_ = json.Unmarshal([]byte(ipv4), &r.Instance.IPv4)
+		_ = json.Unmarshal([]byte(tags), &r.Instance.Tags)
+		out = append(out, r)
+	}
+	return out
+}
+
+// InstanceCacheRow returns one token's cached row for a Linode instance id.
+func (s *Store) InstanceCacheRow(tokenID, instanceID int) (CachedInstanceRow, bool) {
+	if tokenID <= 0 || instanceID <= 0 {
+		return CachedInstanceRow{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var r CachedInstanceRow
+	var ipv4, tags string
+	var alive int
+	err := s.db.QueryRow(
+		`SELECT id, instance_id, label, status, region, type, image, ipv4, ipv6,
+		        tags, created, updated, alive
+		   FROM instance_cache WHERE token_id=? AND instance_id=?`,
+		tokenID, instanceID).Scan(
+		&r.CacheID, &r.Instance.ID, &r.Instance.Label, &r.Instance.Status,
+		&r.Instance.Region, &r.Instance.Type, &r.Instance.Image, &ipv4,
+		&r.Instance.IPv6, &tags, &r.Instance.Created, &r.Instance.Updated, &alive)
+	if err != nil {
+		return CachedInstanceRow{}, false
+	}
+	r.Alive = alive != 0
+	_ = json.Unmarshal([]byte(ipv4), &r.Instance.IPv4)
+	_ = json.Unmarshal([]byte(tags), &r.Instance.Tags)
+	return r, true
+}
+
 // CachedInstances returns the cached instance snapshot for a token, or nil
-// when nothing is cached.
+// when nothing is cached. Missing instances (alive=0) are excluded; use
+// CachedInstanceRows when they should be shown as unavailable.
 func (s *Store) CachedInstances(tokenID int) []linode.Instance {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1309,16 +1398,134 @@ func (s *Store) InvalidateInstanceCache(tokenID int) error {
 	return err
 }
 
-// RemoveInstanceCache hides one instance from a token's cached snapshot. Used
-// when the Linode API reports the instance as no longer existing, so a stale
-// cached row does not linger in the list and keep failing to refresh. The row
-// is kept as a dead anchor while configuration still references it.
-func (s *Store) RemoveInstanceCache(tokenID, instanceID int) error {
+// MarkInstanceMissing marks one instance as no longer existing upstream
+// (alive=0). The row and its configuration are kept: the list shows it as
+// unavailable and the user can migrate it to another account. Without this,
+// the cache-first list would keep showing the row as healthy.
+func (s *Store) MarkInstanceMissing(tokenID, instanceID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`UPDATE instance_cache SET alive=0 WHERE token_id=? AND instance_id=?`, tokenID, instanceID)
 	return err
+}
+
+// DeleteInstanceCache permanently removes one instance's cache row together
+// with its panel-side configuration. Used for an explicit user delete (or to
+// purge the record of an instance that is already gone upstream).
+func (s *Store) DeleteInstanceCache(tokenID, instanceID int) error {
+	if tokenID <= 0 || instanceID <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var cacheID int
+	err = tx.QueryRow(
+		`SELECT id FROM instance_cache WHERE token_id=? AND instance_id=?`,
+		tokenID, instanceID).Scan(&cacheID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, table := range []string{
+		"instance_scripts", "instance_root_passwords",
+		"instance_auto_rebuild", "instance_failover",
+	} {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE cache_id=?`, cacheID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM instance_cache WHERE id=?`, cacheID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MigrateInstanceCache moves an instance's stable cache row to another account
+// and points it at the instance created there. The cache id is unchanged, so
+// per-instance configuration (script, root password, auto-rebuild, failover)
+// follows automatically; the config rows' bound token is updated so background
+// monitors probe the new account.
+func (s *Store) MigrateInstanceCache(cacheID, targetTokenID int, inst linode.Instance) error {
+	if cacheID <= 0 || targetTokenID <= 0 || inst.ID <= 0 {
+		return fmt.Errorf("迁移实例缓存: 参数无效")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// A row may already exist for the new instance under the target account
+	// (e.g. the account was refreshed mid-migration). Fold its configuration
+	// into the migrating row, letting the migrated row's config win, then drop
+	// the duplicate.
+	var dupID int
+	err = tx.QueryRow(
+		`SELECT id FROM instance_cache WHERE token_id=? AND instance_id=?`,
+		targetTokenID, inst.ID).Scan(&dupID)
+	switch {
+	case err == nil && dupID != cacheID:
+		if err := mergeConfigToCacheID(tx, dupID, cacheID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM instance_cache WHERE id=?`, dupID); err != nil {
+			return err
+		}
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+
+	ipv4 := inst.IPv4
+	if ipv4 == nil {
+		ipv4 = []string{}
+	}
+	tags := inst.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	ipv4JSON, err := json.Marshal(ipv4)
+	if err != nil {
+		return err
+	}
+	tagsJSON, err := json.Marshal(tags)
+	if err != nil {
+		return err
+	}
+	fetchedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(
+		`UPDATE instance_cache
+		    SET token_id=?, instance_id=?, label=?, status=?, region=?, type=?,
+		        image=?, ipv4=?, ipv6=?, tags=?, created=?, updated=?,
+		        fetched_at=?, alive=1, stale=0
+		  WHERE id=?`,
+		targetTokenID, inst.ID, inst.Label, inst.Status, inst.Region, inst.Type,
+		inst.Image, string(ipv4JSON), inst.IPv6, string(tagsJSON),
+		inst.Created, inst.Updated, fetchedAt, cacheID); err != nil {
+		return err
+	}
+	// Background monitors read the account from the config row; point them at
+	// the account now hosting the instance.
+	if _, err := tx.Exec(
+		`UPDATE instance_auto_rebuild SET token_id=? WHERE cache_id=?`,
+		targetTokenID, cacheID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE instance_failover SET token_id=? WHERE cache_id=?`,
+		targetTokenID, cacheID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpsertInstanceCache inserts or updates a single instance within a token's

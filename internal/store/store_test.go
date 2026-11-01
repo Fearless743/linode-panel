@@ -607,7 +607,7 @@ func TestCachedInstanceLookup(t *testing.T) {
 	}
 	// A dead anchor (instance gone from the snapshot) still resolves so a
 	// rebuild can recreate it from the last known spec.
-	if err := s.RemoveInstanceCache(7, 42); err != nil {
+	if err := s.MarkInstanceMissing(7, 42); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := s.CachedInstance(42); !ok || got.Region != "us-east" {
@@ -648,7 +648,7 @@ func TestInstanceCacheUpsert(t *testing.T) {
 	}
 }
 
-func TestInstanceCacheRemove(t *testing.T) {
+func TestInstanceCacheMarkMissing(t *testing.T) {
 	s, _ := newTestStore(t)
 	if err := s.CacheInstances(7, []linode.Instance{
 		{ID: 1, Label: "web"},
@@ -659,20 +659,93 @@ func TestInstanceCacheRemove(t *testing.T) {
 	if err := s.CacheInstances(8, []linode.Instance{{ID: 2, Label: "other"}}); err != nil {
 		t.Fatal(err)
 	}
-	// Remove one instance from one token only.
-	if err := s.RemoveInstanceCache(7, 2); err != nil {
-		t.Fatalf("RemoveInstanceCache: %v", err)
+	// Mark one instance as missing from one token only. The live snapshot
+	// excludes it, but the row is kept and reported as not alive.
+	if err := s.MarkInstanceMissing(7, 2); err != nil {
+		t.Fatalf("MarkInstanceMissing: %v", err)
 	}
 	got := s.CachedInstances(7)
 	if len(got) != 1 || got[0].ID != 1 {
-		t.Fatalf("token 7 cache = %+v, want only instance 1", got)
+		t.Fatalf("token 7 live cache = %+v, want only instance 1", got)
+	}
+	rows := s.CachedInstanceRows(7)
+	if len(rows) != 2 {
+		t.Fatalf("token 7 rows = %+v, want 2 (missing row kept)", rows)
+	}
+	missing := 0
+	for _, row := range rows {
+		if !row.Alive {
+			missing++
+			if row.Instance.ID != 2 {
+				t.Fatalf("missing row = %+v, want instance 2", row)
+			}
+		}
+	}
+	if missing != 1 {
+		t.Fatalf("missing rows = %d, want 1", missing)
 	}
 	if got := s.CachedInstances(8); len(got) != 1 || got[0].ID != 2 {
 		t.Fatalf("token 8 cache should be unaffected: %+v", got)
 	}
-	// Removing a missing instance is a no-op.
-	if err := s.RemoveInstanceCache(7, 999); err != nil {
-		t.Fatalf("RemoveInstanceCache missing: %v", err)
+	// Marking a missing instance is a no-op.
+	if err := s.MarkInstanceMissing(7, 999); err != nil {
+		t.Fatalf("MarkInstanceMissing missing: %v", err)
+	}
+}
+
+// TestCacheInstancesKeepsMissingRows verifies a refresh that no longer sees an
+// instance keeps the row (marked missing) instead of deleting it, so the list
+// can still show it as unavailable.
+func TestCacheInstancesKeepsMissingRows(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 1, Label: "web"}, {ID: 2, Label: "db"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 1, Label: "web"}}); err != nil {
+		t.Fatal(err)
+	}
+	rows := s.CachedInstanceRows(7)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (missing row retained)", len(rows))
+	}
+	for _, row := range rows {
+		if row.Instance.ID == 2 && row.Alive {
+			t.Fatalf("instance 2 should be marked missing: %+v", row)
+		}
+	}
+	if got := s.CachedInstances(7); len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("live cache = %+v, want only instance 1", got)
+	}
+}
+
+// TestDeleteInstanceCache purges the row and its configuration on an explicit
+// user delete, so it does not reappear as an unavailable row.
+func TestDeleteInstanceCache(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 42, Label: "web"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceScript(42, "echo hi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceRootPassword(42, "Secret123!"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteInstanceCache(7, 42); err != nil {
+		t.Fatalf("DeleteInstanceCache: %v", err)
+	}
+	if rows := s.CachedInstanceRows(7); len(rows) != 0 {
+		t.Fatalf("rows after delete = %+v, want none", rows)
+	}
+	if _, ok := s.InstanceScript(42); ok {
+		t.Fatal("script should be purged with the cache row")
+	}
+	if _, ok := s.InstanceRootPassword(42); ok {
+		t.Fatal("root password should be purged with the cache row")
+	}
+	// Deleting a non-existent row is a no-op.
+	if err := s.DeleteInstanceCache(7, 999); err != nil {
+		t.Fatalf("DeleteInstanceCache missing: %v", err)
 	}
 }
 
@@ -805,6 +878,79 @@ func TestRepointInstanceCacheInheritsConfig(t *testing.T) {
 	}
 	if gotID != cacheID {
 		t.Fatalf("cache id changed after refresh: %d -> %d", cacheID, gotID)
+	}
+}
+
+// TestMigrateInstanceCacheMovesToTargetAccount verifies a missing instance's
+// stable cache row (and its configuration) moves to another account while
+// pointing at the replacement instance created there.
+func TestMigrateInstanceCacheMovesToTargetAccount(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{
+		ID: 42, Label: "web", Status: "running", Region: "us-east",
+		Type: "g6-standard-1", Image: "linode/debian12",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkInstanceMissing(7, 42); err != nil {
+		t.Fatal(err)
+	}
+	row, ok := s.InstanceCacheRow(7, 42)
+	if !ok || row.Alive {
+		t.Fatalf("row = %+v, %v; want a missing row", row, ok)
+	}
+	if err := s.SetInstanceScript(42, "echo hi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceRootPassword(42, "Secret123!"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAutoRebuild(AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 7, Enabled: true, Port: 2222,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFailover(Failover{
+		InstanceID: 42, UserID: 1, GroupID: 3, TokenID: 7, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	newInst := linode.Instance{
+		ID: 99, Label: "web", Status: "provisioning", Region: "us-east",
+		Type: "g6-standard-1", Image: "linode/debian12", IPv4: []string{"9.9.9.9"},
+	}
+	if err := s.MigrateInstanceCache(row.CacheID, 8, newInst); err != nil {
+		t.Fatalf("MigrateInstanceCache: %v", err)
+	}
+
+	// The source account no longer lists the row; the target account now has
+	// the same stable cache id pointing at the new instance.
+	if rows := s.CachedInstanceRows(7); len(rows) != 0 {
+		t.Fatalf("source rows = %+v, want none", rows)
+	}
+	rows := s.CachedInstanceRows(8)
+	if len(rows) != 1 {
+		t.Fatalf("target rows = %+v, want 1", rows)
+	}
+	if rows[0].CacheID != row.CacheID || rows[0].Instance.ID != 99 || !rows[0].Alive {
+		t.Fatalf("migrated row = %+v", rows[0])
+	}
+	// Configuration follows the stable cache id.
+	if script, ok := s.InstanceScript(99); !ok || script != "echo hi" {
+		t.Fatalf("InstanceScript(99) = %q, %v", script, ok)
+	}
+	if pass, ok := s.InstanceRootPassword(99); !ok || pass != "Secret123!" {
+		t.Fatalf("InstanceRootPassword(99) = %q, %v", pass, ok)
+	}
+	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled || cfg.TokenID != 8 {
+		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
+	}
+	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled || cfg.TokenID != 8 || cfg.GroupID != 3 {
+		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
+	}
+	if _, ok := s.InstanceScript(42); ok {
+		t.Fatal("script should no longer resolve under the old instance id")
 	}
 }
 

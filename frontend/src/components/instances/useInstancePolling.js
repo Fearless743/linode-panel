@@ -64,11 +64,17 @@ export default function useInstancePolling({ findInstance, showBanner, onInstanc
         const tokenId = inst && inst.token_id != null ? inst.token_id : "";
         data = await getInstanceStatus(id, tokenId);
       } catch (err) {
-        // 404：实例已在上游不存在（被删除/替换），停止轮询并从列表移除。
+        // 404：实例已在上游不存在（被删除/替换），停止轮询但保留行，
+        // 标记为不可用，允许手动迁移到其他账号。
         if (err && err.status === 404) {
           stopTimer(st);
+          st.lastStatus = "unavailable";
+          st.statusData = null;
+          st.sshReady = false;
+          st.failMsg = "";
           if (onInstanceMissing) onInstanceMissing(id);
-          showBanner("该实例在 Linode 已不存在，已从列表移除", false);
+          bump();
+          showBanner("该实例在 Linode 已不存在，已标记为不可用（可迁移到其他账号）", false);
           return;
         }
         showBanner(err.message || "状态查询失败", false);
