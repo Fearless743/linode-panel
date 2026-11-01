@@ -10,14 +10,12 @@ function shellQuote(value) {
 
 // agentInstallCommand 拼出远程主机上接入面板 agent 的一条命令。
 // origin: 面板 base URL（通常取 window.location.origin）；
-// token:  面板预签发的 agent token（可空；缺省时退化为 --code 注册流程）；
-// code:   注册码（agent 用它派生 PAT 解密密钥，必填）。
+// code:   注册码（agent 用它注册并获取身份，必填）。
 // 缺少 origin 时返回空字符串（调用方应禁用复制）。
-export function agentInstallCommand({ origin, token, code } = {}) {
+export function agentInstallCommand({ origin, code } = {}) {
   const base = String(origin || "").replace(/\/+$/, "");
   if (!base) return "";
   const parts = ["linode-panel-agent", "--panel", shellQuote(base)];
-  if (token) parts.push("--token", shellQuote(token));
   if (code) parts.push("--code", shellQuote(code));
   return parts.join(" ");
 }

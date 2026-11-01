@@ -109,7 +109,10 @@ func TestSetFailoverPreservesReplacedBy(t *testing.T) {
 		t.Fatalf("SetFailover: %v", err)
 	}
 	// 直接写入 replaced_by（模拟替换归档）。
-	if _, err := s.db.Exec(`UPDATE instance_failover SET replaced_by=? WHERE instance_id=?`, 99, 42); err != nil {
+	if _, err := s.db.Exec(
+		`UPDATE instance_failover SET replaced_by=?
+		  WHERE cache_id=(SELECT id FROM instance_cache WHERE instance_id=? ORDER BY id LIMIT 1)`,
+		99, 42); err != nil {
 		t.Fatalf("update replaced_by: %v", err)
 	}
 
@@ -169,7 +172,10 @@ func TestMoveFailover(t *testing.T) {
 		t.Fatalf("SetFailover: %v", err)
 	}
 	_ = s.UpdateFailoverState(42, 3, "banned", "账号被封", "2026-01-01T00:00:00Z", "task-9")
-	if _, err := s.db.Exec(`UPDATE instance_failover SET replaced_by=? WHERE instance_id=?`, 777, 42); err != nil {
+	if _, err := s.db.Exec(
+		`UPDATE instance_failover SET replaced_by=?
+		  WHERE cache_id=(SELECT id FROM instance_cache WHERE instance_id=? ORDER BY id LIMIT 1)`,
+		777, 42); err != nil {
 		t.Fatalf("update replaced_by: %v", err)
 	}
 

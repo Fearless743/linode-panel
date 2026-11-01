@@ -1,5 +1,5 @@
 // 与后端 JSON API 通信的轻量客户端。
-// 共享契约中的 JSON 字段（instances / status / ssh-keys / users / groups / agents…）。
+// 共享契约中的 JSON 字段（instances / status / users / groups / agents…）。
 //
 // 本模块保持自足：不依赖 constants.js 或其他模块，仅使用浏览器内置 fetch。
 // 提供统一封装：
@@ -117,15 +117,24 @@ export function getInstanceStatus(id, tokenId) {
   );
 }
 
-// 通过 API 重新获取单个实例的最新数据（行级「刷新」），并更新其缓存。
+// 通过 API 重新获取单个实例的最新数据（账号分组刷新时逐个调用），并更新其缓存。
 export function refreshInstance(id, tokenId) {
   return apiFetch(
     "/api/instances/" + encodeURIComponent(id) + "/refresh" + query({ token_id: tokenId })
   );
 }
 
+// 永久删除实例（DELETE /linode/instances/{id}），并清空后端缓存。
+export function deleteInstance(id, tokenId) {
+  return apiFetch(
+    "/api/instances/" + encodeURIComponent(id) + query({ token_id: tokenId }),
+    { method: "DELETE" }
+  );
+}
+
 // action: boot | shutdown | reboot
-// viaAgent: 经 Agent 执行；agentId: 指定执行 Agent（覆盖账号绑定）。
+// viaAgent: true=经 Agent；false=面板直发；undefined/null=跟随账号绑定（后端决定）。
+// agentId: 显式指定执行 Agent（仅经 Agent 时生效，覆盖账号绑定）。
 export function instanceAction(id, action, { tokenId, viaAgent, agentId } = {}) {
   return apiFetch(
     "/api/instances/" +
@@ -134,28 +143,26 @@ export function instanceAction(id, action, { tokenId, viaAgent, agentId } = {}) 
       encodeURIComponent(action) +
       query({
         token_id: tokenId,
-        via_agent: viaAgent ? 1 : undefined,
+        via_agent: viaAgent === undefined || viaAgent === null ? undefined : viaAgent ? 1 : 0,
         agent_id: viaAgent && agentId ? agentId : undefined,
       }),
     { method: "POST" }
   );
 }
 
-// viaAgent: 经 Agent 执行；agentId: 指定执行 Agent（覆盖账号绑定）。
+// viaAgent: true=经 Agent；false=面板直发；undefined/null=跟随账号绑定（后端决定）。
 export function rebuildInstance(id, payload, viaAgent, agentId) {
   return jsonRequest(
     "/api/instances/" +
       encodeURIComponent(id) +
       "/rebuild" +
-      query({ via_agent: viaAgent ? 1 : undefined, agent_id: viaAgent && agentId ? agentId : undefined }),
+      query({
+        via_agent: viaAgent === undefined || viaAgent === null ? undefined : viaAgent ? 1 : 0,
+        agent_id: viaAgent && agentId ? agentId : undefined,
+      }),
     "POST",
     payload
   );
-}
-
-// ---------- SSH 密钥 ----------
-export function listSSHKeys() {
-  return apiFetch("/api/ssh-keys");
 }
 
 // ---------- 重建任务 ----------
@@ -249,10 +256,6 @@ export function listAgents() {
   return apiFetch("/api/agents");
 }
 
-export function createAgent(name) {
-  return jsonRequest("/api/agents", "POST", { name });
-}
-
 export function deleteAgent(id) {
   return apiFetch("/api/agents/" + encodeURIComponent(id), { method: "DELETE" });
 }
@@ -287,6 +290,12 @@ export function setAccountAgent(tokenId, agentId) {
     "PUT",
     { agent_id: agentId }
   );
+}
+
+// 编辑当前登录用户的账号（token）：修改名称和/或绑定 Agent。
+// payload: { label?: string, agent_id?: number }
+export function updateAccountToken(tokenId, payload) {
+  return jsonRequest("/api/account/tokens/" + encodeURIComponent(tokenId), "PUT", payload);
 }
 
 // ---------- 账号组 ----------

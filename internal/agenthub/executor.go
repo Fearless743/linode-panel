@@ -23,10 +23,6 @@ type LinodeAPI interface {
 	GetInstanceIPs(ctx context.Context, id int) (linode.InstanceIPs, error)
 	CreateInstance(ctx context.Context, opts linode.CreateOptions) (linode.Instance, error)
 	DeleteInstance(ctx context.Context, id int) error
-	GetConfigID(ctx context.Context, id int) (int, error)
-	UpdateConfigNetworkHelper(ctx context.Context, id, configID int, enabled bool) error
-	AssignIP(ctx context.Context, region, address string, linodeID int) error
-	AttachAllowAllFirewall(ctx context.Context, region string, linodeID int) error
 }
 
 // RunFn runs the boot script over SSH.
@@ -39,8 +35,6 @@ type ProbeFn func(ctx context.Context, host string, port int) error
 // shared command executor used by both remote agents (cmd/agent) and the
 // panel's own self-agent (internal/api/localagent.go).
 type Executor struct {
-	// PATs holds the locally-saved Linode PATs (plaintext, in memory).
-	PATs []string
 	// APIBase is the Linode API v4 base URL used by per-PAT clients.
 	APIBase string
 	// SSHPort is the SSH port used for boot scripts and probes.
@@ -49,13 +43,15 @@ type Executor struct {
 	Run RunFn
 	// Probe verifies the instance's SSH port is reachable.
 	Probe ProbeFn
-	// Progress is an optional callback invoked before each rebuild step.
-	Progress func(step string)
 	// NewAPI builds a LinodeAPI for one PAT. Defaults to linode.New with APIBase applied.
 	NewAPI func(pat string) LinodeAPI
 	// Log is the logger used by the executor.
 	Log *slog.Logger
 }
+
+// Reporter receives a command's final result, or an in-flight progress update
+// (ok=false with payload["progress"]).
+type Reporter func(ok bool, errMsg string, payload map[string]any)
 
 // NewExecutor creates an Executor with default values.
 func NewExecutor() *Executor {
@@ -100,94 +96,150 @@ func (e *Executor) API(pat string) LinodeAPI {
 	return c
 }
 
-// IsNotFoundOrForbidden reports whether a Linode API error is 404 or 403.
-func IsNotFoundOrForbidden(err error) bool {
-	var apiErr *linode.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.StatusCode == 404 || apiErr.StatusCode == 403
+// IntParam coerces a JSON-decoded number into an int.
+func IntParam(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
 	}
-	return false
+	return 0, false
 }
 
-// ListInstances aggregates all instances across every local PAT. A PAT that
-// fails (bad token, network) is skipped with a warning. No PATs → empty list.
-func (e *Executor) ListInstances(ctx context.Context) ([]linode.Instance, error) {
-	if len(e.PATs) == 0 {
-		return []linode.Instance{}, nil
+// ListInstances lists the instances of a single account (PAT).
+func (e *Executor) ListInstances(ctx context.Context, pat string) ([]linode.Instance, error) {
+	insts, err := e.API(pat).ListInstances(ctx)
+	if err != nil {
+		return nil, err
 	}
-	seen := map[int]bool{}
-	var all []linode.Instance
-	for _, pat := range e.PATs {
-		api := e.API(pat)
-		insts, err := api.ListInstances(ctx)
+	if insts == nil {
+		insts = []linode.Instance{}
+	}
+	return insts, nil
+}
+
+// Power performs one power action against a single account (PAT).
+func (e *Executor) Power(ctx context.Context, pat, action string, id int) error {
+	if pat == "" {
+		return errors.New("命令未携带 PAT")
+	}
+	api := e.API(pat)
+	switch action {
+	case ActionBoot:
+		return api.Boot(ctx, id)
+	case ActionShutdown:
+		return api.Shutdown(ctx, id)
+	case ActionReboot:
+		return api.Reboot(ctx, id)
+	default:
+		return fmt.Errorf("未知电源操作: %s", action)
+	}
+}
+
+// Execute runs one command with the executor and reports its result through
+// report. Long-running rebuilds emit progress updates (ok=false with a
+// payload["progress"] step string) before the final result. This is the single
+// implementation shared by remote agents and the panel's own self-agent.
+func (e *Executor) Execute(ctx context.Context, cmd Command, report Reporter) {
+	pat, _ := cmd.Params["pat"].(string)
+	switch cmd.Type {
+	case CmdList:
+		if pat == "" {
+			report(false, "命令未携带 PAT", nil)
+			return
+		}
+		insts, err := e.ListInstances(ctx, pat)
 		if err != nil {
-			if e.Log != nil {
-				e.Log.Warn("list: 跳过失败的 PAT", "err", err)
+			report(false, err.Error(), nil)
+			return
+		}
+		report(true, "", map[string]any{"instances": insts})
+	case CmdPower:
+		if pat == "" {
+			report(false, "命令未携带 PAT", nil)
+			return
+		}
+		action, _ := cmd.Params["action"].(string)
+		id, ok := IntParam(cmd.Params["id"])
+		if !ok || id <= 0 {
+			report(false, "无效的实例 ID", nil)
+			return
+		}
+		if err := e.Power(ctx, pat, action, id); err != nil {
+			report(false, err.Error(), nil)
+			return
+		}
+		report(true, "", map[string]any{})
+	case CmdReboot:
+		if pat == "" {
+			report(false, "命令未携带 PAT", nil)
+			return
+		}
+		id, ok := IntParam(cmd.Params["id"])
+		if !ok || id <= 0 {
+			report(false, "无效的实例 ID", nil)
+			return
+		}
+		script, _ := cmd.Params["script"].(string)
+		rootPass, _ := cmd.Params["root_password"].(string)
+		progress := func(step string) {
+			report(false, "", map[string]any{"progress": step})
+		}
+		if newID, _, err := e.Rebuild(ctx, id, script, rootPass, pat, progress); err != nil {
+			// Even a failed rebuild may already have created the replacement
+			// instance (e.g. the boot script failed). Report its id so the
+			// panel can still make it inherit the instance's configuration.
+			payload := map[string]any{}
+			if newID > 0 {
+				payload["new_instance_id"] = newID
 			}
-			continue
-		}
-		for _, in := range insts {
-			if !seen[in.ID] {
-				seen[in.ID] = true
-				all = append(all, in)
+			report(false, err.Error(), payload)
+			return
+		} else {
+			insts, err := e.ListInstances(ctx, pat)
+			if err != nil {
+				report(false, err.Error(), nil)
+				return
 			}
+			// new_instance_id lets the panel re-point its stable cache row to
+			// the replacement instance, so per-instance configuration is
+			// inherited even when the rebuild runs on a remote agent.
+			report(true, "", map[string]any{"instances": insts, "new_instance_id": newID})
 		}
-	}
-	if all == nil {
-		all = []linode.Instance{}
-	}
-	return all, nil
-}
-
-// PowerAction performs one power action, trying each stored PAT until one
-// succeeds. A PAT that returns 404/403 is skipped; any other error is a real
-// failure.
-func (e *Executor) PowerAction(ctx context.Context, action string, id int) error {
-	return e.PowerActionWith(ctx, e.PATs, action, id)
-}
-
-// PowerActionWith is PowerAction over an explicit PAT list.
-func (e *Executor) PowerActionWith(ctx context.Context, pats []string, action string, id int) error {
-	if len(pats) == 0 {
-		return errors.New("没有可用的 PAT")
-	}
-	var lastErr error
-	for _, pat := range pats {
-		api := e.API(pat)
-		var err error
-		switch action {
-		case ActionBoot:
-			err = api.Boot(ctx, id)
-		case ActionShutdown:
-			err = api.Shutdown(ctx, id)
-		case ActionReboot:
-			err = api.Reboot(ctx, id)
-		default:
-			return fmt.Errorf("未知电源操作: %s", action)
+	case CmdDelete:
+		if pat == "" {
+			report(false, "命令未携带 PAT", nil)
+			return
 		}
-		if err == nil {
-			return nil
+		id, ok := IntParam(cmd.Params["id"])
+		if !ok || id <= 0 {
+			report(false, "无效的实例 ID", nil)
+			return
 		}
-		if IsNotFoundOrForbidden(err) {
-			lastErr = err
-			continue
+		if err := e.API(pat).DeleteInstance(ctx, id); err != nil {
+			report(false, err.Error(), nil)
+			return
 		}
-		return fmt.Errorf("执行 %s 失败: %w", action, err)
+		report(true, "", map[string]any{})
+	default:
+		report(false, "未知命令类型: "+cmd.Type, nil)
 	}
-	return fmt.Errorf("所有 PAT 都无法执行 %s: %w", action, lastErr)
 }
 
 // Rebuild executes the full rebuild orchestration:
-// shutdown old → network_helper on → delete → create (fresh ed25519 key,
-// booted) → wait running → network_helper off + shutdown → wait offline →
-// assign reserved IP (optional) → boot → wait running → sshrun script →
-// probe SSH port.
-func (e *Executor) Rebuild(ctx context.Context, id int, script, reservedIP, pat string) (string, error) {
+// shutdown old → delete → create (fresh ed25519 key, booted) → wait running →
+// sshrun script → probe SSH port. progress (when non-nil) is called with a
+// Chinese label before each step. It returns the replacement instance's
+// Linode id (0 when it was never created) and its host address.
+func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat string, progress func(step string)) (int, string, error) {
 	api := e.API(pat)
 	step := func(n int, format string, args ...any) {
 		label := fmt.Sprintf("step %d: %s", n, fmt.Sprintf(format, args...))
-		if e.Progress != nil {
-			e.Progress(label)
+		if progress != nil {
+			progress(label)
 		}
 		if e.Log != nil {
 			e.Log.Info(label)
@@ -197,132 +249,75 @@ func (e *Executor) Rebuild(ctx context.Context, id int, script, reservedIP, pat 
 	step(0, "读取旧实例 %d", id)
 	old, err := api.GetInstance(ctx, id)
 	if err != nil {
-		return "", fmt.Errorf("读取旧实例失败: %w", err)
+		return 0, "", fmt.Errorf("读取旧实例失败: %w", err)
 	}
 
 	step(1, "关机旧实例 %d", id)
 	if err := api.Shutdown(ctx, id); err != nil {
-		return "", fmt.Errorf("关机旧实例失败: %w", err)
+		return 0, "", fmt.Errorf("关机旧实例失败: %w", err)
 	}
 
-	// network_helper must be on before deletion so the new instance inherits it.
-	// Failure is best-effort (networking may work via DHCP anyway).
-	step(2, "启用 network_helper (旧实例 %d)", id)
-	if cfgID, cfgErr := api.GetConfigID(ctx, id); cfgErr == nil {
-		if err := api.UpdateConfigNetworkHelper(ctx, id, cfgID, true); err != nil {
-			if e.Log != nil {
-				e.Log.Warn("network_helper 启用失败（继续）", "err", err)
-			}
-		}
-	} else {
-		if e.Log != nil {
-			e.Log.Warn("获取配置失败（继续）", "err", cfgErr)
-		}
-	}
-
-	step(3, "删除旧实例 %d", id)
+	step(2, "删除旧实例 %d", id)
 	if err := api.DeleteInstance(ctx, id); err != nil {
-		return "", fmt.Errorf("删除旧实例失败: %w", err)
+		return 0, "", fmt.Errorf("删除旧实例失败: %w", err)
 	}
 
 	privPEM, pubKey, err := sshrun.GenerateKey()
 	if err != nil {
-		return "", fmt.Errorf("生成 SSH 密钥失败: %w", err)
+		return 0, "", fmt.Errorf("生成 SSH 密钥失败: %w", err)
 	}
 	booted := true
-	step(4, "创建新实例 (region=%s type=%s image=%s)", old.Region, old.Type, old.Image)
+	step(3, "创建新实例 (region=%s type=%s image=%s)", old.Region, old.Type, old.Image)
 	newInst, err := api.CreateInstance(ctx, linode.CreateOptions{
 		Region:         old.Region,
 		Type:           old.Type,
 		Image:          old.Image,
+		Label:          old.Label,
+		Tags:           old.Tags,
+		RootPass:       rootPass,
 		AuthorizedKeys: []string{pubKey},
 		Booted:         &booted,
 	})
 	if err != nil {
-		return "", fmt.Errorf("创建新实例失败: %w", err)
+		return 0, "", fmt.Errorf("创建新实例失败: %w", err)
 	}
 	newID := newInst.ID
 
-	step(5, "等待新实例 %d 运行", newID)
+	step(4, "等待新实例 %d 运行", newID)
 	if err := e.waitStatus(ctx, api, newID, "running"); err != nil {
-		return "", err
+		return newID, "", err
 	}
 
-	step(6, "关闭 network_helper 并关机 (新实例 %d)", newID)
-	if cfgID, cfgErr := api.GetConfigID(ctx, newID); cfgErr == nil {
-		if err := api.UpdateConfigNetworkHelper(ctx, newID, cfgID, false); err != nil {
-			if e.Log != nil {
-				e.Log.Warn("network_helper 关闭失败（继续）", "err", err)
-			}
-		}
-	} else {
-		if e.Log != nil {
-			e.Log.Warn("获取配置失败（继续）", "err", cfgErr)
-		}
-	}
-	if err := api.Shutdown(ctx, newID); err != nil {
-		return "", fmt.Errorf("关机新实例失败: %w", err)
-	}
-	step(6, "等待新实例 %d 离线", newID)
-	if err := e.waitStatus(ctx, api, newID, "offline"); err != nil {
-		return "", err
-	}
-
-	// Default-open-all-ports: attach the allow-all Cloud Firewall while the
-	// instance is offline (config changes apply at the next boot). Best-effort.
-	step(6, "绑定开放全部端口防火墙 (新实例 %d)", newID)
-	if err := api.AttachAllowAllFirewall(ctx, newInst.Region, newID); err != nil {
-		if e.Log != nil {
-			e.Log.Warn("防火墙绑定失败（继续）", "err", err)
-		}
-	}
-
-	if reservedIP != "" {
-		step(7, "分配保留 IP %s", reservedIP)
-		if err := api.AssignIP(ctx, old.Region, reservedIP, newID); err != nil {
-			return "", fmt.Errorf("分配保留 IP 失败: %w", err)
-		}
-	}
-
-	step(8, "开机新实例 %d", newID)
-	if err := api.Boot(ctx, newID); err != nil {
-		return "", fmt.Errorf("开机失败: %w", err)
-	}
-	step(8, "等待新实例 %d 运行", newID)
-	if err := e.waitStatus(ctx, api, newID, "running"); err != nil {
-		return "", err
-	}
-
-	step(9, "获取新实例 IP 并执行开机脚本")
+	step(5, "获取新实例 IP 并执行开机脚本")
 	ips, err := api.GetInstanceIPs(ctx, newID)
 	if err != nil {
-		return "", fmt.Errorf("获取新实例 IP 失败: %w", err)
+		return newID, "", fmt.Errorf("获取新实例 IP 失败: %w", err)
 	}
 	host := ips.PublicIPv4()
 	if host == "" {
 		host = ips.SLAACv6()
 	}
 	if host == "" {
-		return "", fmt.Errorf("新实例没有可用的公网 IP")
+		return newID, "", fmt.Errorf("新实例没有可用的公网 IP")
 	}
 	if e.Run == nil {
-		return "", fmt.Errorf("SSH 运行器未配置")
+		return newID, "", fmt.Errorf("SSH 运行器未配置")
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	if err := e.Run(runCtx, host, e.SSHPort, privPEM, script); err != nil {
-		return "", fmt.Errorf("SSH 执行开机脚本失败: %w", err)
+		return newID, host, fmt.Errorf("SSH 执行开机脚本失败: %w", err)
 	}
 
-	step(10, "探测 SSH 端口 %s:%d", host, e.SSHPort)
+	step(6, "探测 SSH 端口 %s:%d", host, e.SSHPort)
 	if err := e.ProbePort(ctx, host); err != nil {
-		return "", fmt.Errorf("SSH 端口探测失败: %w", err)
+		return newID, host, fmt.Errorf("SSH 端口探测失败: %w", err)
 	}
-	return host, nil
+	return newID, host, nil
 }
 
-// WaitStatus polls the instance until it reaches want or the timeout elapses.
-func (e *Executor) WaitStatus(ctx context.Context, api LinodeAPI, id int, want string) error {
+// waitStatus polls the instance until it reaches want or the timeout elapses.
+func (e *Executor) waitStatus(ctx context.Context, api LinodeAPI, id int, want string) error {
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
 		inst, err := api.GetInstance(ctx, id)
@@ -341,11 +336,6 @@ func (e *Executor) WaitStatus(ctx context.Context, api LinodeAPI, id int, want s
 		case <-time.After(3 * time.Second):
 		}
 	}
-}
-
-// waitStatus is the internal helper used by Rebuild.
-func (e *Executor) waitStatus(ctx context.Context, api LinodeAPI, id int, want string) error {
-	return e.WaitStatus(ctx, api, id, want)
 }
 
 // ProbePort attempts a TCP connection to host:sshPort, bounded by 3s.

@@ -8,10 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"linode-panel/internal/agentcrypto"
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
 )
 
 // waitForResult polls the Hub until at least one result exists.
@@ -140,50 +138,6 @@ func TestRenameRejectsRemoteAgent(t *testing.T) {
 	remote2 := registerAgentID(t, srv2, "regcode-1", "node-2")
 	rr2 := authedPut(t, srv2, cookie2, "/api/agents/"+strconv.Itoa(remote2)+"/name", `{"name":"x"}`)
 	wantStatus(t, rr2, http.StatusBadRequest)
-}
-
-// TestRenameManualAgent verifies agents created from the panel UI can be
-// renamed (the panel owns their name), while still not being the self-agent.
-func TestRenameManualAgent(t *testing.T) {
-	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{})
-	if err := srv.Store.SetRegCode("regcode-1"); err != nil {
-		t.Fatalf("SetRegCode: %v", err)
-	}
-	// No self-agent: renaming must still work for a manually created agent.
-	rr := authedPost(t, srv, cookie, "/api/agents", `{"name":"manual-1"}`)
-	wantStatus(t, rr, http.StatusOK)
-	var created struct {
-		AgentID int `json:"agent_id"`
-	}
-	decodeJSON(t, rr, &created)
-
-	rr2 := authedPut(t, srv, cookie, "/api/agents/"+strconv.Itoa(created.AgentID)+"/name", `{"name":"机房A"}`)
-	wantStatus(t, rr2, http.StatusOK)
-	if agent, _ := srv.Hub.Agent(created.AgentID); agent.Name != "机房A" {
-		t.Fatalf("manual agent name = %q, want 机房A", agent.Name)
-	}
-
-	// The list endpoint flags it as manual.
-	list := authedGet(t, srv, cookie, "/api/agents")
-	wantStatus(t, list, http.StatusOK)
-	var resp struct {
-		Agents []struct {
-			ID     int  `json:"id"`
-			Manual bool `json:"manual"`
-			Local  bool `json:"local"`
-		} `json:"agents"`
-	}
-	decodeJSON(t, list, &resp)
-	if len(resp.Agents) != 1 || !resp.Agents[0].Manual || resp.Agents[0].Local {
-		t.Fatalf("agents = %+v, want one manual non-local agent", resp.Agents)
-	}
-
-	// Empty names are rejected for manual agents too.
-	rr3 := authedPut(t, srv, cookie, "/api/agents/"+strconv.Itoa(created.AgentID)+"/name", `{"name":"  "}`)
-	wantStatus(t, rr3, http.StatusBadRequest)
-	if agent, _ := srv.Hub.Agent(created.AgentID); agent.Name != "机房A" {
-		t.Fatalf("name changed after rejected rename: %q", agent.Name)
-	}
 }
 
 func TestSelfAgentExecutesPower(t *testing.T) {
@@ -330,7 +284,7 @@ func TestSelfAgentExecutesRebuild(t *testing.T) {
 		t.Fatalf("SetRegCode: %v", err)
 	}
 
-	// Configure the Server's rebuild Manager with a fast, fake rebuild.
+	// Inject a fast, fake rebuild into the self-agent's executor.
 	var mu sync.Mutex
 	status := map[int]string{7: "running"}
 	base := linode.Instance{Region: "us-east", Type: "g6-standard-1", Image: "linode/debian12", IPv4: []string{"198.51.100.5"}}
@@ -373,26 +327,34 @@ func TestSelfAgentExecutesRebuild(t *testing.T) {
 		ips.IPv4.Public = []linode.IPAddress{{Address: "203.0.113.7", Public: true}}
 		return ips, nil
 	}
-	srv.Tasks.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
+	srv.newAgentExec = func() *agenthub.Executor {
+		return &agenthub.Executor{
+			SSHPort: 22,
+			Run:     func(context.Context, string, int, []byte, string) error { return nil },
+			Probe:   func(context.Context, string, int) error { return nil },
+			NewAPI:  func(string) agenthub.LinodeAPI { return fake },
+		}
 	}
-	srv.Tasks.ProbeFn = func(_ context.Context, _ string) error { return nil }
-	srv.Tasks.PollInterval = time.Millisecond
-	srv.Tasks.PollTimeout = 100 * time.Millisecond
-	srv.Tasks.newAPI = func(string) LinodeAPI { return fake }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	localID := srv.EnableSelfAgent(ctx, "本地面板")
 
-	sealed, err := agentcrypto.Seal(agentcrypto.DeriveKey("regcode-1"), []byte("pat1"))
-	if err != nil {
-		t.Fatalf("Seal: %v", err)
+	// Seed the panel-side config for the old instance; the agent reports the
+	// replacement id, so the panel must re-point the stable cache row and the
+	// new instance inherits the script.
+	tok := srv.Store.TokensOf(aliceID)[0]
+	if err := srv.Store.CacheInstances(tok.ID, []linode.Instance{{ID: 7, Label: "web"}}); err != nil {
+		t.Fatal(err)
 	}
+	if err := srv.Store.SetInstanceScript(7, "echo inherited"); err != nil {
+		t.Fatal(err)
+	}
+
 	cmd, err := srv.Hub.Enqueue(localID, agenthub.Command{
 		Type: agenthub.CmdReboot,
 		Params: map[string]any{
-			"id": 7, "script": "echo hi", "sealed_pat": sealed,
+			"id": 7, "script": "echo hi", "pat": "pat1",
 		},
 	})
 	if err != nil {
@@ -401,5 +363,12 @@ func TestSelfAgentExecutesRebuild(t *testing.T) {
 	results := waitForResult(t, srv, 5*time.Second)
 	if !resultOK(results, cmd.ID) {
 		t.Fatalf("no ok rebuild result for %d: %+v", cmd.ID, results)
+	}
+	cached := srv.Store.CachedInstances(tok.ID)
+	if len(cached) != 1 || cached[0].ID != 99 {
+		t.Fatalf("cached instances = %+v, want the new instance 99", cached)
+	}
+	if script, ok := srv.Store.InstanceScript(99); !ok || script != "echo inherited" {
+		t.Fatalf("InstanceScript(99) = %q, %v; want inherited script", script, ok)
 	}
 }

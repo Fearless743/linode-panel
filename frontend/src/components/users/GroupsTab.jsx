@@ -1,75 +1,39 @@
 import { useState } from "react";
 import { useUi } from "../../ui";
 import { createGroup, deleteGroup } from "../../api";
-import Modal from "../Modal";
 import ConfirmDialog from "../ui/ConfirmDialog";
+import EditFormModal from "../ui/EditFormModal";
 import { PERM_LABELS } from "../../constants";
 
 // ---------- 创建权限组模态框 ----------
 function CreateGroupModal({ onClose, onCreated }) {
-  const { showBanner } = useUi();
-  const [name, setName] = useState("");
-  const [perms, setPerms] = useState(["view"]);
-  const [busy, setBusy] = useState(false);
-
-  function toggle(perm) {
-    setPerms((p) => (p.includes(perm) ? p.filter((x) => x !== perm) : [...p, perm]));
-  }
-
-  async function submit() {
-    if (!name.trim()) {
-      showBanner("组名称不能为空", false);
-      return;
-    }
-    setBusy(true);
-    try {
-      await createGroup({ name: name.trim(), perms });
-      onCreated();
-      onClose();
-    } catch (err) {
-      showBanner(err && err.message ? err.message : "创建权限组失败", false);
-      setBusy(false);
-    }
-  }
-
   return (
-    <Modal title="创建权限组" onClose={onClose}>
-      <div className="modal-field">
-        <label htmlFor="create-group-name">组名称</label>
-        <input
-          id="create-group-name"
-          className="modal-input"
-          type="text"
-          autoComplete="off"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-      </div>
-      <div className="modal-field">
-        <label>权限</label>
-        <div className="perm-checks">
-          {PERM_LABELS.map(([p, text]) => (
-            <label className="perm-check" key={p}>
-              <input
-                type="checkbox"
-                value={p}
-                checked={perms.includes(p)}
-                onChange={() => toggle(p)}
-              />
-              {text}
-            </label>
-          ))}
-        </div>
-      </div>
-      <div className="modal-actions">
-        <button className="btn btn-ghost" type="button" onClick={onClose} disabled={busy}>
-          取消
-        </button>
-        <button className="btn btn-primary" type="button" onClick={submit} disabled={busy}>
-          创建
-        </button>
-      </div>
-    </Modal>
+    <EditFormModal
+      title="创建权限组"
+      fields={[
+        {
+          key: "name",
+          label: "组名称",
+          type: "text",
+          autoComplete: "off",
+        },
+        {
+          key: "perms",
+          label: "权限",
+          type: "switches",
+          options: PERM_LABELS.map(([value, label]) => ({ value, label })),
+        },
+      ]}
+      initialValues={{ name: "", perms: ["view"] }}
+      busyLabel="创建中…"
+      submitLabel="创建"
+      onSubmit={async (values) => {
+        await createGroup({ name: values.name.trim(), perms: values.perms || [] });
+        onCreated();
+        onClose();
+      }}
+      onClose={onClose}
+    />
   );
 }
 

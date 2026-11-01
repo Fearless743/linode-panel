@@ -46,6 +46,10 @@ type Task struct {
 	StartedAt  string   `json:"started_at"`
 	EndedAt    string   `json:"ended_at"`
 
+	// rootPass is the instance's saved root password, used for the replacement
+	// instance. It is deliberately unexported so it never appears in task JSON.
+	rootPass string
+
 	// NewInstanceID is the id of the instance created by the rebuild, set as
 	// soon as it exists (InstanceID keeps the old, since-deleted id). 0 when
 	// the rebuild failed before creating it.
@@ -95,6 +99,11 @@ type Manager struct {
 	// PollInterval and PollTimeout bound status polling (steps 5-6).
 	PollInterval time.Duration
 	PollTimeout  time.Duration
+
+	// RepointCache, when set, is called as soon as a rebuild has created the
+	// replacement instance: the panel re-points the instance's stable cache row
+	// (and thus all per-instance configuration) at the new Linode id.
+	RepointCache func(oldID, newID int)
 }
 
 func NewManager(api LinodeAPI) *Manager {
@@ -125,9 +134,10 @@ func (m *Manager) SetSSHPort(port int) {
 
 // Start queues a rebuild job and returns its task id. Only one job may run at
 // a time; while one is in flight, Start returns ErrBusy. The pat is the
-// Personal Access Token for the requesting user's chosen token; tokenLabel is
+// Personal Access Token for the requesting user's chosen token; rootPass is the
+// instance's saved root password (empty = SSH-key-only), and tokenLabel is
 // recorded on the task for display.
-func (m *Manager) Start(instanceID int, script string, reservedIP string, pat string, tokenLabel string) (string, error) {
+func (m *Manager) Start(instanceID int, script, rootPass, pat string, tokenLabel string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.busy {
@@ -144,10 +154,11 @@ func (m *Manager) Start(instanceID int, script string, reservedIP string, pat st
 		TokenLabel: tokenLabel,
 		StartedAt:  time.Now().UTC().Format(time.RFC3339),
 		Log:        []string{},
+		rootPass:   rootPass,
 	}
 	m.tasks[id] = t
 	m.order = append(m.order, id)
-	go m.run(t, reservedIP, pat)
+	go m.run(t, pat)
 	return id, nil
 }
 

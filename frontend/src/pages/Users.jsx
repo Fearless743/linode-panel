@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import { listUsers, listGroups } from "../api";
 import UsersTab from "../components/users/UsersTab";
 import GroupsTab from "../components/users/GroupsTab";
-import PATModal from "../components/users/PATModal";
 import GroupEditModal from "../components/users/GroupEditModal";
 
 // ---------- 页面：仅保留 tab 状态与数据编排 ----------
@@ -11,7 +10,6 @@ export default function Users() {
   const [users, setUsers] = useState(null);
   const [groups, setGroups] = useState(null);
   const [error, setError] = useState("");
-  const [patUser, setPatUser] = useState(null);
   const [editGroup, setEditGroup] = useState(null);
 
   const load = useCallback(async () => {
@@ -53,9 +51,7 @@ export default function Users() {
 
       {error && <div className="users-empty">加载失败：{error}</div>}
 
-      {tab === "users" && (
-        <UsersTab users={users} groups={groups} onOpenPat={setPatUser} onReload={load} />
-      )}
+      {tab === "users" && <UsersTab users={users} groups={groups} onReload={load} />}
 
       {tab === "groups" && (
         <GroupsTab
@@ -66,15 +62,6 @@ export default function Users() {
         />
       )}
 
-      {patUser && (
-        <PATModal
-          user={patUser}
-          onClose={() => {
-            setPatUser(null);
-            load();
-          }}
-        />
-      )}
       {editGroup && (
         <GroupEditModal
           group={editGroup}

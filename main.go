@@ -192,14 +192,7 @@ func defaultAutoRebuildCheckAPI() string {
 }
 
 // defaultStatePath returns the default SQLite database location under the
-// user's config directory, falling back to the home directory when XDG is
-// unset.
+// ./db directory of the current working directory.
 func defaultStatePath() string {
-	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
-		return filepath.Join(dir, "linode-panel", "state.db")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".config", "linode-panel", "state.db")
-	}
-	return "state.db"
+	return filepath.Join("db", "state.db")
 }

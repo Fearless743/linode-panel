@@ -1,0 +1,51 @@
+# linode-panel Docker Compose
+#
+# 快速开始：
+#   docker compose up -d              # 拉取 GHCR 镜像并启动
+#   docker compose up -d --build      # 本地构建镜像后启动
+#   docker compose logs -f            # 查看日志（首次启动含管理员密码）
+#   docker compose pull && docker compose up -d   # 升级
+#
+# 默认仅监听 127.0.0.1:8787，对外访问请在前面加 Nginx/Caddy 反向代理并配置 TLS。
+# 可用环境变量（可写在同目录 .env 中）：
+#   PANEL_IMAGE   镜像地址，默认 ghcr.io/fearless743/linode-panel:latest
+#   PANEL_BIND    宿主机监听地址，默认 127.0.0.1
+#   PANEL_PORT    宿主机端口，默认 8787
+#   TZ            时区，默认 Asia/Shanghai
+#   LINODE_API_BASE        Linode API base，默认 https://api.linode.com/v4
+#   AUTO_REBUILD_CHECK_API 被墙判定用的探测接口，留空使用程序默认值
+
+name: linode-panel
+
+services:
+  panel:
+    image: ${PANEL_IMAGE:-ghcr.io/fearless743/linode-panel:latest}
+    build:
+      context: .
+      target: runtime
+    container_name: linode-panel
+    restart: unless-stopped
+    ports:
+      - "${PANEL_BIND:-127.0.0.1}:${PANEL_PORT:-8787}:8787"
+    volumes:
+      - panel-data:/data
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LINODE_API_BASE: ${LINODE_API_BASE:-https://api.linode.com/v4}
+      AUTO_REBUILD_CHECK_API: ${AUTO_REBUILD_CHECK_API:-}
+    # 镜像内默认已带 --addr 0.0.0.0:8787 --state /data/state.db，可按需覆盖：
+    # command: ["--addr", "0.0.0.0:8787", "--state", "/data/state.db"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8787/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  panel-data:

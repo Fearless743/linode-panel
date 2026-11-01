@@ -1,4 +1,4 @@
-/* 页面专属样式：instances 表、ssh-keys、boot-script、tasks、users、agents */
+/* 页面专属样式：instances 表、boot-script、tasks、users、agents */
 
 /* ---------- 实例表格 ---------- */
 .instances {
@@ -39,6 +39,29 @@
   margin-left: 6px;
 }
 
+.account-group-row td {
+  background: var(--bg-elevated);
+  padding: 8px var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.account-group-label {
+  font-weight: 600;
+}
+
+.account-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.account-group-count {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  margin-left: 8px;
+}
+
 .ip-cell {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
@@ -51,63 +74,6 @@
 
 .ip-muted {
   color: var(--text-muted);
-}
-
-/* ---------- SSH Keys ---------- */
-.ssh-keys-panel {
-  margin: 14px var(--space-5) 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg-elevated);
-  overflow: hidden;
-}
-
-.panel-title {
-  font-size: var(--font-size-base);
-  font-weight: 600;
-  margin: 0;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-}
-
-.ssh-keys-content {
-  padding: 10px 14px;
-  max-height: 320px;
-  overflow-y: auto;
-}
-
-.ssh-key-item {
-  padding: var(--space-2) 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.ssh-key-item:last-child {
-  border-bottom: none;
-}
-
-.ssh-key-item .ssh-key-label {
-  font-weight: 600;
-}
-
-.ssh-key-item .ssh-key-meta {
-  color: var(--text-muted);
-  font-size: var(--font-size-sm);
-  margin-left: var(--space-2);
-}
-
-.ssh-key-item .ssh-key-body {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: var(--space-1);
-}
-
-.ssh-keys-empty {
-  color: var(--text-muted);
-  padding: var(--space-2) 0;
 }
 
 /* ---------- 通用面板 / 开机脚本 ---------- */
@@ -169,6 +135,34 @@
   color: var(--danger);
 }
 
+/* ---------- 实例编辑弹窗（开机脚本 / 自动换 IP 标签页） ---------- */
+.edit-modal-tabs {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.edit-modal-tab {
+  font: inherit;
+  font-size: var(--font-size-sm);
+  padding: var(--space-1) 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.edit-modal-tab:hover {
+  background: var(--bg-hover);
+}
+
+.edit-modal-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-on-accent);
+}
+
 /* ---------- 任务页 ---------- */
 .tasks-content {
   padding: 10px 14px;
@@ -206,6 +200,13 @@
   max-width: 240px;
   padding: 6px 8px;
   font-size: var(--font-size-sm);
+}
+
+/* 账号管理：未绑定 Agent 时的占位文本。 */
+.agent-unbound {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-style: italic;
 }
 
 /* ---------- Agent 表格 ---------- */
@@ -346,6 +347,13 @@
   background: color-mix(in srgb, var(--danger) 15%, transparent);
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+/* 账号页：余额/状态单元格（状态胶囊下的余额小字）。 */
+.acct-balance {
+  margin-top: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
 }
 
 /* 管理成员弹窗内的账号列表。 */

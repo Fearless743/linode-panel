@@ -216,6 +216,24 @@ func fakeLinodeServer(t *testing.T, byPAT map[string][]linode.Instance) *httptes
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(found)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/linode/instances/"):
+			// DELETE /linode/instances/{id} -> 200 when the instance exists.
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/linode/instances/"), "/")
+			id := parts[0]
+			var found *linode.Instance
+			for i := range insts {
+				if id == strconv.Itoa(insts[i].ID) {
+					found = &insts[i]
+					break
+				}
+			}
+			if found == nil {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"errors": []map[string]string{{"reason": "not found"}}})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{}"))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/boot"):
 			mu.Lock()
 			statuses[1] = "running"

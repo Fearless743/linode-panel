@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   apiFetch,
+  deleteInstance,
   instanceAction,
   listInstances,
   listRebuildTasks,
@@ -17,8 +18,8 @@ import InstanceTable from "../components/instances/InstanceTable";
 import ActionModal from "../components/instances/ActionModal";
 import RebuildModal from "../components/instances/RebuildModal";
 import CreateInstanceModal from "../components/instances/CreateInstanceModal";
-import InstanceScriptModal from "../components/InstanceScriptModal";
-import AutoRebuildModal from "../components/instances/AutoRebuildModal";
+import InstanceEditModal from "../components/instances/InstanceEditModal";
+import ConfirmDialog from "../components/ui/ConfirmDialog";
 
 export default function Instances() {
   const { hasPerm } = useAuth();
@@ -30,13 +31,15 @@ export default function Instances() {
   const [rebuildTaskRunning, setRebuildTaskRunning] = useState(false);
   const [actionModal, setActionModal] = useState(null); // { inst, action }
   const [rebuildModal, setRebuildModal] = useState(null); // inst
-  const [scriptModal, setScriptModal] = useState(null); // inst
+  const [editModal, setEditModal] = useState(null); // inst
+  const [deleteModal, setDeleteModal] = useState(null); // inst
   const [customScriptIds, setCustomScriptIds] = useState(() => new Set());
   // 已开启「被墙后自动换 IP」的实例 id 集合（用于行内标记）。
   const [autoRebuildIds, setAutoRebuildIds] = useState(() => new Set());
-  const [autoRebuildModal, setAutoRebuildModal] = useState(null); // inst
   const [tokens, setTokens] = useState([]); // 已绑定账号（PAT），用于创建实例
   const [createOpen, setCreateOpen] = useState(false); // 创建实例模态框
+  // 正在按账号批量刷新中的分组 key（token_id，0 表示未绑定账号）。
+  const [refreshingKey, setRefreshingKey] = useState(null);
 
   const instancesRef = useRef([]);
   instancesRef.current = instances;
@@ -46,11 +49,17 @@ export default function Instances() {
     []
   );
 
+  // 实例在上游已不存在（404）时从列表移除，避免「卡实例」一直显示。
+  const removeInstance = useCallback((id) => {
+    setInstances((prev) => prev.filter((i) => i.id !== id));
+  }, []);
+
   // 行状态（timer/sshReady/startedAt/…）+ 状态轮询 + SSH 探测，集中在 hook 中。
   const { getRowState, startPolling, stopPolling, resetRowStates, resetRowState, bump } =
     useInstancePolling({
       findInstance,
       showBanner,
+      onInstanceMissing: removeInstance,
     });
 
   // 哪些实例配置了自定义脚本（用于在行内标记）。
@@ -86,8 +95,19 @@ export default function Instances() {
     }
   }, []);
 
+  // 账号（token id）绑定的执行 Agent 名称；空串表示未绑定（面板直发）。
+  // 供操作/重建模态框显示执行通道，并用于删除确认提示。
+  const boundAgentNameOf = useCallback(
+    (tokenId) => {
+      const t = tokens.find((x) => x.id === tokenId);
+      if (!t || !(t.agent_id > 0)) return "";
+      return t.agent_name || "Agent #" + t.agent_id;
+    },
+    [tokens]
+  );
+
   // 加载实例列表：后端返回数据库缓存（首次无缓存时自动拉取并缓存）。
-  // 实例的最新数据通过行级「刷新」按钮单独拉取（见 refreshRow）。
+  // 实例的最新数据通过账号分组行的「刷新」按钮批量拉取（见 refreshGroup）。
   const loadInstances = useCallback(async () => {
     setLoading(true);
     hideBanner();
@@ -131,26 +151,69 @@ export default function Instances() {
   // rebuildTaskRunning 为 true 时每 5s 轮询重建任务，全部结束后自动停止。
   usePolling(checkRebuildTasks, 5000, rebuildTaskRunning);
 
-  // ---------- 行级刷新（仅该实例通过 API 获取最新） ----------
-  const refreshRow = async (inst) => {
+  // ---------- 账号级刷新（仅该账号下的实例通过 API 获取最新） ----------
+  const refreshGroup = async (group) => {
     hideBanner();
-    const tokenId = inst && inst.token_id != null ? inst.token_id : "";
-    try {
-      const data = await refreshInstance(inst.id, tokenId);
-      if (!data || data.id == null) throw new Error("未返回实例数据");
-      setInstances((prev) => prev.map((i) => (i.id === inst.id ? data : i)));
+    const list = Array.isArray(group.instances) ? group.instances : [];
+    if (list.length === 0 || refreshingKey !== null) return;
+    setRefreshingKey(group.key);
+    const results = await Promise.allSettled(
+      list.map((inst) => refreshInstance(inst.id, inst.token_id != null ? inst.token_id : ""))
+    );
+
+    const refreshed = [];
+    const missingIds = [];
+    const failed = [];
+    results.forEach((res, idx) => {
+      const inst = list[idx];
+      if (res.status === "rejected") {
+        const err = res.reason || {};
+        if (err.status === 404) {
+          missingIds.push(inst.id);
+        } else {
+          failed.push((inst.label || "#" + inst.id) + "：" + (err.message || "未知错误"));
+        }
+        return;
+      }
+      const data = res.value;
+      if (!data || data.id == null) {
+        failed.push((inst.label || "#" + inst.id) + "：未返回实例数据");
+        return;
+      }
+      refreshed.push(data);
       resetRowState(inst.id);
+    });
+
+    if (refreshed.length > 0 || missingIds.length > 0) {
+      setInstances((prev) => {
+        const byId = new Map(refreshed.map((i) => [i.id, i]));
+        return prev
+          .filter((i) => !missingIds.includes(i.id))
+          .map((i) => byId.get(i.id) || i);
+      });
       bump();
-    } catch (err) {
-      showBanner("刷新失败：" + (err.message || "未知错误"), false);
     }
+    setRefreshingKey(null);
+
+    const notes = [];
+    if (missingIds.length > 0) {
+      notes.push("有 " + missingIds.length + " 个实例在 Linode 已不存在，已从列表移除");
+    }
+    if (failed.length > 0) {
+      notes.push("刷新失败：" + failed.join("；"));
+    }
+    if (notes.length === 0 && refreshed.length > 0) {
+      notes.push("账号「" + group.label + "」的 " + refreshed.length + " 个实例已刷新");
+    }
+    if (notes.length > 0) showBanner(notes.join("；"), false);
   };
 
   // ---------- 操作与轮询 ----------
   const performAction = async (id, action, choice) => {
     hideBanner();
     const st = getRowState(id);
-    const viaAgent = !!(choice && choice.viaAgent);
+    // undefined = 跟随账号绑定（后端决定执行通道）。
+    const viaAgent = choice ? choice.viaAgent : undefined;
     const agentId = choice && choice.agentId ? String(choice.agentId) : "";
     st.action = action;
     st.sshTimeout = false;
@@ -168,8 +231,8 @@ export default function Instances() {
       const inst = findInstance(id);
       const tokenId = inst && inst.token_id != null ? inst.token_id : "";
       const res = await instanceAction(id, action, { tokenId, viaAgent, agentId });
-      if (viaAgent) {
-        if (!res || res.command_id == null) throw new Error("未返回命令 ID");
+      // 后端经 Agent 下发时返回 command_id（auto 模式命中绑定时同样如此）。
+      if (res && res.command_id != null) {
         st.lastStatus = null;
         stopPolling(id);
         bump();
@@ -188,15 +251,16 @@ export default function Instances() {
     startPolling(id);
   };
 
-  const confirmRebuild = async ({ script, ip, viaAgent, agentId }) => {
+  const confirmRebuild = async ({ script, root_password, viaAgent, agentId }) => {
     hideBanner();
     const inst = rebuildModal;
     const payload = { script };
-    if (ip) payload.reserved_ip = ip;
-    if (!viaAgent && inst && inst.token_id != null) payload.token_id = inst.token_id;
+    if (root_password) payload.root_password = root_password;
+    // 目标账号始终随请求下发：直发用它调用 API，经 Agent 时用它解析 PAT。
+    if (inst && inst.token_id != null) payload.token_id = inst.token_id;
     const res = await rebuildInstance(inst.id, payload, viaAgent, agentId);
-    if (viaAgent) {
-      if (!res || res.command_id == null) throw new Error("未返回命令 ID");
+    // 经 Agent 下发（含 auto 模式命中绑定）返回 command_id。
+    if (res && res.command_id != null) {
       showBanner("已下发至 Agent（命令 #" + res.command_id + "），可在 Agent 面板查看进度", false);
       return;
     }
@@ -206,7 +270,35 @@ export default function Instances() {
     loadInstances();
   };
 
+  // ---------- 删除实例 ----------
+  // 确认后调用 API 永久删除实例；执行通道跟随账号绑定。
+  const confirmDelete = async () => {
+    const inst = deleteModal;
+    if (!inst) return;
+    hideBanner();
+    const tokenId = inst.token_id != null ? inst.token_id : "";
+    try {
+      const res = await deleteInstance(inst.id, tokenId);
+      // 经 Agent 下发时删除是异步的，不立即移除行（后续刷新会因 404 自动移除）。
+      if (res && res.command_id != null) {
+        showBanner("删除命令已下发至 Agent（命令 #" + res.command_id + "）", false);
+      } else {
+        stopPolling(inst.id);
+        resetRowState(inst.id);
+        removeInstance(inst.id);
+        bump();
+        showBanner("实例已删除", false);
+      }
+    } catch (err) {
+      showBanner("删除失败：" + (err.message || "未知错误"), false);
+    } finally {
+      setDeleteModal(null);
+    }
+  };
+
   const hasInstances = instances.length > 0;
+  // 删除确认里展示实际执行通道（跟随账号绑定）。
+  const deleteAgentName = deleteModal ? boundAgentNameOf(deleteModal.token_id) : "";
 
   return (
     <>
@@ -232,11 +324,13 @@ export default function Instances() {
           customScriptIds={customScriptIds}
           autoRebuildIds={autoRebuildIds}
           hasPerm={hasPerm}
+          agentNameForToken={boundAgentNameOf}
           onAction={(inst, action) => setActionModal({ inst, action })}
           onRebuild={(inst) => setRebuildModal(inst)}
-          onScript={(inst) => setScriptModal(inst)}
-          onAutoRebuild={(inst) => setAutoRebuildModal(inst)}
-          onRefresh={refreshRow}
+          onEdit={(inst) => setEditModal(inst)}
+          onRefreshGroup={refreshGroup}
+          refreshingKey={refreshingKey}
+          onDelete={(inst) => setDeleteModal(inst)}
         />
       )}
 
@@ -244,6 +338,7 @@ export default function Instances() {
         <ActionModal
           inst={actionModal.inst}
           action={actionModal.action}
+          boundAgentName={boundAgentNameOf(actionModal.inst.token_id)}
           onClose={() => setActionModal(null)}
           onConfirm={(choice) =>
             performAction(actionModal.inst.id, actionModal.action, choice)
@@ -253,22 +348,36 @@ export default function Instances() {
       {rebuildModal && (
         <RebuildModal
           inst={rebuildModal}
+          boundAgentName={boundAgentNameOf(rebuildModal.token_id)}
           onClose={() => setRebuildModal(null)}
           onConfirm={confirmRebuild}
         />
       )}
-      {scriptModal && (
-        <InstanceScriptModal
-          inst={scriptModal}
-          onClose={() => setScriptModal(null)}
-          onChanged={loadScriptStatus}
+      {editModal && (
+        <InstanceEditModal
+          inst={editModal}
+          canScript={hasPerm("script")}
+          canAutoRebuild={hasPerm("rebuild")}
+          onClose={() => setEditModal(null)}
+          onScriptChanged={loadScriptStatus}
+          onAutoRebuildChanged={loadAutoRebuildStatus}
         />
       )}
-      {autoRebuildModal && (
-        <AutoRebuildModal
-          inst={autoRebuildModal}
-          onClose={() => setAutoRebuildModal(null)}
-          onChanged={loadAutoRebuildStatus}
+      {deleteModal && (
+        <ConfirmDialog
+          title="删除实例"
+          message={
+            "确定删除实例 " +
+            (deleteModal.label || "#" + deleteModal.id) +
+            " 吗？该操作不可恢复，实例及其磁盘将被永久删除。" +
+            (deleteAgentName
+              ? "将通过 Agent「" + deleteAgentName + "」执行。"
+              : "将通过面板直发执行。")
+          }
+          confirmText="删除"
+          danger
+          onConfirm={confirmDelete}
+          onCancel={() => setDeleteModal(null)}
         />
       )}
       {createOpen && (
@@ -277,7 +386,7 @@ export default function Instances() {
           onClose={() => setCreateOpen(false)}
           onCreated={() => {
             loadInstances();
-            showBanner("实例已创建", false);
+            showBanner("实例已创建；开机脚本将在实例启动后自动执行", false);
           }}
         />
       )}

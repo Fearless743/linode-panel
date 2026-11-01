@@ -175,7 +175,8 @@ export default function CreateInstanceModal({ tokens, onClose, onCreated }) {
       <div className="modal-field">
         <label htmlFor="create-script">开机脚本（可选）</label>
         <p className="boot-script-hint">
-          保存为该实例配置的开机脚本，实例重建时自动执行；留空则使用内置默认脚本。
+          创建后由面板在实例启动后通过 SSH 以 root 身份执行，并保存为该实例配置（重建时也会执行）；
+          留空则不执行。
         </p>
         <textarea
           id="create-script"

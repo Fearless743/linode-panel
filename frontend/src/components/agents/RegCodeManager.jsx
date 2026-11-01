@@ -21,7 +21,7 @@ export default function RegCodeManager({ onSetRegcode, onGenRegcode }) {
         </div>
       </div>
       <p className="agents-muted">
-        注册码用于派生 AES-256-GCM 密钥，加密下发给 Agent 的 PAT 只能被持有该码的 Agent 解密。
+        注册码是 Agent 接入面板的唯一凭据：远程主机首次运行 agent 时用 --code 注册即可。
       </p>
       {setOpen && (
         <SetRegcodeModal

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -426,6 +427,14 @@ func TestGenerateKey(t *testing.T) {
 	}
 	if comment != "" {
 		t.Errorf("comment = %q, want empty", comment)
+	}
+	// The Linode API rejects multi-lined SSH keys; the authorized key must be
+	// a single line with no surrounding whitespace/newline.
+	if strings.ContainsAny(authorized, "\r\n") {
+		t.Errorf("authorized key must be single-lined, got %q", authorized)
+	}
+	if strings.TrimSpace(authorized) != authorized {
+		t.Errorf("authorized key has surrounding whitespace: %q", authorized)
 	}
 }
 

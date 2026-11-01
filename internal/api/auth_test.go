@@ -11,7 +11,6 @@ func TestUnauthenticated401(t *testing.T) {
 	for _, path := range []string{
 		"/api/instances",
 		"/api/instances/1/status",
-		"/api/ssh-keys",
 		"/api/users",
 		"/api/groups",
 	} {

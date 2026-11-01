@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 )
@@ -28,12 +29,23 @@ type groupJSON struct {
 // accounts in GET /api/account/tokens). Only the masked value is returned;
 // the plaintext token never leaves the server. agent_id/agent_name report the
 // account's bound agent (0/empty when unbound).
+// tokenJSON 用于 GET /api/account/tokens（及管理员的 /api/users/{id}/tokens）。
+// health_* 字段由服务端对每个账号发起一次 GET /account 探测填充：
+//   - health_status：ok | no_balance | banned | error，探测失败时留空；
+//   - health_detail：可读中文说明（含余额数字）；
+//   - health_checked_at：本次探测时间（RFC3339）。
+// balance / balance_uninvoiced 仅探测成功时返回（float64，正数=欠款）。
 type tokenJSON struct {
-	ID        int    `json:"id"`
-	Label     string `json:"label"`
-	Masked    string `json:"masked"`
-	AgentID   int    `json:"agent_id"`
-	AgentName string `json:"agent_name,omitempty"`
+	ID               int     `json:"id"`
+	Label            string  `json:"label"`
+	Masked           string  `json:"masked"`
+	AgentID          int     `json:"agent_id"`
+	AgentName        string  `json:"agent_name,omitempty"`
+	HealthStatus     string  `json:"health_status,omitempty"`
+	HealthDetail     string  `json:"health_detail,omitempty"`
+	HealthCheckedAt  string  `json:"health_checked_at,omitempty"`
+	Balance          float64 `json:"balance,omitempty"`
+	BalanceUninvoiced float64 `json:"balance_uninvoiced,omitempty"`
 }
 
 // handleListUsers returns all users with their group name and PAT count.
@@ -101,9 +113,14 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
 		return
 	}
+	groupChanged := req.GroupID != nil
 	groupID := -1
-	if req.GroupID != nil {
+	if groupChanged {
 		groupID = *req.GroupID
+		if groupID <= 0 {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "无效的权限组"})
+			return
+		}
 	}
 	pass := ""
 	if req.Password != nil {
@@ -113,9 +130,18 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if groupID < 0 && pass == "" {
+	if !groupChanged && pass == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有可更新的字段"})
 		return
+	}
+	// 只改密码时保留用户当前组，避免把“不更新组”表示成不存在的 group -1。
+	if !groupChanged {
+		u, ok := s.Store.User(id)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: fmt.Sprintf("用户 %d 不存在", id)})
+			return
+		}
+		groupID = u.GroupID
 	}
 	if err := s.Store.UpdateUser(id, groupID, pass); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})

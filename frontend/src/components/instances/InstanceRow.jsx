@@ -4,6 +4,7 @@ import { Fragment } from "react";
 import StatusPill from "../StatusPill";
 import SshCard from "./SshCard";
 import { isTransition } from "./useInstancePolling";
+import { regionLabel, typeLabel } from "../../utils/linodeLabels";
 
 export default function InstanceRow({
   inst,
@@ -14,9 +15,8 @@ export default function InstanceRow({
   hasPerm,
   onAction,
   onRebuild,
-  onScript,
-  onAutoRebuild,
-  onRefresh,
+  onEdit,
+  onDelete,
 }) {
   const status = st.lastStatus || inst.status;
   const tags = Array.isArray(inst.tags) ? inst.tags : [];
@@ -28,18 +28,8 @@ export default function InstanceRow({
   const renderActions = () => {
     const busy = isTransition(status);
     const canPower = hasPerm("power");
-    // 行级刷新：始终可用，通过 API 获取该实例最新数据。
-    const buttons = [
-      <button
-        key="refresh"
-        className="action-btn"
-        type="button"
-        title="通过 API 刷新该实例"
-        onClick={() => onRefresh(inst)}
-      >
-        刷新
-      </button>,
-    ];
+    // 刷新按钮已上移到账号分组行（按账号批量刷新），行内不再提供。
+    const buttons = [];
     if (canPower && status === "offline") {
       buttons.push(
         <button
@@ -91,33 +81,41 @@ export default function InstanceRow({
         </button>
       );
     }
-    if (hasPerm("script")) {
+    // 「编辑」按钮：合并开机脚本与自动换 IP 两个编辑区；需要其中任一权限才显示。
+    if (hasPerm("script") || hasPerm("rebuild")) {
+      const marks = [hasCustomScript ? "脚本" : "", autoRebuildEnabled ? "自动换IP" : ""]
+        .filter(Boolean)
+        .join("、");
       buttons.push(
         <button
-          key="script"
+          key="edit"
           className="action-btn"
           type="button"
-          title={hasCustomScript ? "已配置自定义开机脚本" : "配置开机脚本"}
-          onClick={() => onScript(inst)}
+          title={
+            "编辑：" +
+            [hasPerm("script") ? "开机脚本" : "", hasPerm("rebuild") ? "自动换 IP" : ""]
+              .filter(Boolean)
+              .join("、") +
+            (marks ? "（已配置：" + marks + "）" : "")
+          }
+          onClick={() => onEdit(inst)}
         >
-          {hasCustomScript ? "脚本 •" : "脚本"}
+          编辑
+          {(hasCustomScript || autoRebuildEnabled) && " •"}
         </button>
       );
     }
-    if (hasPerm("rebuild")) {
+    // 「删除」按钮：需 power 权限；过渡态（操作进行中）禁用，避免误删。
+    if (canPower) {
       buttons.push(
         <button
-          key="auto-rebuild"
-          className={autoRebuildEnabled ? "action-btn primary" : "action-btn"}
+          key="delete"
+          className="action-btn danger"
           type="button"
-          title={
-            autoRebuildEnabled
-              ? "已开启：被墙后自动删机重建换 IP"
-              : "被墙后自动删机重建换 IP"
-          }
-          onClick={() => onAutoRebuild(inst)}
+          disabled={busy}
+          onClick={() => onDelete(inst)}
         >
-          {autoRebuildEnabled ? "自动换IP •" : "自动换IP"}
+          删除
         </button>
       );
     }
@@ -146,8 +144,8 @@ export default function InstanceRow({
           <StatusPill status={status} />
         </td>
         <td>
-          <div>{inst.region || "—"}</div>
-          <div className="ip-muted">{inst.type || ""}</div>
+          <div>{inst.region ? regionLabel(inst.region) : "—"}</div>
+          <div className="ip-muted">{inst.type ? typeLabel(inst.type) : ""}</div>
         </td>
         <td>
           <div className="ip-cell">

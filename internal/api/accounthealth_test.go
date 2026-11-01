@@ -23,7 +23,6 @@ func (f fakeAccountProber) GetAccount(ctx context.Context) (linode.Account, erro
 
 // TestAccountHealthProbeWith 覆盖 probeAccountHealthWith 的各种判定分支。
 func TestAccountHealthProbeWith(t *testing.T) {
-	srv := testServer(t, &fakeAPI{})
 	cases := []struct {
 		name       string
 		acct       linode.Account
@@ -88,8 +87,7 @@ func TestAccountHealthProbeWith(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, detail := srv.probeAccountHealthWith(context.Background(),
-				fakeAccountProber{acct: tc.acct, err: tc.err})
+			status, detail := probeAccountHealthWith(fakeAccountProber{acct: tc.acct, err: tc.err}, context.Background())
 			if status != tc.wantStatus {
 				t.Fatalf("status = %q, want %q (detail=%q)", status, tc.wantStatus, detail)
 			}

@@ -2,15 +2,14 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"linode-panel/internal/agentcrypto"
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/linode"
 )
@@ -145,7 +144,7 @@ func TestAgentResultWrongAgent(t *testing.T) {
 	}
 	decodeJSON(t, rr, &reg)
 	cmd, _ := srv.Hub.Enqueue(reg.AgentID, agenthub.Command{Type: agenthub.CmdList, Params: map[string]any{}})
-	srv.Hub.NextCommands(reg.AgentID, 0) // mark in_flight
+	srv.Hub.NextCommands(context.Background(), reg.AgentID, 0) // mark in_flight
 
 	// A different (second) agent cannot complete the command.
 	_, tok2 := srv.Hub.Register("node-2")
@@ -199,28 +198,20 @@ func TestAgentsAdminGate(t *testing.T) {
 	wantStatus(t, rr2, http.StatusForbidden)
 }
 
-func TestCreateAgentAndDelete(t *testing.T) {
+func TestDeleteAgent(t *testing.T) {
 	srv, cookie := agentTestServer(t, "regcode-1")
-	rr := authedPost(t, srv, cookie, "/api/agents", `{"name":"manual-1"}`)
+	id := registerAgentID(t, srv, "regcode-1", "node-1")
+	if _, ok := srv.Hub.Agent(id); !ok {
+		t.Fatal("agent not registered")
+	}
+	rr := authedDelete(t, srv, cookie, "/api/agents/"+strconv.Itoa(id))
 	wantStatus(t, rr, http.StatusOK)
-	var resp struct {
-		AgentID int    `json:"agent_id"`
-		Token   string `json:"agent_token"`
-		Code    string `json:"registration_code"`
-	}
-	decodeJSON(t, rr, &resp)
-	if resp.AgentID <= 0 || resp.Token == "" || resp.Code != "regcode-1" {
-		t.Fatalf("create agent resp = %+v", resp)
-	}
-	// Delete it.
-	rr2 := authedDelete(t, srv, cookie, "/api/agents/"+strconv.Itoa(resp.AgentID))
-	wantStatus(t, rr2, http.StatusOK)
-	if _, ok := srv.Hub.Agent(resp.AgentID); ok {
+	if _, ok := srv.Hub.Agent(id); ok {
 		t.Fatal("agent still present after delete")
 	}
 	// Unknown id -> 404.
-	rr3 := authedDelete(t, srv, cookie, "/api/agents/999")
-	wantStatus(t, rr3, http.StatusNotFound)
+	rr2 := authedDelete(t, srv, cookie, "/api/agents/999")
+	wantStatus(t, rr2, http.StatusNotFound)
 }
 
 func TestSetRegCode(t *testing.T) {
@@ -294,13 +285,9 @@ func TestViaAgentPowerQueues(t *testing.T) {
 	if id, _ := cmd.Params["id"].(int); id != 7 {
 		t.Fatalf("cmd id param = %#v, want 7", cmd.Params["id"])
 	}
-	sealed, _ := cmd.Params["sealed_pat"].(string)
-	plain, err := agentcrypto.Open(agentcrypto.DeriveKey("regcode-1"), sealed)
-	if err != nil {
-		t.Fatalf("Open sealed pat: %v", err)
-	}
-	if string(plain) != "pat1" {
-		t.Fatalf("sealed PAT = %q, want pat1", string(plain))
+	pat, _ := cmd.Params["pat"].(string)
+	if pat != "pat1" {
+		t.Fatalf("PAT = %q, want pat1", pat)
 	}
 }
 
@@ -313,7 +300,7 @@ func TestViaAgentRebuildQueues(t *testing.T) {
 	}
 	decodeJSON(t, rr, &reg)
 
-	body := `{"script":"echo boot","reserved_ip":"203.0.113.9"}`
+	body := `{"script":"echo boot"}`
 	rr2 := authedPost(t, srv, cookie, "/api/instances/7/rebuild?via_agent=1", body)
 	wantStatus(t, rr2, http.StatusAccepted)
 	var resp struct {
@@ -325,34 +312,21 @@ func TestViaAgentRebuildQueues(t *testing.T) {
 		t.Fatalf("command %d not found", resp.CommandID)
 	}
 	if cmd.Type != agenthub.CmdReboot ||
-		cmd.Params["script"] != "echo boot" || cmd.Params["reserved_ip"] != "203.0.113.9" {
+		cmd.Params["script"] != "echo boot" {
 		t.Fatalf("cmd = %+v", cmd)
 	}
 	if id, _ := cmd.Params["id"].(int); id != 7 {
 		t.Fatalf("cmd id param = %#v, want 7", cmd.Params["id"])
 	}
-	sealed, _ := cmd.Params["sealed_pat"].(string)
-	plain, err := agentcrypto.Open(agentcrypto.DeriveKey("regcode-1"), sealed)
-	if err != nil || string(plain) != "pat1" {
-		t.Fatalf("sealed PAT = %q, err=%v", string(plain), err)
-	}
-}
-
-func TestViaAgentNoRegCode(t *testing.T) {
-	srv, cookie := agentTestServer(t, "")
-	// Register an agent anyway (hub has one) but no reg code.
-	_, _ = srv.Hub.Register("orphan")
-	rr := authedPost(t, srv, cookie, "/api/instances/7/boot?via_agent=1", "")
-	wantStatus(t, rr, http.StatusBadRequest)
-	var resp errorResponse
-	decodeJSON(t, rr, &resp)
-	if !strings.Contains(resp.Error, "没有已注册的 agent") {
-		t.Fatalf("error = %q", resp.Error)
+	pat, _ := cmd.Params["pat"].(string)
+	if pat != "pat1" {
+		t.Fatalf("PAT = %q, want pat1", pat)
 	}
 }
 
 func TestViaAgentNoAgent(t *testing.T) {
-	srv, cookie := agentTestServer(t, "regcode-1")
+	srv, cookie := agentTestServer(t, "")
+	// No agent registered at all.
 	rr := authedPost(t, srv, cookie, "/api/instances/7/boot?via_agent=1", "")
 	wantStatus(t, rr, http.StatusBadRequest)
 }
@@ -533,6 +507,97 @@ func TestViaAgentRoutesToBoundAgent(t *testing.T) {
 	decodeJSON(t, rr4, &resp)
 	if cmd, ok := srv.Hub.Command(resp.CommandID); !ok || cmd.AgentID != agent1 {
 		t.Fatalf("after unbind command agent = %+v, want agent %d", cmd, agent1)
+	}
+}
+
+// TestAutoRoutesByAccountBinding verifies that with no explicit via_agent
+// parameter, an operation follows the account's bound agent (agent when bound,
+// panel-direct when unbound).
+func TestAutoRoutesByAccountBinding(t *testing.T) {
+	srv, cookie := agentTestServer(t, "regcode-1")
+	registerAgentID(t, srv, "regcode-1", "node-1") // 默认回退目标
+	agent2 := registerAgentID(t, srv, "regcode-1", "node-2")
+	tid := tokenIDOf(t, srv, cookie)
+	tokenParam := "?token_id=" + strconv.Itoa(tid)
+
+	// Bind the account to agent2: an operation without via_agent goes there.
+	if r := authedPut(t, srv, cookie, "/api/account/tokens/"+strconv.Itoa(tid)+"/agent",
+		`{"agent_id":`+strconv.Itoa(agent2)+`}`); r.Code != http.StatusOK {
+		t.Fatalf("bind status = %d", r.Code)
+	}
+	rr := authedPost(t, srv, cookie, "/api/instances/7/boot"+tokenParam, "")
+	wantStatus(t, rr, http.StatusAccepted)
+	var resp struct {
+		CommandID int64 `json:"command_id"`
+	}
+	decodeJSON(t, rr, &resp)
+	if cmd, ok := srv.Hub.Command(resp.CommandID); !ok || cmd.AgentID != agent2 {
+		t.Fatalf("bound auto command agent = %+v, want agent %d", cmd, agent2)
+	}
+
+	// Unbind: the same operation runs panel-direct (200 ok), bypassing agents.
+	if r := authedPut(t, srv, cookie, "/api/account/tokens/"+strconv.Itoa(tid)+"/agent",
+		`{"agent_id":0}`); r.Code != http.StatusOK {
+		t.Fatalf("unbind status = %d", r.Code)
+	}
+	rr2 := authedPost(t, srv, cookie, "/api/instances/7/boot"+tokenParam, "")
+	wantStatus(t, rr2, http.StatusOK)
+	var ok struct {
+		OK bool `json:"ok"`
+	}
+	decodeJSON(t, rr2, &ok)
+	if !ok.OK {
+		t.Fatalf("direct auto ok = false")
+	}
+}
+
+// TestDeleteInstanceViaBoundAgent verifies a bound account deletes through its
+// agent and queues a delete command.
+func TestDeleteInstanceViaBoundAgent(t *testing.T) {
+	srv, cookie := agentTestServer(t, "regcode-1")
+	agent1 := registerAgentID(t, srv, "regcode-1", "node-1")
+	tid := tokenIDOf(t, srv, cookie)
+	if r := authedPut(t, srv, cookie, "/api/account/tokens/"+strconv.Itoa(tid)+"/agent",
+		`{"agent_id":`+strconv.Itoa(agent1)+`}`); r.Code != http.StatusOK {
+		t.Fatalf("bind status = %d", r.Code)
+	}
+	rr := authedDelete(t, srv, cookie, "/api/instances/7?token_id="+strconv.Itoa(tid))
+	wantStatus(t, rr, http.StatusAccepted)
+	var resp struct {
+		CommandID int64 `json:"command_id"`
+	}
+	decodeJSON(t, rr, &resp)
+	cmd, ok := srv.Hub.Command(resp.CommandID)
+	if !ok || cmd.AgentID != agent1 || cmd.Type != agenthub.CmdDelete {
+		t.Fatalf("delete command = %+v, want type %q on agent %d", cmd, agenthub.CmdDelete, agent1)
+	}
+}
+
+// TestRebuildAutoRoutesByBindingFromBody verifies rebuild (whose target account
+// arrives in the request body) follows the account binding when via_agent is
+// omitted.
+func TestRebuildAutoRoutesByBindingFromBody(t *testing.T) {
+	srv, cookie := agentTestServer(t, "regcode-1")
+	registerAgentID(t, srv, "regcode-1", "node-1")
+	agent2 := registerAgentID(t, srv, "regcode-1", "node-2")
+	tid := tokenIDOf(t, srv, cookie)
+	if r := authedPut(t, srv, cookie, "/api/account/tokens/"+strconv.Itoa(tid)+"/agent",
+		`{"agent_id":`+strconv.Itoa(agent2)+`}`); r.Code != http.StatusOK {
+		t.Fatalf("bind status = %d", r.Code)
+	}
+	rr := authedPost(t, srv, cookie, "/api/instances/7/rebuild",
+		`{"script":"#!/bin/bash\necho hi","token_id":`+strconv.Itoa(tid)+`}`)
+	wantStatus(t, rr, http.StatusAccepted)
+	var resp struct {
+		CommandID int64 `json:"command_id"`
+	}
+	decodeJSON(t, rr, &resp)
+	cmd, ok := srv.Hub.Command(resp.CommandID)
+	if !ok || cmd.AgentID != agent2 || cmd.Type != agenthub.CmdReboot {
+		t.Fatalf("rebuild command = %+v, want type %q on agent %d", cmd, agenthub.CmdReboot, agent2)
+	}
+	if pat, _ := cmd.Params["pat"].(string); pat != "pat1" {
+		t.Fatalf("rebuild command pat = %q, want pat1", pat)
 	}
 }
 

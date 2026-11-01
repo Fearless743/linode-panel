@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, listAccountAgents, setAccountAgent } from "../api";
+import { apiFetch, listAccountAgents, updateAccountToken } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
+import EditFormModal from "../components/ui/EditFormModal";
+import AccountHealthCell from "../components/accounts/AccountHealthCell";
 
 // 账号管理：绑定/管理自己的 Linode PAT（账号），并可为每个账号绑定
 // 执行 Agent（经 Agent 执行的操作将路由到该 Agent）。
@@ -13,6 +15,7 @@ export default function Accounts() {
 
   // 弹窗状态。
   const [addTokenOpen, setAddTokenOpen] = useState(false);
+  const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
 
   const loadTokens = useCallback(async () => {
     try {
@@ -55,55 +58,94 @@ export default function Accounts() {
     }
   }
 
-  // 绑定/解绑执行 Agent（agentId=0 表示解绑）。
-  async function bindAgent(t, value) {
-    const agentId = value === "" || value == null ? 0 : Number(value);
-    setError("");
-    setStatus(null);
-    try {
-      await setAccountAgent(t.id, agentId);
-      const agent = agents.find((a) => a.id === agentId);
-      setStatus({
-        msg: agentId === 0 ? "已解绑 Agent" : "已绑定 Agent：" + (agent ? agent.name : "#" + agentId),
-        cls: "ok",
-      });
-      // 本地更新该账号的绑定状态，避免整表刷新闪烁。
-      setTokens((prev) =>
-        (prev || []).map((x) =>
-          x.id === t.id ? { ...x, agent_id: agentId, agent_name: agent ? agent.name : "" } : x
-        )
-      );
-    } catch (err) {
-      setError(err && err.message ? err.message : "绑定失败");
-    }
+  // 编辑账号：弹窗提交后本地更新，避免整表刷新闪烁。
+  async function handleEditSubmit(editToken, values) {
+    const agentId = values.agent_id === "" ? 0 : Number(values.agent_id);
+    await updateAccountToken(editToken.id, {
+      label: values.label,
+      agent_id: agentId,
+    });
+    setTokens((prev) =>
+      (prev || []).map((x) =>
+        x.id === editToken.id
+          ? { ...x, label: values.label, agent_id: agentId, agent_name: "" }
+          : x
+      )
+    );
+    setStatus({ msg: "账号已更新", cls: "ok" });
+    setEditToken(null);
   }
 
-  // 下拉框当前值：绑定到本地面板或未绑定时统一显示为「未绑定（默认面板）」。
-  function boundAgentValue(t) {
-    if (!t.agent_id) return "";
+  // 编辑弹窗字段描述。
+  function editFieldsFor(t) {
+    const placeholder =
+      agents.length === 0
+        ? "暂无已注册 Agent"
+        : agents.some((a) => a.local)
+          ? "本地面板（未绑定）"
+          : "未绑定（默认 Agent）";
+    return [
+      {
+        key: "label",
+        label: "名称",
+        type: "text",
+        placeholder: "名称（如 生产账号）",
+      },
+      {
+        key: "agent_id",
+        label: "执行 Agent",
+        type: "select",
+        required: false, // 空值 = 解绑 / 默认 Agent，合法
+        options: [
+          { value: "", label: placeholder },
+          ...agents
+            .filter((a) => !a.local)
+            .map((a) => ({ value: String(a.id), label: a.name || "Agent #" + a.id })),
+        ],
+      },
+    ];
+  }
+
+  function editInitialValuesFor(t) {
+    const agentBound =
+      t.agent_id > 0 && agents.some((a) => a.id === t.agent_id && !a.local);
+    return {
+      label: t.label || "",
+      agent_id: agentBound ? String(t.agent_id) : "",
+    };
+  }
+
+  // 行内显示当前绑定 Agent 名称。
+  function boundAgentLabel(t) {
+    if (!t.agent_id) return null;
     const a = agents.find((x) => x.id === t.agent_id);
-    return a && !a.local ? String(a.id) : "";
+    return a ? a.name || "Agent #" + a.id : "Agent #" + t.agent_id;
   }
 
   return (
     <section className="panel">
       <h2 className="panel-title">账号管理</h2>
       <p className="boot-script-hint">
-        每个账号对应一个 Linode PAT；绑定后可用于聚合实例、开关机与创建实例。可将账号绑定到
-        某个 Agent，使「经 Agent 执行」的操作固定由该 Agent 完成。
+        每个账号对应一个 Linode PAT；绑定后可用于聚合实例、开关机与创建实例。将账号绑定到
+        某个 Agent 后，该账号的开关机、重建、删除等操作会自动经该 Agent 执行（未绑定则面板直发）。
       </p>
 
       {/* 账号列表 */}
       <div className="agents-section">
         <div className="agents-section-head">
           <h3 className="agents-section-title">已绑定账号</h3>
-          <button
-            className="btn btn-primary"
-            type="button"
-            onClick={() => setAddTokenOpen(true)}
-          >
-            绑定新账号
-          </button>
+          <div className="actions">
+            <button className="btn btn-ghost" type="button" onClick={loadTokens}>
+              重新检测
+            </button>
+            <button
+              className="btn btn-primary"
+              type="button"
+              onClick={() => setAddTokenOpen(true)}
+            >
+              绑定新账号
+            </button>
+          </div>
         </div>
         {tokens === null && <div className="users-empty">正在加载…</div>}
         {tokens !== null && tokens.length === 0 && <div className="users-empty">尚未绑定账号</div>}
@@ -113,6 +155,7 @@ export default function Accounts() {
               <tr>
                 <th>名称</th>
                 <th>Token</th>
+                <th>余额 / 状态</th>
                 <th>执行 Agent</th>
                 <th>操作</th>
               </tr>
@@ -123,29 +166,20 @@ export default function Accounts() {
                   <td>{t.label || "（未命名）"}</td>
                   <td>{t.masked || ""}</td>
                   <td>
-                    <select
-                      className="modal-input token-agent-select"
-                      value={boundAgentValue(t)}
-                      onChange={(e) => bindAgent(t, e.target.value)}
-                    >
-                      <option value="">
-                        {agents.length === 0
-                          ? "暂无已注册 Agent"
-                          : agents.some((a) => a.local)
-                            ? "本地面板（未绑定）"
-                            : "未绑定（默认 Agent）"}
-                      </option>
-                      {agents
-                        .filter((a) => !a.local)
-                        .map((a) => (
-                          <option key={a.id} value={String(a.id)}>
-                            {a.name || "Agent #" + a.id}
-                          </option>
-                        ))}
-                    </select>
+                    <AccountHealthCell token={t} />
+                  </td>
+                  <td>
+                    {boundAgentLabel(t) ? (
+                      <span>{boundAgentLabel(t)}</span>
+                    ) : (
+                      <span className="agent-unbound">未绑定</span>
+                    )}
                   </td>
                   <td>
                     <div className="actions">
+                      <button className="action-btn" type="button" onClick={() => setEditToken(t)}>
+                        编辑
+                      </button>
                       <button className="action-btn danger" type="button" onClick={() => removeToken(t)}>
                         删除
                       </button>
@@ -174,6 +208,18 @@ export default function Accounts() {
             setStatus({ msg: "已添加账号", cls: "ok" });
             loadTokens();
           }}
+        />
+      )}
+
+      {editToken && (
+        <EditFormModal
+          title={"编辑账号 · " + (editToken.label || "#" + editToken.id)}
+          description="修改账号名称与绑定执行 Agent"
+          fields={editFieldsFor(editToken)}
+          initialValues={editInitialValuesFor(editToken)}
+          busyLabel="保存中…"
+          onSubmit={(values) => handleEditSubmit(editToken, values)}
+          onClose={() => setEditToken(null)}
         />
       )}
     </section>

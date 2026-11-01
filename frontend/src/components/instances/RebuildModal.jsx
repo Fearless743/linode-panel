@@ -1,19 +1,15 @@
-// 重建确认模态框：保留 IP + 开机脚本（预填该实例配置，未配置用全局默认），
-// 支持面板直发或经 Agent 执行。
+// 重建确认模态框：开机脚本（预填该实例配置，未配置用全局默认）。
+// 执行方式固定跟随账号绑定：账号绑定了 Agent 就经该 Agent 执行，否则面板直发。
 import { useEffect, useState } from "react";
-import { useAuth } from "../../auth";
 import { apiFetch } from "../../api";
 import Modal from "../Modal";
 import { Button, FormField } from "../ui";
 import { regionLabel, typeLabel } from "../../utils/linodeLabels";
 
-export default function RebuildModal({ inst, onClose, onConfirm }) {
-  const { hasPerm } = useAuth();
-  const [ip, setIp] = useState("");
+export default function RebuildModal({ inst, boundAgentName, onClose, onConfirm }) {
   const [script, setScript] = useState("");
-  const [mode, setMode] = useState("direct");
-  const [agents, setAgents] = useState([]);
-  const [agentId, setAgentId] = useState("");
+  const [rootPassword, setRootPassword] = useState("");
+  const [passwordConfigured, setPasswordConfigured] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -30,17 +26,17 @@ export default function RebuildModal({ inst, onClose, onConfirm }) {
           setError("加载开机脚本失败，请直接填写。");
         }
       });
-    if (hasPerm("admin")) {
-      apiFetch("/api/agents")
-        .then((data) => {
-          if (alive) setAgents(Array.isArray(data.agents) ? data.agents : []);
-        })
-        .catch(() => {});
-    }
+    apiFetch("/api/instances/" + inst.id + "/root-password")
+      .then((data) => {
+        if (alive) setPasswordConfigured(!!(data && data.configured));
+      })
+      .catch(() => {
+        /* 密码状态仅用于提示，加载失败时按未保存处理 */
+      });
     return () => {
       alive = false;
     };
-  }, [hasPerm, inst.id]);
+  }, [inst.id]);
 
   async function confirm() {
     if (!script.trim()) {
@@ -50,13 +46,18 @@ export default function RebuildModal({ inst, onClose, onConfirm }) {
     setError("");
     setBusy(true);
     try {
-      await onConfirm({ script, ip: ip.trim(), viaAgent: mode === "agent", agentId });
+      // 不传 viaAgent，由后端按账号绑定决定执行通道。
+      await onConfirm({ script, root_password: rootPassword.trim() || undefined });
       onClose();
     } catch (err) {
       setError(err && err.message ? err.message : "重建失败");
       setBusy(false);
     }
   }
+
+  const channel = boundAgentName
+    ? "经 Agent「" + boundAgentName + "」执行"
+    : "面板直发执行";
 
   return (
     <Modal title="重建实例" onClose={onClose}>
@@ -66,16 +67,7 @@ export default function RebuildModal({ inst, onClose, onConfirm }) {
         ，机型={inst.type ? typeLabel(inst.type) : "—"}
         ，image={inst.image || "—"}。重建后新实例的 IP 不保证与原来相同。
       </p>
-      <FormField label="保留 IP（选填，预留的 reserved IP 地址）" htmlFor="rebuild-ip-input">
-        <input
-          id="rebuild-ip-input"
-          className="modal-input"
-          type="text"
-          placeholder="如 192.0.2.10，留空则不指定"
-          value={ip}
-          onChange={(e) => setIp(e.target.value)}
-        />
-      </FormField>
+      <p className="modal-detail">执行方式：{channel}（跟随账号绑定）</p>
       <FormField
         label="开机脚本（重建后自动执行，并保存为该实例的配置）"
         htmlFor="rebuild-script-input"
@@ -90,66 +82,23 @@ export default function RebuildModal({ inst, onClose, onConfirm }) {
           onChange={(e) => setScript(e.target.value)}
         />
       </FormField>
-      <FormField label="执行方式">
-        <div className="exec-select">
-          <label className="exec-option">
-            <input
-              type="radio"
-              name="rebuild-exec-mode"
-              value="direct"
-              checked={mode === "direct"}
-              onChange={() => setMode("direct")}
-            />
-            <span className="exec-option-text">
-              <span>面板直发</span>
-              <span className="exec-option-sub">
-                使用当前登录用户的 PAT 直接调用 Linode API
-              </span>
-            </span>
-          </label>
-          {hasPerm("admin") && (
-            <>
-              <label className="exec-option">
-                <input
-                  type="radio"
-                  name="rebuild-exec-mode"
-                  value="agent"
-                  checked={mode === "agent"}
-                  onChange={() => setMode("agent")}
-                />
-                <span className="exec-option-text">
-                  <span>经 Agent 执行</span>
-                  <span className="exec-option-sub">
-                    面板加密下发 PAT，由本机 Agent 完成操作
-                  </span>
-                </span>
-              </label>
-              {mode === "agent" && (
-                <select
-                  className="modal-input exec-agent-select"
-                  value={agentId}
-                  onChange={(e) => setAgentId(e.target.value)}
-                >
-                  <option value="">
-                    {agents.length === 0
-                      ? "没有已注册的 Agent"
-                      : agents.some((a) => a.local)
-                        ? "本地面板（未绑定）"
-                        : "未绑定（默认 Agent）"}
-                  </option>
-                  {agents
-                    .filter((a) => !a.local)
-                    .map((a) => (
-                      <option key={a.id} value={String(a.id)}>
-                        {a.name}
-                        {a.hostname ? "（" + a.hostname + "）" : ""}
-                      </option>
-                    ))}
-                </select>
-              )}
-            </>
-          )}
-        </div>
+      <FormField label="root 密码（可选）" htmlFor="rebuild-rootpass-input">
+        <input
+          id="rebuild-rootpass-input"
+          className="modal-input"
+          type="password"
+          autoComplete="new-password"
+          placeholder={passwordConfigured ? "留空则使用已保存的密码" : "留空则仅使用 SSH 密钥登录"}
+          value={rootPassword}
+          onChange={(e) => setRootPassword(e.target.value)}
+          disabled={busy}
+        />
+        <p className="boot-script-hint">
+          填写后会保存为该实例的 root 密码，重建时用于创建新实例；
+          {passwordConfigured
+            ? "该实例已保存密码，留空即使用已保存的密码。"
+            : "该实例尚未保存密码，留空则新实例仅使用一次性 SSH 密钥登录。"}
+        </p>
       </FormField>
       <div className="modal-actions">
         <Button variant="ghost" onClick={onClose} disabled={busy}>

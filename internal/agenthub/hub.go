@@ -117,20 +117,6 @@ func (h *Hub) Rename(id int, name string) bool {
 	return true
 }
 
-// MarkManual flags an agent as created from the panel UI (rather than
-// self-registered by an agent process), so the panel may rename it. Unknown
-// IDs return false.
-func (h *Hub) MarkManual(id int) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	a, ok := h.agents[id]
-	if !ok {
-		return false
-	}
-	a.Manual = true
-	return true
-}
-
 // Agents returns all agents ordered by ID ascending.
 func (h *Hub) Agents() []Agent {
 	h.mu.Lock()
@@ -189,50 +175,9 @@ func (h *Hub) Enqueue(agentID int, cmd Command) (Command, error) {
 // NextCommands returns all queued commands for the agent (FIFO by ID),
 // marking them in_flight, and updates LastSeen. If none are queued it blocks
 // up to wait for an Enqueue to wake it; on timeout or wait <= 0 it returns an
-// empty (non-nil) slice.
-func (h *Hub) NextCommands(agentID int, wait time.Duration) []Command {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	agent, ok := h.agents[agentID]
-	if !ok {
-		return []Command{}
-	}
-	agent.LastSeen = time.Now().UTC().Format(time.RFC3339)
-
-	deadline := time.Now().Add(wait)
-	for {
-		if cmds := h.dequeueLocked(agentID); len(cmds) > 0 {
-			return cmds
-		}
-		if wait <= 0 {
-			return []Command{}
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return []Command{}
-		}
-		wake := h.wake
-		h.mu.Unlock()
-		timer := time.NewTimer(remaining)
-		select {
-		case <-wake:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-		}
-		h.mu.Lock()
-	}
-}
-
-// NextCommandsContext is NextCommands with an additional context: when ctx is
-// done (client disconnect/cancel) it stops waiting and returns immediately
-// with whatever commands are queued (possibly empty).
-func (h *Hub) NextCommandsContext(ctx context.Context, agentID int, wait time.Duration) []Command {
-	if ctx == nil {
-		return h.NextCommands(agentID, wait)
-	}
+// empty (non-nil) slice. When ctx is non-nil, it also stops waiting when ctx
+// is done (client disconnect/cancel) and returns immediately.
+func (h *Hub) NextCommands(ctx context.Context, agentID int, wait time.Duration) []Command {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 

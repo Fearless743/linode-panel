@@ -10,11 +10,8 @@
 //	func (c *Client) Shutdown(ctx context.Context, id int) error
 //	func (c *Client) Reboot(ctx context.Context, id int) error
 //	func (c *Client) GetInstanceIPs(ctx context.Context, id int) (InstanceIPs, error)
-//	func (c *Client) ListSSHKeys(ctx context.Context) ([]SSHKey, error)
 //	func (c *Client) CreateInstance(ctx context.Context, opts CreateOptions) (Instance, error)
 //	func (c *Client) DeleteInstance(ctx context.Context, id int) error
-//	func (c *Client) GetConfigID(ctx context.Context, id int) (int, error)
-//	func (c *Client) UpdateConfigNetworkHelper(ctx context.Context, id, configID int, enabled bool) error
 //	func (c *Client) AttachAllowAllFirewall(ctx context.Context, region string, linodeID int) error
 package linode
 
@@ -90,14 +87,6 @@ type Account struct {
 	BalanceUninvoiced float64 `json:"balance_uninvoiced"` // 未出账金额
 	Company           string  `json:"company"`
 	Email             string  `json:"email"`
-}
-
-// SSHKey mirrors an item of GET /v4/profile/sshkeys.
-type SSHKey struct {
-	ID      int    `json:"id"`
-	Label   string `json:"label"`
-	SSHKey  string `json:"ssh_key"`
-	Created string `json:"created"`
 }
 
 // APIError is a non-2xx Linode API response.

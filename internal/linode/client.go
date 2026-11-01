@@ -72,11 +72,6 @@ func (c *Client) GetInstanceIPs(ctx context.Context, id int) (InstanceIPs, error
 	return ips, err
 }
 
-// ListSSHKeys returns all SSH keys on the profile, following pagination.
-func (c *Client) ListSSHKeys(ctx context.Context) ([]SSHKey, error) {
-	return paginate[SSHKey](c, ctx, "/profile/sshkeys")
-}
-
 // do performs one request, decoding a successful JSON response into out.
 // out may be nil for actions with no response body (POST boot/shutdown/reboot).
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {
@@ -92,6 +87,9 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, ou
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}

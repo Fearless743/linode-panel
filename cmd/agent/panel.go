@@ -127,7 +127,7 @@ func ensureToken(ctx context.Context, st *state, path string, pc *panelClient, c
 		return nil
 	}
 	if code == "" {
-		return errors.New("缺少注册码：首次运行必须用 --code 注册 agent（或使用面板预签发的 --token 直连）")
+		return errors.New("缺少注册码：首次运行必须用 --code 注册 agent")
 	}
 	resp, err := pc.register(ctx, code, hostname)
 	if err != nil {
@@ -138,7 +138,6 @@ func ensureToken(ctx context.Context, st *state, path string, pc *panelClient, c
 	}
 	st.AgentID = resp.AgentID
 	st.AgentToken = resp.Token
-	st.RegistrationCode = code
 	pc.token = resp.Token
 	return saveState(path, *st)
 }

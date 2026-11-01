@@ -20,6 +20,14 @@ const STATUS_LABELS = {
   idle: "未检测（实例未运行）",
 };
 
+// 创建实例后由面板后台执行开机脚本，这里展示最近一次执行状态。
+const SCRIPT_RUN_LABELS = {
+  pending: "等待实例启动…",
+  running: "正在执行…",
+  success: "上次创建后执行成功",
+  failed: "上次创建后执行失败",
+};
+
 function fmtTime(s) {
   if (!s) return "—";
   const d = new Date(s);
@@ -31,6 +39,7 @@ function fmtTime(s) {
 function ScriptSection({ inst, onChanged }) {
   const [script, setScript] = useState("");
   const [configured, setConfigured] = useState(false);
+  const [lastRun, setLastRun] = useState(null); // 创建后最近一次执行状态
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [status, setStatus] = useState(null); // { msg, cls }
@@ -43,6 +52,7 @@ function ScriptSection({ inst, onChanged }) {
         if (!alive) return;
         setScript((data && data.script) || "");
         setConfigured(data && data.configured === true);
+        setLastRun((data && data.last_run) || null);
         setLoading(false);
       })
       .catch((err) => {
@@ -97,9 +107,22 @@ function ScriptSection({ inst, onChanged }) {
       {error && <div className="boot-script-status error">{error}</div>}
       <p className="boot-script-hint">
         {configured
-          ? "当前为该实例配置了自定义脚本，重建时使用此脚本。"
+          ? "当前为该实例配置了自定义脚本；创建实例时由面板在实例启动后通过 SSH 执行，重建时也会执行。"
           : "当前未配置自定义脚本，重建时使用内置默认脚本。"}
       </p>
+      {lastRun && (
+        <div
+          className={
+            "boot-script-status " +
+            (lastRun.state === "failed" ? "error" : lastRun.state === "success" ? "ok" : "")
+          }
+        >
+          {SCRIPT_RUN_LABELS[lastRun.state] || lastRun.state}
+          {lastRun.host ? "（" + lastRun.host + "）" : ""}
+          {lastRun.finished_at ? " · " + fmtTime(lastRun.finished_at) : ""}
+          {lastRun.error ? "：" + lastRun.error : ""}
+        </div>
+      )}
       <textarea
         className="boot-script-textarea"
         rows={12}
@@ -328,6 +351,113 @@ function AutoRebuildSection({ inst, onChanged }) {
   );
 }
 
+// ---------- root 密码区块 ----------
+function RootPasswordSection({ inst, onChanged }) {
+  const [configured, setConfigured] = useState(false);
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState(null); // { msg, cls }
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    apiFetch("/api/instances/" + inst.id + "/root-password")
+      .then((data) => {
+        if (!alive) return;
+        setConfigured(!!(data && data.configured));
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setError(err && err.message ? err.message : "加载失败");
+        setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [inst.id]);
+
+  async function save() {
+    if (!password.trim()) {
+      setStatus({ msg: "密码不能为空", cls: "error" });
+      return;
+    }
+    setBusy(true);
+    setStatus({ msg: "保存中…", cls: "" });
+    try {
+      await jsonRequest("/api/instances/" + inst.id + "/root-password", "PUT", { password });
+      setConfigured(true);
+      setPassword("");
+      setStatus({ msg: "已保存", cls: "ok" });
+      if (onChanged) onChanged();
+    } catch (err) {
+      setStatus({ msg: "保存失败：" + ((err && err.message) || "未知错误"), cls: "error" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clear() {
+    setBusy(true);
+    setStatus({ msg: "", cls: "" });
+    try {
+      await apiFetch("/api/instances/" + inst.id + "/root-password", { method: "DELETE" });
+      setConfigured(false);
+      setPassword("");
+      setStatus({ msg: "已清除", cls: "ok" });
+      if (onChanged) onChanged();
+    } catch (err) {
+      setStatus({ msg: "清除失败：" + ((err && err.message) || "未知错误"), cls: "error" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      {loading && <div className="boot-script-status">正在加载…</div>}
+      {error && <div className="boot-script-status error">{error}</div>}
+      {!loading && !error && (
+        <>
+          <p className="boot-script-hint">
+            密码保存在面板数据库中（数据库文件权限 0600），删机重建时会用同一密码创建新实例；
+            面板不会回显已保存的密码。未保存密码时，重建后的新实例仅使用一次性 SSH 密钥登录。
+          </p>
+          <div className="boot-script-status">
+            {configured ? "当前已保存 root 密码（不回显）" : "当前未保存 root 密码"}
+          </div>
+          <FormField label={configured ? "设置新密码" : "设置 root 密码"} htmlFor="root-pass-input">
+            <input
+              id="root-pass-input"
+              className="modal-input"
+              type="password"
+              autoComplete="new-password"
+              placeholder={configured ? "输入新密码以替换已保存的密码" : "输入 root 密码"}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={busy}
+            />
+          </FormField>
+          <div className="modal-actions">
+            <span className={"boot-script-status" + (status ? " " + status.cls : "")}>
+              {status ? status.msg : ""}
+            </span>
+            {configured && (
+              <button className="btn btn-ghost" type="button" onClick={clear} disabled={busy}>
+                清除密码
+              </button>
+            )}
+            <button className="btn btn-primary" type="button" onClick={save} disabled={busy}>
+              保存
+            </button>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 // ---------- 合并模态框 ----------
 export default function InstanceEditModal({
   inst,
@@ -337,33 +467,33 @@ export default function InstanceEditModal({
   onScriptChanged,
   onAutoRebuildChanged,
 }) {
-  // 两个区块都显示时提供标签页切换；只显示一个时不加标签。
-  // 两个区块始终挂载（隐藏的区块通过 display:none 保留状态，避免切换时重载）。
-  const showTabs = canScript && canAutoRebuild;
+  const tabs = [];
+  if (canScript) tabs.push(["script", "开机脚本"], ["password", "root 密码"]);
+  if (canAutoRebuild) tabs.push(["auto", "自动换 IP"]);
+  const showTabs = tabs.length > 1;
   const [tab, setTab] = useState(canScript ? "script" : "auto");
 
   return (
     <Modal title={"编辑 · " + (inst.label || "#" + inst.id)} onClose={onClose}>
       {showTabs && (
         <div className="edit-modal-tabs">
-          <button
-            type="button"
-            className={"edit-modal-tab" + (tab === "script" ? " active" : "")}
-            onClick={() => setTab("script")}
-          >
-            开机脚本
-          </button>
-          <button
-            type="button"
-            className={"edit-modal-tab" + (tab === "auto" ? " active" : "")}
-            onClick={() => setTab("auto")}
-          >
-            自动换 IP
-          </button>
+          {tabs.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              className={"edit-modal-tab" + (tab === key ? " active" : "")}
+              onClick={() => setTab(key)}
+            >
+              {label}
+            </button>
+          ))}
         </div>
       )}
       <div style={{ display: canScript && (tab === "script" || !showTabs) ? "block" : "none" }}>
         {canScript && <ScriptSection inst={inst} onChanged={onScriptChanged} />}
+      </div>
+      <div style={{ display: canScript && tab === "password" ? "block" : "none" }}>
+        {canScript && <RootPasswordSection inst={inst} onChanged={onScriptChanged} />}
       </div>
       <div style={{ display: canAutoRebuild && (tab === "auto" || !showTabs) ? "block" : "none" }}>
         {canAutoRebuild && <AutoRebuildSection inst={inst} onChanged={onAutoRebuildChanged} />}

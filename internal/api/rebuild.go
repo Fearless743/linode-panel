@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"linode-panel/internal/agenthub"
@@ -28,18 +29,13 @@ const rebuildPollTimeout = 10 * time.Minute
 // Sequence (fails fast; every step logs before running):
 //  0. read the old instance (region/type/image for the rebuild)
 //  1. shutdown the old instance
-//  2. enable network_helper (best effort; failure is logged, not fatal)
-//  3. delete the old instance
-//  4. create a fresh instance (same region/type/image, booted) with a
+//  2. delete the old instance
+//  3. create a fresh instance (same region/type/image, booted) with a
 //     fresh one-off SSH key
-//  5. poll until the new instance is running (3s interval, 10m cap)
-//  6. disable network_helper and shutdown, wait until offline
-//  7. assign the reserved IP (only when the user provided one)
-//  8. boot, then wait until running
-//  9. run the boot script over SSH (5m timeout)
-//
-// 10. probe the SSH port; task succeeds only when the probe connects
-func (m *Manager) run(t *Task, reservedIP string, pat string) {
+//  4. poll until the new instance is running (3s interval, 10m cap)
+//  5. run the boot script over SSH (5m timeout)
+//  6. probe the SSH port; task succeeds only when the probe connects
+func (m *Manager) run(t *Task, pat string) {
 	ctx := context.Background()
 	oldID := t.InstanceID
 
@@ -68,20 +64,7 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 		return
 	}
 
-	// The network helper must be enabled before the instance is deleted so
-	// the freshly created instance inherits it from the image. A failure here
-	// is not fatal: networking may still work via DHCP without the helper.
-	m.log(t, "step 2: enable network_helper on old instance %d", oldID)
-	configID, cfgErr := api.GetConfigID(ctx, oldID)
-	if cfgErr == nil {
-		if err := api.UpdateConfigNetworkHelper(ctx, oldID, configID, true); err != nil {
-			m.log(t, "  network_helper enable failed (continuing): %v", err)
-		}
-	} else {
-		m.log(t, "  get config failed (continuing): %v", cfgErr)
-	}
-
-	m.log(t, "step 3: delete old instance %d", oldID)
+	m.log(t, "step 2: delete old instance %d", oldID)
 	if err := api.DeleteInstance(ctx, oldID); err != nil {
 		m.fail(t, fmt.Errorf("删除旧实例失败: %w", err))
 		return
@@ -98,10 +81,12 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 		Type:           old.Type,
 		Image:          old.Image,
 		Label:          old.Label,
+		Tags:           old.Tags,
+		RootPass:       t.rootPass,
 		AuthorizedKeys: []string{pubKey},
 		Booted:         &booted,
 	}
-	m.log(t, "step 4: create new instance (region=%s type=%s image=%s label=%s)", old.Region, old.Type, old.Image, old.Label)
+	m.log(t, "step 3: create new instance (region=%s type=%s image=%s label=%s)", old.Region, old.Type, old.Image, old.Label)
 	newInst, err := api.CreateInstance(ctx, createOpts)
 	if err != nil {
 		m.fail(t, fmt.Errorf("创建新实例失败: %w", err))
@@ -109,60 +94,20 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 	}
 	newID := newInst.ID
 	m.setNewInstanceID(t, newID)
+	// The old instance is gone; the replacement inherits the panel-side
+	// configuration because the cache row keeps its stable id and only its
+	// Linode instance id changes.
+	if m.RepointCache != nil {
+		m.RepointCache(oldID, newID)
+	}
 
-	m.log(t, "step 5: wait for instance %d to be running", newID)
+	m.log(t, "step 4: wait for instance %d to be running", newID)
 	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
 		m.fail(t, err)
 		return
 	}
 
-	m.log(t, "step 6: disable network_helper and shutdown instance %d", newID)
-	if cfgID, err := api.GetConfigID(ctx, newID); err == nil {
-		if err := api.UpdateConfigNetworkHelper(ctx, newID, cfgID, false); err != nil {
-			m.log(t, "  network_helper disable failed (continuing): %v", err)
-		}
-	} else {
-		m.log(t, "  get config failed (continuing): %v", err)
-	}
-	if err := api.Shutdown(ctx, newID); err != nil {
-		m.fail(t, fmt.Errorf("关机新实例失败: %w", err))
-		return
-	}
-	m.log(t, "step 6b: wait for instance %d to be offline", newID)
-	if err := m.waitStatus(t, api, ctx, newID, "offline"); err != nil {
-		m.fail(t, err)
-		return
-	}
-
-	// Default-open-all-ports: attach the allow-all Cloud Firewall while the
-	// instance is offline (config changes are applied at the next boot).
-	// Best-effort: failure is logged, the rebuild still proceeds.
-	m.log(t, "step 6c: attach allow-all firewall (region=%s instance=%d)", newInst.Region, newID)
-	if err := api.AttachAllowAllFirewall(ctx, newInst.Region, newID); err != nil {
-		m.log(t, "  防火墙绑定失败（继续）: %v", err)
-	}
-
-	if reservedIP != "" {
-		m.log(t, "step 7: assign reserved IP %s", reservedIP)
-		if err := api.AssignIP(ctx, old.Region, reservedIP, newID); err != nil {
-			m.fail(t, fmt.Errorf("分配保留 IP 失败: %w", err))
-			return
-		}
-	}
-
-	m.log(t, "step 8: boot instance %d", newID)
-	if err := api.Boot(ctx, newID); err != nil {
-		m.fail(t, fmt.Errorf("开机失败: %w", err))
-		return
-	}
-
-	m.log(t, "step 8b: wait for instance %d to be running", newID)
-	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
-		m.fail(t, err)
-		return
-	}
-
-	m.log(t, "step 9: run boot script via SSH")
+	m.log(t, "step 5: run boot script via SSH")
 	ips, err := api.GetInstanceIPs(ctx, newID)
 	if err != nil {
 		m.fail(t, fmt.Errorf("获取新实例 IP 失败: %w", err))
@@ -202,7 +147,7 @@ func (m *Manager) run(t *Task, reservedIP string, pat string) {
 	if res.Stderr != "" {
 		m.log(t, "  stderr: %s", res.Stderr)
 	}
-	m.log(t, "step 10: probe SSH port on %s", host)
+	m.log(t, "step 6: probe SSH port on %s", host)
 
 	if err := m.ProbeFn(ctx, host); err != nil {
 		m.fail(t, fmt.Errorf("SSH 端口探测失败: %w", err))
@@ -271,9 +216,11 @@ func probe(ctx context.Context, host string, port int) error {
 // HTTP handlers for the rebuild and task routes.
 
 type rebuildRequest struct {
-	Script     string `json:"script"`
-	ReservedIP string `json:"reserved_ip"`
-	TokenID    int    `json:"token_id"`
+	Script  string `json:"script"`
+	TokenID int    `json:"token_id"`
+	// RootPassword optionally overrides the instance's saved root password;
+	// when non-empty it is saved as the instance's configuration first.
+	RootPassword string `json:"root_password"`
 }
 
 type rebuildResponse struct {
@@ -306,12 +253,27 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Agent path: queue the rebuild command instead of running the Manager.
-	if r.URL.Query().Get("via_agent") == "1" {
-		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdReboot, map[string]any{
-			"id":          id,
-			"script":      script,
-			"reserved_ip": req.ReservedIP,
+	// root 密码同样固化到该实例：请求体显式提供 → 保存并使用；否则使用
+	// 该实例已保存的密码（没有则仅用一次性 SSH 密钥登录）。
+	if req.RootPassword != "" {
+		if err := s.Store.SetInstanceRootPassword(id, req.RootPassword); err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存 root 密码失败"})
+			return
+		}
+	}
+	rootPass := s.rootPasswordFor(id)
+	// 执行通道：显式 ?via_agent=1/0 优先；否则跟随账号绑定的 Agent。
+	// 目标账号来自请求体 token_id（与直发路径一致）。
+	user, _ := UserFrom(r.Context())
+	tokenID := ""
+	if req.TokenID > 0 {
+		tokenID = strconv.Itoa(req.TokenID)
+	}
+	if s.viaAgentForRequest(user, tokenID, r.URL.Query().Get("via_agent")) {
+		cmdID, ok := s.enqueueAgentCommandForToken(w, r, tokenID, agenthub.CmdReboot, map[string]any{
+			"id":            id,
+			"script":        script,
+			"root_password": rootPass,
 		})
 		if !ok {
 			return
@@ -319,17 +281,12 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]any{"command_id": cmdID})
 		return
 	}
-	user, _ := UserFrom(r.Context())
-	tokenID := ""
-	if req.TokenID > 0 {
-		tokenID = strconv.Itoa(req.TokenID)
-	}
 	pat, err := s.resolveToken(user, tokenID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
-	taskID, err := s.Tasks.Start(id, script, req.ReservedIP, pat, s.tokenLabel(user, tokenID))
+	taskID, err := s.Tasks.Start(id, script, rootPass, pat, s.tokenLabel(user, tokenID))
 	if err != nil {
 		if errors.Is(err, ErrBusy) {
 			writeJSON(w, http.StatusConflict, errorResponse{Error: "已有重建任务进行中"})
@@ -359,6 +316,13 @@ func (s *Server) tokenLabel(user store.User, tokenID string) string {
 	return "PAT"
 }
 
+// rootPasswordFor returns the instance's saved root password, or "" when none
+// is configured (the rebuild then authenticates with the one-off SSH key only).
+func (s *Server) rootPasswordFor(id int) string {
+	pass, _ := s.Store.InstanceRootPassword(id)
+	return pass
+}
+
 // handleRebuildTasks lists tasks (newest first, logs reversed).
 func (s *Server) handleRebuildTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]Task{"tasks": s.Tasks.List()})
@@ -386,16 +350,27 @@ type bootScriptRequest struct {
 
 // handleGetInstanceScript returns the script effective for one instance:
 // its configured script when set, otherwise the built-in default template.
+// last_run is the state of the most recent create-time execution (absent when
+// the script has not been run by the panel since startup).
 func (s *Server) handleGetInstanceScript(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
 		return
 	}
+	lastRun, hasRun := s.bootScriptRun(id)
 	if script, configured := s.Store.InstanceScript(id); configured && script != "" {
-		writeJSON(w, http.StatusOK, map[string]any{"script": script, "configured": true})
+		resp := map[string]any{"script": script, "configured": true}
+		if hasRun {
+			resp["last_run"] = lastRun
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"script": DefaultBootScript, "configured": false})
+	resp := map[string]any{"script": DefaultBootScript, "configured": false}
+	if hasRun {
+		resp["last_run"] = lastRun
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handlePutInstanceScript persists an instance's own boot script.
@@ -442,4 +417,59 @@ func (s *Server) handleInstanceScriptStatus(w http.ResponseWriter, r *http.Reque
 		ids = []int{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"configured": ids})
+}
+
+// rootPasswordRequest is the request body for saving an instance's root
+// password.
+type rootPasswordRequest struct {
+	Password string `json:"password"`
+}
+
+// handleGetInstanceRootPassword reports whether a root password is saved for
+// the instance. The password itself is never returned.
+func (s *Server) handleGetInstanceRootPassword(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"configured": s.Store.InstanceRootPasswordConfigured(id),
+	})
+}
+
+// handlePutInstanceRootPassword saves the root password used when the instance
+// is rebuilt.
+func (s *Server) handlePutInstanceRootPassword(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req rootPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
+		return
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "密码不能为空"})
+		return
+	}
+	if err := s.Store.SetInstanceRootPassword(id, req.Password); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "保存 root 密码失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+// handleDeleteInstanceRootPassword removes the saved root password so a later
+// rebuild authenticates with the one-off SSH key only.
+func (s *Server) handleDeleteInstanceRootPassword(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteInstanceRootPassword(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "删除 root 密码失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }

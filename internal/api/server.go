@@ -19,6 +19,7 @@ import (
 
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/linode"
+	"linode-panel/internal/sshrun"
 	"linode-panel/internal/store"
 )
 
@@ -31,12 +32,8 @@ type LinodeAPI interface {
 	Shutdown(ctx context.Context, id int) error
 	Reboot(ctx context.Context, id int) error
 	GetInstanceIPs(ctx context.Context, id int) (linode.InstanceIPs, error)
-	ListSSHKeys(ctx context.Context) ([]linode.SSHKey, error)
 	CreateInstance(ctx context.Context, opts linode.CreateOptions) (linode.Instance, error)
 	DeleteInstance(ctx context.Context, id int) error
-	GetConfigID(ctx context.Context, id int) (int, error)
-	UpdateConfigNetworkHelper(ctx context.Context, id, configID int, enabled bool) error
-	AssignIP(ctx context.Context, region, address string, linodeID int) error
 	// AttachAllowAllFirewall ensures the account's allow-all Cloud Firewall is
 	// attached to the Linode (idempotent). Best-effort at call sites.
 	AttachAllowAllFirewall(ctx context.Context, region string, linodeID int) error
@@ -67,11 +64,9 @@ type Server struct {
 	// in-process; see EnableSelfAgent.
 	localAgentID int
 
-	// localAgentKey seals commands routed to the panel's own self-agent. It is
-	// set by EnableSelfAgent: derived from the registration code when one is
-	// set, otherwise a random per-run key so the panel can act as an agent
-	// without configuring a registration code.
-	localAgentKey []byte
+	// newAgentExec optionally overrides the Executor used by the self-agent.
+	// Tests inject a fake here; production leaves it nil.
+	newAgentExec func() *agenthub.Executor
 
 	// AutoRebuildCheckAPI overrides the China-side probe URL used by the
 	// auto-rebuild monitor (empty = DefaultBlockCheckAPI).
@@ -80,6 +75,19 @@ type Server struct {
 	// monitor is the running auto-rebuild background monitor (nil until
 	// StartAutoRebuildMonitor is called). Handlers use it for on-demand checks.
 	monitor *AutoRebuildMonitor
+
+	// BootScriptRun executes the create-time boot script over SSH. Injectable
+	// for tests; nil means sshrun.Run.
+	BootScriptRun func(context.Context, sshrun.Options, string) (sshrun.Result, error)
+
+	// BootScriptPollInterval overrides how often the background runner polls
+	// the instance status while waiting for it to boot. 0 means 3s.
+	BootScriptPollInterval time.Duration
+
+	// bootScriptRuns holds the in-memory state of create-time boot-script
+	// executions, keyed by instance id. Guarded by bootScriptMu.
+	bootScriptMu   sync.Mutex
+	bootScriptRuns map[int]scriptRunState
 
 	clientMu sync.Mutex
 	clients  map[string]*linode.Client
@@ -91,13 +99,35 @@ type Server struct {
 // PAT via clientFor.
 func New(api LinodeAPI, st *store.Store) *Server {
 	s := &Server{
-		API:     api,
-		Store:   st,
-		Hub:     agenthub.NewHub(),
-		clients: make(map[string]*linode.Client),
+		API:            api,
+		Store:          st,
+		Hub:            agenthub.NewHub(),
+		clients:        make(map[string]*linode.Client),
+		bootScriptRuns: make(map[int]scriptRunState),
 	}
 	s.Tasks = NewManager(api)
+	s.Tasks.RepointCache = s.repointInstanceCache
 	return s
+}
+
+// repointInstanceCache follows a delete+recreate rebuild: the panel's cached
+// row keeps its stable id (so configuration keyed by it is inherited) while
+// its Linode instance id moves to the replacement instance. The in-memory
+// create-time boot-script state follows the instance as well.
+func (s *Server) repointInstanceCache(oldID, newID int) {
+	if oldID <= 0 || newID <= 0 || oldID == newID {
+		return
+	}
+	if err := s.Store.RepointInstanceCache(oldID, newID); err != nil {
+		slog.Warn("repoint instance cache failed", "old_id", oldID, "new_id", newID, "error", err)
+		return
+	}
+	s.bootScriptMu.Lock()
+	if st, ok := s.bootScriptRuns[oldID]; ok {
+		delete(s.bootScriptRuns, oldID)
+		s.bootScriptRuns[newID] = st
+	}
+	s.bootScriptMu.Unlock()
 }
 
 // clientFor returns a cached Linode client for pat, configured with the
@@ -135,6 +165,7 @@ func (s *Server) Handler() http.Handler {
 	// 账号管理：任何登录用户管理自己的 PAT；创建实例需 power 权限。
 	mux.HandleFunc("GET /api/account/tokens", s.requireAuth("", s.handleListMyTokens))
 	mux.HandleFunc("POST /api/account/tokens", s.requireAuth("", s.handleAddMyToken))
+	mux.HandleFunc("PUT /api/account/tokens/{tid}", s.requireAuth("", s.handleUpdateMyToken))
 	mux.HandleFunc("DELETE /api/account/tokens/{tid}", s.requireAuth("", s.handleDeleteMyToken))
 	mux.HandleFunc("PUT /api/account/tokens/{tid}/agent", s.requireAuth("", s.handleSetTokenAgent))
 	mux.HandleFunc("GET /api/account/agents", s.requireAuth("", s.handleAccountAgents))
@@ -164,12 +195,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/instances/{id}/script", s.requireAuth(store.PermScript, s.handlePutInstanceScript))
 	mux.HandleFunc("DELETE /api/instances/{id}/script", s.requireAuth(store.PermScript, s.handleDeleteInstanceScript))
 	mux.HandleFunc("GET /api/instance-scripts", s.requireAuth(store.PermScript, s.handleInstanceScriptStatus))
-	mux.HandleFunc("GET /api/ssh-keys", s.requireAuth(store.PermView, s.handleListSSHKeys))
+	// 实例 root 密码（重建时用于创建新实例）：设置/检查/清除，永不回显明文。
+	mux.HandleFunc("GET /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handleGetInstanceRootPassword))
+	mux.HandleFunc("PUT /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handlePutInstanceRootPassword))
+	mux.HandleFunc("DELETE /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handleDeleteInstanceRootPassword))
 
-	// Power permission.
+	// Power permission (includes deleting instances).
 	mux.HandleFunc("POST /api/instances/{id}/boot", s.requireAuth(store.PermPower, s.handleBoot))
 	mux.HandleFunc("POST /api/instances/{id}/shutdown", s.requireAuth(store.PermPower, s.handleShutdown))
 	mux.HandleFunc("POST /api/instances/{id}/reboot", s.requireAuth(store.PermPower, s.handleReboot))
+	mux.HandleFunc("DELETE /api/instances/{id}", s.requireAuth(store.PermPower, s.handleDeleteInstance))
 
 	// Rebuild permission.
 	mux.HandleFunc("POST /api/instances/{id}/rebuild", s.requireAuth(store.PermRebuild, s.handleRebuild))
@@ -196,7 +231,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/groups/{id}", s.requireAuth(store.PermAdmin, s.handleUpdateGroup))
 	mux.HandleFunc("DELETE /api/groups/{id}", s.requireAuth(store.PermAdmin, s.handleDeleteGroup))
 	mux.HandleFunc("GET /api/agents", s.requireAuth(store.PermAdmin, s.handleListAgents))
-	mux.HandleFunc("POST /api/agents", s.requireAuth(store.PermAdmin, s.handleCreateAgent))
 	mux.HandleFunc("DELETE /api/agents/{id}", s.requireAuth(store.PermAdmin, s.handleDeleteAgent))
 	mux.HandleFunc("PUT /api/agents/{id}/name", s.requireAuth(store.PermAdmin, s.handleRenameAgent))
 	mux.HandleFunc("GET /api/agent/commands", s.requireAuth(store.PermAdmin, s.handleAgentCommands))
@@ -251,7 +285,9 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 		client := s.clientFor(tok.Token)
 
 		cached := s.Store.CachedInstances(tok.ID)
-		if !forceRefresh && len(cached) > 0 {
+		// A mutating action marks the snapshot stale without dropping rows, so
+		// the stable cache ids (and thus per-instance configuration) survive.
+		if !forceRefresh && len(cached) > 0 && !s.Store.InstanceCacheStale(tok.ID) {
 			s.appendInstances(&resp, cached, tok, "")
 			continue
 		}
@@ -316,6 +352,7 @@ func (s *Server) handleInstanceRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	inst, err := s.clientFor(pat).GetInstance(r.Context(), id)
 	if err != nil {
+		s.evictMissingInstance(r, id, err)
 		writeError(w, err)
 		return
 	}
@@ -353,6 +390,7 @@ func (s *Server) handleInstanceStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	inst, err := client.GetInstance(ctx, id)
 	if err != nil {
+		s.evictMissingInstance(r, id, err)
 		writeError(w, err)
 		return
 	}
@@ -385,28 +423,6 @@ func (s *Server) handleInstanceStatus(w http.ResponseWriter, r *http.Request) {
 		SSHReady:   sshReady,
 		SSHError:   sshErr,
 	})
-}
-
-func (s *Server) handleListSSHKeys(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.operationClient(w, r)
-	if !ok {
-		return
-	}
-	keys, err := client.ListSSHKeys(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	resp := listSSHKeysResponse{Keys: make([]sshKeyJSON, 0, len(keys))}
-	for _, k := range keys {
-		resp.Keys = append(resp.Keys, sshKeyJSON{
-			ID:      k.ID,
-			Label:   k.Label,
-			Key:     k.SSHKey,
-			Created: k.Created,
-		})
-	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // operationClient resolves the request's token_id to a per-PAT Linode client.
@@ -447,9 +463,10 @@ func (s *Server) powerAction(w http.ResponseWriter, r *http.Request, action stri
 	if !ok {
 		return
 	}
-	// Agent path: queue the command for a registered agent instead of calling
-	// the Linode API directly. The PAT is sealed under the registration code.
-	if r.URL.Query().Get("via_agent") == "1" {
+	user, _ := UserFrom(r.Context())
+	// 执行通道：显式 ?via_agent=1/0 优先；否则跟随账号绑定的 Agent
+	// （已绑定则经该 Agent，未绑定则面板直发）。
+	if s.viaAgentForRequest(user, r.URL.Query().Get("token_id"), r.URL.Query().Get("via_agent")) {
 		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdPower, map[string]any{
 			"id":     id,
 			"action": action,
@@ -470,10 +487,46 @@ func (s *Server) powerAction(w http.ResponseWriter, r *http.Request, action stri
 	}
 	// Drop the token's cached snapshot so the next list refetches and shows
 	// the new power state instead of the stale cached one.
-	user, _ := UserFrom(r.Context())
 	if tid := s.tokenIDFor(user, r.URL.Query().Get("token_id")); tid > 0 {
 		if err := s.Store.InvalidateInstanceCache(tid); err != nil {
 			slog.Warn("invalidate instance cache failed", "token_id", tid, "error", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+// handleDeleteInstance permanently removes an instance upstream (DELETE
+// /linode/instances/{id}) and evicts it from the token's cached snapshot so the
+// next list no longer shows the deleted row. The execution channel follows the
+// account binding: a bound account deletes through its agent, otherwise the
+// panel calls the Linode API directly.
+func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	user, _ := UserFrom(r.Context())
+	if s.viaAgentForRequest(user, r.URL.Query().Get("token_id"), r.URL.Query().Get("via_agent")) {
+		cmdID, ok := s.enqueueAgentCommand(w, r, agenthub.CmdDelete, map[string]any{
+			"id": id,
+		})
+		if !ok {
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"command_id": cmdID})
+		return
+	}
+	client, ok := s.operationClient(w, r)
+	if !ok {
+		return
+	}
+	if err := client.DeleteInstance(r.Context(), id); err != nil {
+		writeError(w, err)
+		return
+	}
+	if tid := s.tokenIDFor(user, r.URL.Query().Get("token_id")); tid > 0 {
+		if err := s.Store.RemoveInstanceCache(tid, id); err != nil {
+			slog.Warn("remove instance cache failed", "token_id", tid, "instance_id", id, "error", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
@@ -486,6 +539,25 @@ func parseID(w http.ResponseWriter, r *http.Request) (int, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// evictMissingInstance removes id from the request token's cached snapshot when
+// the Linode API reports it as not found (deleted upstream, or no longer owned
+// by the account). Without this, the cache-first list keeps showing the row
+// while every per-row refresh returns 404 — a "stuck" instance.
+func (s *Server) evictMissingInstance(r *http.Request, id int, err error) {
+	var apiErr *linode.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return
+	}
+	user, _ := UserFrom(r.Context())
+	tid := s.tokenIDFor(user, r.URL.Query().Get("token_id"))
+	if tid <= 0 {
+		return
+	}
+	if err := s.Store.RemoveInstanceCache(tid, id); err != nil {
+		slog.Warn("remove stale instance cache failed", "token_id", tid, "instance_id", id, "error", err)
+	}
 }
 
 // writeError maps errors to Chinese JSON messages per the shared contract.
@@ -549,17 +621,6 @@ type statusResponse struct {
 	SSHCommand string   `json:"ssh_command"`
 	SSHReady   bool     `json:"ssh_ready"`
 	SSHError   string   `json:"ssh_error"`
-}
-
-type listSSHKeysResponse struct {
-	Keys []sshKeyJSON `json:"keys"`
-}
-
-type sshKeyJSON struct {
-	ID      int    `json:"id"`
-	Label   string `json:"label"`
-	Key     string `json:"key"`
-	Created string `json:"created"`
 }
 
 type okResponse struct {

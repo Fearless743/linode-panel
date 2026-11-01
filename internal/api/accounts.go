@@ -7,8 +7,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"linode-panel/internal/linode"
+	"linode-panel/internal/sshrun"
 	"linode-panel/internal/store"
 )
 
@@ -27,14 +29,31 @@ func (s *Server) tokenJSONFor(t store.Token) tokenJSON {
 }
 
 // handleListMyTokens returns the calling user's PATs (masked), each with the
-// agent bound to the account.
+// agent bound to the account and a freshly-probed account health snapshot
+// (status / detail / balance / balance_uninvoiced / checked_at).
 func (s *Server) handleListMyTokens(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
 	toks := s.Store.TokensOf(user.ID)
-	out := make([]tokenJSON, 0, len(toks))
-	for _, t := range toks {
-		out = append(out, s.tokenJSONFor(t))
+	out := make([]tokenJSON, len(toks))
+	for i, t := range toks {
+		out[i] = s.tokenJSONFor(t)
 	}
+	// 并发探测所有账号（纯只读，PAT 缓存客户端内部线程安全）。
+	var wg sync.WaitGroup
+	wg.Add(len(toks))
+	for i, t := range toks {
+		go func(idx int, tok store.Token) {
+			defer wg.Done()
+			h := s.probeAccountHealthFull(r.Context(), tok.Token)
+			js := &out[idx]
+			js.HealthStatus = h.Status
+			js.HealthDetail = h.Detail
+			js.HealthCheckedAt = h.CheckedAt
+			js.Balance = h.Balance
+			js.BalanceUninvoiced = h.Unbilled
+		}(i, t)
+	}
+	wg.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{"tokens": out})
 }
 
@@ -59,6 +78,64 @@ func (s *Server) handleAddMyToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.tokenJSONFor(t))
+}
+
+// handleUpdateMyToken updates the label (and optionally the agent binding) of
+// one of the calling user's PATs.
+func (s *Server) handleUpdateMyToken(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFrom(r.Context())
+	tid, err := strconv.Atoi(r.PathValue("tid"))
+	if err != nil || tid <= 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "令牌 ID 无效"})
+		return
+	}
+	var req struct {
+		Label   *string `json:"label"`
+		AgentID *int    `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
+		return
+	}
+	// Update label.
+	if req.Label != nil {
+		label := strings.TrimSpace(*req.Label)
+		if label == "" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "名称不能为空"})
+			return
+		}
+		if err := s.Store.UpdateTokenLabel(user.ID, tid, label); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+			return
+		}
+	}
+	// Update agent binding (0 = unbind).
+	if req.AgentID != nil {
+		aid := *req.AgentID
+		if aid < 0 {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "无效的 agent ID"})
+			return
+		}
+		if aid > 0 {
+			if _, ok := s.Hub.Agent(aid); !ok {
+				writeJSON(w, http.StatusBadRequest, errorResponse{Error: "agent 不存在"})
+				return
+			}
+		}
+		if err := s.Store.SetTokenAgent(user.ID, tid, aid); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+			return
+		}
+	}
+	// Return the updated token.
+	toks := s.Store.TokensOf(user.ID)
+	for _, t := range toks {
+		if t.ID == tid {
+			writeJSON(w, http.StatusOK, s.tokenJSONFor(t))
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, errorResponse{Error: "令牌不存在"})
 }
 
 // handleDeleteMyToken removes one of the calling user's PATs.
@@ -92,7 +169,8 @@ func (s *Server) handleAccountAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSetTokenAgent binds (agent_id > 0) or unbinds (agent_id == 0) the
-// agent that executes via-agent operations for one of the caller's accounts.
+// agent that executes this account's operations (power, rebuild, delete) by
+// default when the request does not override via_agent/agent_id.
 func (s *Server) handleSetTokenAgent(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
 	tid, err := strconv.Atoi(r.PathValue("tid"))
@@ -128,13 +206,29 @@ func (s *Server) handleSetTokenAgent(w http.ResponseWriter, r *http.Request) {
 
 // handleAccountOptions returns the regions/types/images available to the
 // account identified by token_id, so the UI can populate create-instance
-// selectors.
+// selectors. Results are cached in the database per token; pass ?refresh=1
+// to force a re-fetch from the Linode API.
 func (s *Server) handleAccountOptions(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
-	pat, err := s.resolveToken(user, r.URL.Query().Get("token_id"))
+	tokenIDStr := r.URL.Query().Get("token_id")
+	pat, err := s.resolveToken(user, tokenIDStr)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
+	}
+	forceRefresh := r.URL.Query().Get("refresh") == "1"
+	if tid := s.tokenIDFor(user, tokenIDStr); tid > 0 && !forceRefresh {
+		if snap := s.Store.CachedAccountOptions(tid); snap != nil {
+			// 缓存可能来自旧版本（写入时未排序），读出后统一排序再返回，
+			// 保证命中缓存与强制刷新两种路径的顺序一致。
+			sortAccountOptions(snap.Regions, snap.Types, snap.Images)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"regions": orEmptyRegions(snap.Regions),
+				"types":   orEmptyTypes(snap.Types),
+				"images":  orEmptyImages(snap.Images),
+			})
+			return
+		}
 	}
 	client := s.clientFor(pat)
 	ctx := r.Context()
@@ -155,6 +249,26 @@ func (s *Server) handleAccountOptions(w http.ResponseWriter, r *http.Request) {
 	}
 	// regions 按国家(country)升序排序，同国家内再按 id 升序保证顺序稳定；
 	// types/images 按 id 字母升序排序。均保证前端下拉框顺序稳定。
+	sortAccountOptions(regions, types, images)
+	// Persist the freshly fetched snapshot for future reads.
+	if tid := s.tokenIDFor(user, tokenIDStr); tid > 0 {
+		if err := s.Store.CacheAccountOptions(tid, &store.AccountOptionsSnapshot{
+			Regions: regions, Types: types, Images: images,
+		}); err != nil {
+			slog.Warn("cache account options failed", "token_id", tid, "error", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"regions": orEmptyRegions(regions),
+		"types":   orEmptyTypes(types),
+		"images":  orEmptyImages(images),
+	})
+}
+
+// sortAccountOptions 就地对 options 三个列表排序：
+// regions 按 country 升序、同 country 内按 id 升序；types/images 按 id 升序。
+// 缓存读取与实时拉取两条路径都调用它，保证返回顺序一致。
+func sortAccountOptions(regions []linode.Region, types []linode.LinodeType, images []linode.Image) {
 	slices.SortFunc(regions, func(a, b linode.Region) int {
 		if c := strings.Compare(a.Country, b.Country); c != 0 {
 			return c
@@ -163,11 +277,6 @@ func (s *Server) handleAccountOptions(w http.ResponseWriter, r *http.Request) {
 	})
 	slices.SortFunc(types, func(a, b linode.LinodeType) int { return strings.Compare(a.ID, b.ID) })
 	slices.SortFunc(images, func(a, b linode.Image) int { return strings.Compare(a.ID, b.ID) })
-	writeJSON(w, http.StatusOK, map[string]any{
-		"regions": orEmptyRegions(regions),
-		"types":   orEmptyTypes(types),
-		"images":  orEmptyImages(images),
-	})
 }
 
 type createInstanceRequest struct {
@@ -205,14 +314,29 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	booted := true
-	inst, err := s.clientFor(pat).CreateInstance(r.Context(), linode.CreateOptions{
+	// 可选开机脚本：创建后由后台协程在实例上通过 SSH 执行，同时保存为
+	// 该实例配置（之后重建也会执行）。执行需要一次性密钥，所以创建时把
+	// 对应公钥写入 authorized_keys；生成失败时仍继续创建，只是不执行脚本。
+	script := strings.TrimSpace(req.Script)
+	var bootScriptKey []byte
+	createOpts := linode.CreateOptions{
 		Region:   req.Region,
 		Type:     req.Type,
 		Image:    req.Image,
 		Label:    req.Label,
 		RootPass: req.RootPass,
 		Booted:   &booted,
-	})
+	}
+	if script != "" {
+		privPEM, pubKey, kerr := sshrun.GenerateKey()
+		if kerr != nil {
+			slog.Warn("生成开机脚本 SSH 密钥失败（继续创建，脚本不会执行）", "err", kerr)
+		} else {
+			bootScriptKey = privPEM
+			createOpts.AuthorizedKeys = []string{pubKey}
+		}
+	}
+	inst, err := s.clientFor(pat).CreateInstance(r.Context(), createOpts)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "创建实例失败: " + err.Error()})
 		return
@@ -222,11 +346,19 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	if err := s.clientFor(pat).AttachAllowAllFirewall(r.Context(), req.Region, inst.ID); err != nil {
 		slog.Warn("开放所有端口防火墙绑定失败（实例已创建，继续）", "instance_id", inst.ID, "err", err)
 	}
-	// 可选开机脚本：保存为该实例配置的脚本，重建时自动执行。
-	// 实例已创建成功，保存失败仅记录日志，不影响创建结果。
-	if script := strings.TrimSpace(req.Script); script != "" {
+	// 保存 root 密码为该实例的配置：删机重建时用同一密码创建新实例。
+	if err := s.Store.SetInstanceRootPassword(inst.ID, req.RootPass); err != nil {
+		slog.Warn("保存 root 密码失败（实例已创建，继续）", "instance_id", inst.ID, "err", err)
+	}
+	// 保存为该实例配置的脚本（重建时再次执行）。实例已创建成功，保存失败
+	// 仅记录日志，不影响创建结果。
+	if script != "" {
 		if err := s.Store.SetInstanceScript(inst.ID, script); err != nil {
 			slog.Warn("保存开机脚本失败（实例已创建，继续）", "instance_id", inst.ID, "err", err)
+		}
+		// 后台执行：创建请求立即返回，脚本在实例启动后通过 SSH 运行。
+		if bootScriptKey != nil {
+			s.startBootScript(inst.ID, pat, bootScriptKey, script)
 		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{

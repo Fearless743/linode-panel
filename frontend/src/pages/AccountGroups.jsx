@@ -226,6 +226,7 @@ export default function AccountGroups() {
       {instanceConfigGroup && (
         <InstanceConfigModal
           group={instanceConfigGroup}
+          instances={instances}
           onClose={() => setInstanceConfigGroup(null)}
           onChanged={() => afterMutate("目标开机配置已更新")}
         />

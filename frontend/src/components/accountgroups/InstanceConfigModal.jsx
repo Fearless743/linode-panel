@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Modal from "../Modal";
-import { getInstanceConfig, setInstanceConfig } from "../../api";
+import { apiFetch, getInstanceConfig, setInstanceConfig } from "../../api";
 
 // ---------- 账号组目标开机配置模态框 ----------
 // 加载时调用 getInstanceConfig 回填表单；保存时调用 setInstanceConfig。
 // 清除按钮调用 setInstanceConfig(groupId, null)。
-export default function InstanceConfigModal({ group, onClose, onChanged }) {
+// 支持从实例缓存（页面上已加载的账号实例）中选择一个来预填配置。
+export default function InstanceConfigModal({ group, instances, onClose, onChanged }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -18,6 +19,21 @@ export default function InstanceConfigModal({ group, onClose, onChanged }) {
   const [label, setLabel] = useState("");
   const [script, setScript] = useState("");
   const [booted, setBooted] = useState(true);
+
+  // 从已有缓存实例填充：选中项 + 填充结果提示。
+  const [sourceId, setSourceId] = useState("");
+  const [fillNotice, setFillNotice] = useState("");
+  // 防止快速切换来源时，较早的脚本请求覆盖较新的选择。
+  const sourceReq = useRef(0);
+
+  // 可选来源：页面上已加载的实例缓存（后端数据库快照）。
+  const sources = useMemo(() => {
+    const list = Array.isArray(instances) ? instances : [];
+    return [...list].sort((a, b) => {
+      const labelCmp = String(a.label || "").localeCompare(String(b.label || ""));
+      return labelCmp !== 0 ? labelCmp : Number(a.id) - Number(b.id);
+    });
+  }, [instances]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -43,6 +59,45 @@ export default function InstanceConfigModal({ group, onClose, onChanged }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // 选中缓存实例后，用其 region/type/image/label 预填表单，并尝试读取其开机脚本。
+  async function applySource(value) {
+    const req = ++sourceReq.current;
+    setSourceId(value);
+    setFillNotice("");
+    setError("");
+    if (!value) return;
+    const inst = sources.find((i) => String(i.id) === String(value));
+    if (!inst) return;
+
+    setRegion(inst.region || "");
+    setType(inst.type || "");
+    setImage(inst.image || "");
+    setLabel(inst.label || "");
+
+    const name = inst.label || "#" + inst.id;
+    try {
+      const data = await apiFetch(
+        "/api/instances/" + encodeURIComponent(inst.id) + "/script"
+      );
+      if (req !== sourceReq.current) return;
+      if (data && data.configured) {
+        setScript(data.script || "");
+        setFillNotice("已从实例「" + name + "」回填配置和开机脚本");
+      } else {
+        setFillNotice(
+          "已从实例「" + name + "」回填地区/机型/镜像/名称；该实例未配置开机脚本，脚本保持为空"
+        );
+      }
+    } catch {
+      if (req !== sourceReq.current) return;
+      setFillNotice(
+        "已从实例「" +
+          name +
+          "」回填地区/机型/镜像/名称；读取开机脚本失败（可能需要 script 权限），请手动填写脚本"
+      );
+    }
+  }
 
   function validate() {
     if (!region.trim()) return "region 不能为空";
@@ -108,6 +163,38 @@ export default function InstanceConfigModal({ group, onClose, onChanged }) {
         <div className="page-status">正在加载配置…</div>
       ) : (
         <>
+          <div className="modal-field">
+            <label htmlFor="ag-ic-source">从已有缓存实例填充</label>
+            <select
+              id="ag-ic-source"
+              className="modal-input"
+              value={sourceId}
+              onChange={(e) => applySource(e.target.value)}
+              disabled={busy}
+            >
+              <option value="">
+                {sources.length === 0
+                  ? "（暂无缓存实例，可手动填写）"
+                  : "选择实例，自动回填配置…"}
+              </option>
+              {sources.map((inst) => (
+                <option key={inst.id} value={String(inst.id)}>
+                  {(inst.label || "实例 #" + inst.id) +
+                    " · " +
+                    (inst.region || "?") +
+                    " / " +
+                    (inst.type || "?") +
+                    " #" +
+                    inst.id +
+                    (inst.token_label ? "（" + inst.token_label + "）" : "")}
+                </option>
+              ))}
+            </select>
+            <p className="boot-script-hint">
+              选项来自实例列表缓存；选择后回填地区/机型/镜像/名称，若该实例已配置开机脚本则一并回填。
+            </p>
+          </div>
+          {fillNotice && <div className="boot-script-status ok">{fillNotice}</div>}
           <div className="modal-field">
             <label htmlFor="ag-ic-region">Region</label>
             <input

@@ -9,7 +9,7 @@
 //	func (h *Hub) Rename(id int, name string) bool
 //	func (h *Hub) Agents() []Agent
 //	func (h *Hub) Enqueue(agentID int, cmd Command) (Command, error) // ErrNoAgent
-//	func (h *Hub) NextCommands(agentID int, wait time.Duration) []Command // long-poll
+//	func (h *Hub) NextCommands(ctx context.Context, agentID int, wait time.Duration) []Command // long-poll
 //	func (h *Hub) CompleteCommand(id int64, res Result) bool
 //	func (h *Hub) Results() []Result            // all completed results, newest first
 //	func (h *Hub) PendingCommands() []Command   // queued + in-flight, oldest first
@@ -20,6 +20,7 @@ const (
 	CmdList   = "list"
 	CmdPower  = "power"
 	CmdReboot = "rebuild"
+	CmdDelete = "delete"
 )
 
 // Power actions.
@@ -40,7 +41,7 @@ const (
 type Command struct {
 	ID        int64          `json:"id"`
 	AgentID   int            `json:"agent_id"`
-	Type      string         `json:"type"` // CmdList | CmdPower | CmdRebuild
+	Type      string         `json:"type"` // CmdList | CmdPower | CmdRebuild | CmdDelete
 	Params    map[string]any `json:"params"`
 	Status    string         `json:"status"`
 	CreatedAt string         `json:"created_at"`
@@ -63,8 +64,4 @@ type Agent struct {
 	TokenHash string `json:"-"` // sha256 hex; token itself is shown once at register
 	Hostname  string `json:"hostname,omitempty"`
 	LastSeen  string `json:"last_seen,omitempty"`
-	// Manual marks an agent created from the panel UI (新增 Agent) rather than
-	// self-registered by an agent process. The panel owns such an agent's name,
-	// so it can be renamed like the panel's own self-agent.
-	Manual bool `json:"-"`
 }

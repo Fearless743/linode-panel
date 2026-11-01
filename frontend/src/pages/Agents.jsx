@@ -2,7 +2,6 @@
 import { useCallback, useState } from "react";
 import {
   listAgents,
-  createAgent,
   deleteAgent,
   renameAgent,
   setRegcode,
@@ -15,13 +14,13 @@ import { usePolling } from "../hooks/usePolling";
 import AgentList from "../components/agents/AgentList";
 import RegCodeManager from "../components/agents/RegCodeManager";
 import CommandList from "../components/agents/CommandList";
-import AgentCreatedModal from "../components/agents/AgentCreatedModal";
+import AgentInstallModal from "../components/agents/AgentInstallModal";
 
 export default function Agents() {
   const { showBanner } = useUi();
   const [data, setData] = useState(null); // { agents, commands, results }
   const [error, setError] = useState("");
-  const [created, setCreated] = useState(null);
+  const [newCode, setNewCode] = useState(null); // 新生成的注册码（安装模态框）
 
   const load = useCallback(async () => {
     try {
@@ -47,23 +46,6 @@ export default function Agents() {
   // 5s 轮询：enabled 恒 true，立即执行一次并循环。
   usePolling(load, AGENT_POLL_INTERVAL_MS, true);
 
-  // 创建 Agent：成功返回 true（清空输入），失败返回 false。
-  async function handleCreate(name) {
-    if (!name.trim()) {
-      showBanner("请输入 Agent 名称", false);
-      return false;
-    }
-    try {
-      const res = await createAgent(name.trim());
-      setCreated(res);
-      await load();
-      return true;
-    } catch (err) {
-      showBanner(err && err.message ? err.message : "创建失败", false);
-      return false;
-    }
-  }
-
   async function handleDelete(a) {
     try {
       await deleteAgent(a.id);
@@ -88,10 +70,6 @@ export default function Agents() {
 
   // 设置注册码：成功返回 true（清空输入），失败返回 false。
   async function handleSetRegcode(code) {
-    if (!code.trim()) {
-      showBanner("请输入注册码", false);
-      return false;
-    }
     try {
       await setRegcode(code.trim());
       showBanner("注册码已设置", false);
@@ -102,13 +80,11 @@ export default function Agents() {
     }
   }
 
+  // 生成新注册码并弹出安装命令模态框。
   async function handleGenRegcode() {
     try {
       const res = await genRegcode();
-      showBanner(
-        res && res.registration_code ? "新注册码：" + res.registration_code : "已生成新注册码",
-        false
-      );
+      setNewCode(res && res.registration_code ? res.registration_code : "");
     } catch (err) {
       showBanner(err && err.message ? err.message : "生成失败", false);
     }
@@ -124,16 +100,14 @@ export default function Agents() {
       {error && <div className="agents-error">加载失败：{error}</div>}
       {data === null && !error && <div className="agents-empty">正在加载…</div>}
 
-      <AgentList
-        agents={agents}
-        onCreate={handleCreate}
-        onDelete={handleDelete}
-        onRename={handleRename}
-      />
+      <AgentList agents={agents} onDelete={handleDelete} onRename={handleRename} />
       <RegCodeManager onSetRegcode={handleSetRegcode} onGenRegcode={handleGenRegcode} />
       <CommandList commands={commands} results={results} />
 
-      {created && <AgentCreatedModal res={created} onClose={() => setCreated(null)} />}
+      {newCode !== null && (
+        <AgentInstallModal code={newCode} onClose={() => setNewCode(null)} />
+      )}
     </section>
   );
 }
+

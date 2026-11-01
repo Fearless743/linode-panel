@@ -102,11 +102,15 @@ CREATE TABLE IF NOT EXISTS tokens (
 	agent_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS instance_scripts (
-	instance_id INTEGER PRIMARY KEY,
-	script      TEXT NOT NULL
+	cache_id INTEGER PRIMARY KEY,
+	script   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS instance_root_passwords (
+	cache_id INTEGER PRIMARY KEY,
+	password TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS instance_auto_rebuild (
-	instance_id     INTEGER PRIMARY KEY,
+	cache_id        INTEGER PRIMARY KEY,
 	user_id         INTEGER NOT NULL DEFAULT 0,
 	token_id        INTEGER NOT NULL DEFAULT 0,
 	enabled         INTEGER NOT NULL DEFAULT 0,
@@ -122,7 +126,8 @@ CREATE TABLE IF NOT EXISTS instance_auto_rebuild (
 	updated_at      TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS instance_cache (
-	token_id    INTEGER NOT NULL,
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	token_id    INTEGER NOT NULL DEFAULT 0,
 	instance_id INTEGER NOT NULL,
 	label       TEXT NOT NULL DEFAULT '',
 	status      TEXT NOT NULL DEFAULT '',
@@ -135,7 +140,9 @@ CREATE TABLE IF NOT EXISTS instance_cache (
 	created     TEXT NOT NULL DEFAULT '',
 	updated     TEXT NOT NULL DEFAULT '',
 	fetched_at  TEXT NOT NULL,
-	PRIMARY KEY (token_id, instance_id)
+	alive       INTEGER NOT NULL DEFAULT 1,
+	stale       INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(token_id, instance_id)
 );
 CREATE TABLE IF NOT EXISTS account_groups (
 	id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +158,7 @@ CREATE TABLE IF NOT EXISTS account_group_members (
 	PRIMARY KEY (group_id, token_id)
 );
 CREATE TABLE IF NOT EXISTS instance_failover (
-	instance_id  INTEGER PRIMARY KEY,
+	cache_id     INTEGER PRIMARY KEY,
 	user_id      INTEGER NOT NULL DEFAULT 0,
 	group_id     INTEGER NOT NULL DEFAULT 0,
 	token_id     INTEGER NOT NULL DEFAULT 0,
@@ -165,6 +172,13 @@ CREATE TABLE IF NOT EXISTS instance_failover (
 	last_task_id TEXT NOT NULL DEFAULT '',
 	replaced_by  INTEGER NOT NULL DEFAULT 0,
 	updated_at   TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_options_cache (
+	token_id   INTEGER PRIMARY KEY,
+	regions    TEXT NOT NULL,
+	types      TEXT NOT NULL,
+	images     TEXT NOT NULL,
+	fetched_at TEXT NOT NULL
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化表结构: %w", err)
@@ -176,6 +190,15 @@ CREATE TABLE IF NOT EXISTS instance_failover (
 	// 旧库的 account_groups 表缺少 instance_config 列（目标开机配置），需要补列。
 	if err := s.ensureAccountGroupInstanceConfigColumn(); err != nil {
 		return fmt.Errorf("迁移 account_groups 表: %w", err)
+	}
+	// instance_cache 需要自增 id + alive/stale（稳定实例标识），旧库需要重建表。
+	if err := s.ensureInstanceCacheIDColumn(); err != nil {
+		return fmt.Errorf("迁移 instance_cache 表: %w", err)
+	}
+	// 配置表原先按 Linode 实例 id 关联；改为按 instance_cache.id（稳定标识）
+	// 关联后，删机重建只需更新缓存行的 instance_id，配置自动跟随新实例。
+	if err := s.ensureInstanceConfigCacheIDs(); err != nil {
+		return fmt.Errorf("迁移实例配置表: %w", err)
 	}
 	return nil
 }
@@ -208,6 +231,256 @@ func (s *Store) ensureAccountGroupInstanceConfigColumn() error {
 		return nil
 	}
 	_, err = s.db.Exec(`ALTER TABLE account_groups ADD COLUMN instance_config TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+// instanceCacheDDL is the current shape of instance_cache. The auto-increment
+// id is the panel's stable identity for an instance: it survives a rebuild
+// (only instance_id changes), so per-instance configuration keyed by cache_id
+// is inherited automatically by the replacement instance.
+const instanceCacheDDL = `CREATE TABLE %s (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	token_id    INTEGER NOT NULL DEFAULT 0,
+	instance_id INTEGER NOT NULL,
+	label       TEXT NOT NULL DEFAULT '',
+	status      TEXT NOT NULL DEFAULT '',
+	region      TEXT NOT NULL DEFAULT '',
+	type        TEXT NOT NULL DEFAULT '',
+	image       TEXT NOT NULL DEFAULT '',
+	ipv4        TEXT NOT NULL DEFAULT '[]',
+	ipv6        TEXT NOT NULL DEFAULT '',
+	tags        TEXT NOT NULL DEFAULT '[]',
+	created     TEXT NOT NULL DEFAULT '',
+	updated     TEXT NOT NULL DEFAULT '',
+	fetched_at  TEXT NOT NULL,
+	alive       INTEGER NOT NULL DEFAULT 1,
+	stale       INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(token_id, instance_id)
+)`
+
+// ensureInstanceCacheIDColumn upgrades an old instance_cache (primary key
+// token_id+instance_id) to the current shape with a stable auto-increment id.
+func (s *Store) ensureInstanceCacheIDColumn() error {
+	has, err := s.columnExists("instance_cache", "id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, stmt := range []string{
+			`DROP TABLE IF EXISTS instance_cache_v1`,
+			`ALTER TABLE instance_cache RENAME TO instance_cache_v1`,
+			fmt.Sprintf(instanceCacheDDL, "instance_cache"),
+			`INSERT INTO instance_cache
+			   (token_id, instance_id, label, status, region, type, image,
+			    ipv4, ipv6, tags, created, updated, fetched_at, alive, stale)
+			 SELECT token_id, instance_id, label, status, region, type, image,
+			        ipv4, ipv6, tags, created, updated, fetched_at, 1, 0
+			   FROM instance_cache_v1`,
+			`DROP TABLE instance_cache_v1`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	// Partial/older migrations may already have id but not the state columns.
+	for _, col := range []struct {
+		name string
+		ddl  string
+	}{
+		{"alive", `ALTER TABLE instance_cache ADD COLUMN alive INTEGER NOT NULL DEFAULT 1`},
+		{"stale", `ALTER TABLE instance_cache ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`},
+	} {
+		has, err := s.columnExists("instance_cache", col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.Exec(col.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// instanceConfigTables describes the per-instance configuration tables and how
+// to recreate them keyed by instance_cache.id.
+var instanceConfigTables = []struct {
+	name string
+	// ddl has one %s for the table name and uses cache_id as the primary key.
+	ddl string
+	// cols are the non-key columns copied from the old table, in order.
+	cols []string
+}{
+	{
+		name: "instance_scripts",
+		ddl: `CREATE TABLE %s (
+			cache_id INTEGER PRIMARY KEY,
+			script   TEXT NOT NULL
+		)`,
+		cols: []string{"script"},
+	},
+	{
+		name: "instance_auto_rebuild",
+		ddl: `CREATE TABLE %s (
+			cache_id        INTEGER PRIMARY KEY,
+			user_id         INTEGER NOT NULL DEFAULT 0,
+			token_id        INTEGER NOT NULL DEFAULT 0,
+			enabled         INTEGER NOT NULL DEFAULT 0,
+			port            INTEGER NOT NULL DEFAULT 22,
+			threshold       INTEGER NOT NULL DEFAULT 3,
+			interval_sec    INTEGER NOT NULL DEFAULT 300,
+			fail_count      INTEGER NOT NULL DEFAULT 0,
+			last_status     TEXT NOT NULL DEFAULT '',
+			last_detail     TEXT NOT NULL DEFAULT '',
+			last_check_at   TEXT NOT NULL DEFAULT '',
+			last_blocked_at TEXT NOT NULL DEFAULT '',
+			last_task_id    TEXT NOT NULL DEFAULT '',
+			updated_at      TEXT NOT NULL DEFAULT ''
+		)`,
+		cols: []string{"user_id", "token_id", "enabled", "port", "threshold",
+			"interval_sec", "fail_count", "last_status", "last_detail",
+			"last_check_at", "last_blocked_at", "last_task_id", "updated_at"},
+	},
+	{
+		name: "instance_failover",
+		ddl: `CREATE TABLE %s (
+			cache_id     INTEGER PRIMARY KEY,
+			user_id      INTEGER NOT NULL DEFAULT 0,
+			group_id     INTEGER NOT NULL DEFAULT 0,
+			token_id     INTEGER NOT NULL DEFAULT 0,
+			enabled      INTEGER NOT NULL DEFAULT 0,
+			threshold    INTEGER NOT NULL DEFAULT 3,
+			interval_sec INTEGER NOT NULL DEFAULT 300,
+			fail_count   INTEGER NOT NULL DEFAULT 0,
+			last_status  TEXT NOT NULL DEFAULT '',
+			last_detail  TEXT NOT NULL DEFAULT '',
+			last_check_at TEXT NOT NULL DEFAULT '',
+			last_task_id TEXT NOT NULL DEFAULT '',
+			replaced_by  INTEGER NOT NULL DEFAULT 0,
+			updated_at   TEXT NOT NULL DEFAULT ''
+		)`,
+		cols: []string{"user_id", "group_id", "token_id", "enabled", "threshold",
+			"interval_sec", "fail_count", "last_status", "last_detail",
+			"last_check_at", "last_task_id", "replaced_by", "updated_at"},
+	},
+}
+
+// ensureInstanceConfigCacheIDs upgrades config tables that were keyed by the
+// volatile Linode instance id to key by the stable instance_cache.id.
+func (s *Store) ensureInstanceConfigCacheIDs() error {
+	for _, t := range instanceConfigTables {
+		has, err := s.columnExists(t.name, "cache_id")
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		hasOld, err := s.columnExists(t.name, "instance_id")
+		if err != nil {
+			return err
+		}
+		if !hasOld {
+			continue
+		}
+		if err := s.migrateConfigTableToCacheID(t.name, t.ddl, t.cols); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateConfigTableToCacheID rebuilds one config table with cache_id keys.
+// Each old instance_id is mapped to the canonical instance_cache.id (the
+// smallest id for that Linode instance); a token-less anchor row is created
+// when the instance was never cached.
+func (s *Store) migrateConfigTableToCacheID(name, ddl string, cols []string) error {
+	tmp := name + "_cacheid_new"
+	old := name + "_instanceid_old"
+	colList := strings.Join(cols, ", ")
+	oldList := "o." + strings.Join(cols, ", o.")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS ` + tmp,
+		`DROP TABLE IF EXISTS ` + old,
+		`ALTER TABLE ` + name + ` RENAME TO ` + old,
+		fmt.Sprintf(ddl, tmp),
+		`INSERT INTO instance_cache (token_id, instance_id, fetched_at)
+		   SELECT 0, o.instance_id, ''
+		     FROM ` + old + ` o
+		    WHERE NOT EXISTS (
+		          SELECT 1 FROM instance_cache c WHERE c.instance_id = o.instance_id)`,
+		`INSERT INTO ` + tmp + ` (cache_id, ` + colList + `)
+		   SELECT (SELECT MIN(c.id) FROM instance_cache c WHERE c.instance_id = o.instance_id),
+		          ` + oldList + `
+		     FROM ` + old + ` o`,
+		`DROP TABLE ` + old,
+		`ALTER TABLE ` + tmp + ` RENAME TO ` + name,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// cacheIDForInstanceLocked returns the canonical cache id for a Linode
+// instance id (the smallest id across all tokens' snapshots). When ensure is
+// true and no row exists, a token-less anchor row is inserted so configuration
+// can be attached before the instance has ever been listed.
+func (s *Store) cacheIDForInstanceLocked(instanceID int, ensure bool) (int, bool, error) {
+	var id int
+	err := s.db.QueryRow(
+		`SELECT id FROM instance_cache WHERE instance_id=? ORDER BY id LIMIT 1`, instanceID).Scan(&id)
+	if err == nil {
+		return id, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, err
+	}
+	if !ensure {
+		return 0, false, nil
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO instance_cache (token_id, instance_id, fetched_at) VALUES(0, ?, '')`, instanceID)
+	if err != nil {
+		return 0, false, err
+	}
+	last, err := res.LastInsertId()
+	if err != nil {
+		return 0, false, err
+	}
+	return int(last), true, nil
+}
+
+// dropTokenCacheLocked hides a token's cached rows. Rows still referenced by
+// per-instance configuration are kept as dead anchors (so the stable id keeps
+// resolving); the rest are deleted.
+func (s *Store) dropTokenCacheLocked(tokenID int) error {
+	const referenced = `id IN (SELECT cache_id FROM instance_scripts
+	                           UNION SELECT cache_id FROM instance_root_passwords
+	                           UNION SELECT cache_id FROM instance_auto_rebuild
+	                           UNION SELECT cache_id FROM instance_failover)`
+	if _, err := s.db.Exec(
+		`UPDATE instance_cache SET alive=0, stale=1 WHERE token_id=? AND `+referenced, tokenID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(
+		`DELETE FROM instance_cache WHERE token_id=? AND NOT (`+referenced+`)`, tokenID)
 	return err
 }
 
@@ -442,7 +715,10 @@ func (s *Store) DeleteUser(id int) error {
 		return err
 	}
 	for _, tid := range tokenIDs {
-		if _, err := s.db.Exec(`DELETE FROM instance_cache WHERE token_id=?`, tid); err != nil {
+		if err := s.dropTokenCacheLocked(tid); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`DELETE FROM account_options_cache WHERE token_id=?`, tid); err != nil {
 			return err
 		}
 	}
@@ -512,6 +788,23 @@ func (s *Store) SetTokenAgent(userID, tokenID, agentID int) error {
 	return nil
 }
 
+// UpdateTokenLabel renames a user's token (account).
+func (s *Store) UpdateTokenLabel(userID, tokenID int, newLabel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.userExistsLockedByID(userID) {
+		return fmt.Errorf("用户 %d 不存在", userID)
+	}
+	res, err := s.db.Exec(`UPDATE tokens SET label=? WHERE id=? AND user_id=?`, newLabel, tokenID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("令牌 %d 不存在", tokenID)
+	}
+	return nil
+}
+
 // DeleteToken removes a token from a user.
 func (s *Store) DeleteToken(userID, tokenID int) error {
 	s.mu.Lock()
@@ -527,7 +820,10 @@ func (s *Store) DeleteToken(userID, tokenID int) error {
 		return fmt.Errorf("令牌 %d 不存在", tokenID)
 	}
 	// Drop the token's cached instance snapshot so it does not linger.
-	if _, err := s.db.Exec(`DELETE FROM instance_cache WHERE token_id=?`, tokenID); err != nil {
+	if err := s.dropTokenCacheLocked(tokenID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM account_options_cache WHERE token_id=?`, tokenID); err != nil {
 		return err
 	}
 	return nil
@@ -732,11 +1028,17 @@ func (s *Store) SetSelfAgentName(name string) error {
 
 // InstanceScript returns the script configured for an instance (ok=false when
 // none is configured, i.e. the instance uses the built-in default template).
+// Configuration is stored against the instance's stable cache id, so it
+// survives a delete+recreate rebuild automatically.
 func (s *Store) InstanceScript(instanceID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	if err != nil || !ok {
+		return "", false
+	}
 	var script string
-	err := s.db.QueryRow(`SELECT script FROM instance_scripts WHERE instance_id=?`, instanceID).Scan(&script)
+	err = s.db.QueryRow(`SELECT script FROM instance_scripts WHERE cache_id=?`, cacheID).Scan(&script)
 	if err != nil {
 		return "", false
 	}
@@ -747,9 +1049,13 @@ func (s *Store) InstanceScript(instanceID int) (string, bool) {
 func (s *Store) SetInstanceScript(instanceID int, script string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		`INSERT INTO instance_scripts(instance_id, script) VALUES(?, ?)
-		 ON CONFLICT(instance_id) DO UPDATE SET script=excluded.script`, instanceID, script)
+	cacheID, _, err := s.cacheIDForInstanceLocked(instanceID, true)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO instance_scripts(cache_id, script) VALUES(?, ?)
+		 ON CONFLICT(cache_id) DO UPDATE SET script=excluded.script`, cacheID, script)
 	return err
 }
 
@@ -758,16 +1064,76 @@ func (s *Store) SetInstanceScript(instanceID int, script string) error {
 func (s *Store) DeleteInstanceScript(instanceID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM instance_scripts WHERE instance_id=?`, instanceID)
+	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	if err != nil || !ok {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM instance_scripts WHERE cache_id=?`, cacheID)
 	return err
 }
 
-// InstanceScriptIDs returns the ids of instances that have a custom script
-// configured.
+// InstanceRootPassword returns the root password saved for an instance. The
+// password is stored against the instance's stable cache id, so a rebuild
+// inherits it automatically.
+func (s *Store) InstanceRootPassword(instanceID int) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	if err != nil || !ok {
+		return "", false
+	}
+	var password string
+	err = s.db.QueryRow(
+		`SELECT password FROM instance_root_passwords WHERE cache_id=?`, cacheID).Scan(&password)
+	if err != nil {
+		return "", false
+	}
+	return password, true
+}
+
+// InstanceRootPasswordConfigured reports whether a root password is saved for
+// an instance, without exposing the secret.
+func (s *Store) InstanceRootPasswordConfigured(instanceID int) bool {
+	_, ok := s.InstanceRootPassword(instanceID)
+	return ok
+}
+
+// SetInstanceRootPassword persists the root password used when (re)creating an
+// instance.
+func (s *Store) SetInstanceRootPassword(instanceID int, password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cacheID, _, err := s.cacheIDForInstanceLocked(instanceID, true)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO instance_root_passwords(cache_id, password) VALUES(?, ?)
+		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password`, cacheID, password)
+	return err
+}
+
+// DeleteInstanceRootPassword removes the saved root password.
+func (s *Store) DeleteInstanceRootPassword(instanceID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	if err != nil || !ok {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM instance_root_passwords WHERE cache_id=?`, cacheID)
+	return err
+}
+
+// InstanceScriptIDs returns the current Linode instance ids that have a custom
+// script configured.
 func (s *Store) InstanceScriptIDs() []int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT instance_id FROM instance_scripts ORDER BY instance_id`)
+	rows, err := s.db.Query(
+		`SELECT DISTINCT c.instance_id
+		   FROM instance_scripts s JOIN instance_cache c ON c.id = s.cache_id
+		  ORDER BY c.instance_id`)
 	if err != nil {
 		return nil
 	}
@@ -784,8 +1150,10 @@ func (s *Store) InstanceScriptIDs() []int {
 }
 
 // CacheInstances replaces the cached instance snapshot for a token with the
-// given instances, recording the fetch time. Called after a successful
-// ListInstances so a later API failure can fall back to this snapshot.
+// given instances, recording the fetch time. Rows are upserted (not deleted
+// and re-inserted) so each instance keeps its stable auto-increment id across
+// refreshes; rows that disappeared from the snapshot are marked dead but kept
+// while any per-instance configuration still references them.
 func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -795,9 +1163,7 @@ func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM instance_cache WHERE token_id=?`, tokenID); err != nil {
-		return err
-	}
+	seen := make([]int, 0, len(insts))
 	for _, in := range insts {
 		ipv4 := in.IPv4
 		if ipv4 == nil {
@@ -818,13 +1184,50 @@ func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error {
 		if _, err := tx.Exec(
 			`INSERT INTO instance_cache
 				(token_id, instance_id, label, status, region, type, image,
-				 ipv4, ipv6, tags, created, updated, fetched_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				 ipv4, ipv6, tags, created, updated, fetched_at, alive, stale)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)
+			 ON CONFLICT(token_id, instance_id) DO UPDATE SET
+				label=excluded.label, status=excluded.status, region=excluded.region,
+				type=excluded.type, image=excluded.image, ipv4=excluded.ipv4,
+				ipv6=excluded.ipv6, tags=excluded.tags, created=excluded.created,
+				updated=excluded.updated, fetched_at=excluded.fetched_at,
+				alive=1, stale=0`,
 			tokenID, in.ID, in.Label, in.Status, in.Region, in.Type, in.Image,
 			string(ipv4JSON), in.IPv6, string(tagsJSON), in.Created, in.Updated, fetchedAt,
 		); err != nil {
 			return err
 		}
+		seen = append(seen, in.ID)
+	}
+	// Mark rows missing from this snapshot as dead instead of deleting them:
+	// a stable id must survive both a rebuild (instance temporarily absent)
+	// and configuration that still points at it.
+	if len(seen) == 0 {
+		if _, err := tx.Exec(`UPDATE instance_cache SET alive=0 WHERE token_id=?`, tokenID); err != nil {
+			return err
+		}
+	} else {
+		args := make([]any, 0, len(seen)+1)
+		args = append(args, tokenID)
+		for _, id := range seen {
+			args = append(args, id)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seen)), ",")
+		if _, err := tx.Exec(
+			`UPDATE instance_cache SET alive=0
+			  WHERE token_id=? AND instance_id NOT IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+	}
+	// Dead rows with no per-instance configuration can be discarded safely.
+	if _, err := tx.Exec(
+		`DELETE FROM instance_cache
+		  WHERE token_id=? AND alive=0
+		    AND id NOT IN (SELECT cache_id FROM instance_scripts
+		                   UNION SELECT cache_id FROM instance_root_passwords
+		                   UNION SELECT cache_id FROM instance_auto_rebuild
+		                   UNION SELECT cache_id FROM instance_failover)`, tokenID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -837,7 +1240,7 @@ func (s *Store) CachedInstances(tokenID int) []linode.Instance {
 	rows, err := s.db.Query(
 		`SELECT instance_id, label, status, region, type, image, ipv4, ipv6,
 		        tags, created, updated
-		   FROM instance_cache WHERE token_id=? ORDER BY instance_id`, tokenID)
+		   FROM instance_cache WHERE token_id=? AND alive=1 ORDER BY instance_id`, tokenID)
 	if err != nil {
 		return nil
 	}
@@ -857,13 +1260,37 @@ func (s *Store) CachedInstances(tokenID int) []linode.Instance {
 	return out
 }
 
-// InvalidateInstanceCache drops the cached snapshot for a token so the next
-// list refetches from the Linode API. Called after mutating operations
-// (power actions, create, rebuild) to avoid serving stale cached state.
+// InstanceCacheStale reports whether a token's snapshot was marked stale by a
+// mutating action, so the list should refetch from the Linode API.
+func (s *Store) InstanceCacheStale(tokenID int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM instance_cache WHERE token_id=? AND alive=1 AND stale=1`, tokenID).Scan(&n)
+	return err == nil && n > 0
+}
+
+// InvalidateInstanceCache marks a token's cached snapshot stale so the next
+// list refetches from the Linode API. Called after mutating operations (power
+// actions, create, rebuild). Rows (and their stable ids) are kept, so
+// per-instance configuration is not lost.
 func (s *Store) InvalidateInstanceCache(tokenID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM instance_cache WHERE token_id=?`, tokenID)
+	_, err := s.db.Exec(`UPDATE instance_cache SET stale=1 WHERE token_id=?`, tokenID)
+	return err
+}
+
+// RemoveInstanceCache hides one instance from a token's cached snapshot. Used
+// when the Linode API reports the instance as no longer existing, so a stale
+// cached row does not linger in the list and keep failing to refresh. The row
+// is kept as a dead anchor while configuration still references it.
+func (s *Store) RemoveInstanceCache(tokenID, instanceID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE instance_cache SET alive=0 WHERE token_id=? AND instance_id=?`, tokenID, instanceID)
 	return err
 }
 
@@ -893,17 +1320,200 @@ func (s *Store) UpsertInstanceCache(tokenID int, inst linode.Instance) error {
 	_, err = s.db.Exec(
 		`INSERT INTO instance_cache
 			(token_id, instance_id, label, status, region, type, image,
-			 ipv4, ipv6, tags, created, updated, fetched_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+			 ipv4, ipv6, tags, created, updated, fetched_at, alive, stale)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)
 		 ON CONFLICT(token_id, instance_id) DO UPDATE SET
 			label=excluded.label, status=excluded.status, region=excluded.region,
 			type=excluded.type, image=excluded.image, ipv4=excluded.ipv4,
 			ipv6=excluded.ipv6, tags=excluded.tags, created=excluded.created,
-			updated=excluded.updated, fetched_at=excluded.fetched_at`,
+			updated=excluded.updated, fetched_at=excluded.fetched_at,
+			alive=1, stale=0`,
 		tokenID, inst.ID, inst.Label, inst.Status, inst.Region, inst.Type, inst.Image,
 		string(ipv4JSON), inst.IPv6, string(tagsJSON), inst.Created, inst.Updated, fetchedAt,
 	)
 	return err
+}
+
+// RepointInstanceCache records that the Linode instance oldID was replaced by
+// newID (delete+recreate rebuild). Every cached row for oldID is updated in
+// place, keeping its stable id, so per-instance configuration keyed by that id
+// is inherited by the new instance without any copying.
+func (s *Store) RepointInstanceCache(oldID, newID int) error {
+	if oldID <= 0 || newID <= 0 || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	type cacheRow struct{ id, tokenID int }
+	var rows []cacheRow
+	rs, err := tx.Query(`SELECT id, token_id FROM instance_cache WHERE instance_id=? ORDER BY id`, oldID)
+	if err != nil {
+		return err
+	}
+	for rs.Next() {
+		var r cacheRow
+		if err := rs.Scan(&r.id, &r.tokenID); err != nil {
+			rs.Close()
+			return err
+		}
+		rows = append(rows, r)
+	}
+	rs.Close()
+	if err := rs.Err(); err != nil {
+		return err
+	}
+
+	for _, r := range rows {
+		var dupID int
+		err := tx.QueryRow(
+			`SELECT id FROM instance_cache WHERE token_id=? AND instance_id=?`,
+			r.tokenID, newID).Scan(&dupID)
+		switch {
+		case err == nil && dupID != r.id:
+			if err := mergeConfigToCacheID(tx, dupID, r.id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM instance_cache WHERE id=?`, dupID); err != nil {
+				return err
+			}
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE instance_cache SET instance_id=?, alive=1, stale=1 WHERE id=?`,
+			newID, r.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// mergeConfigToCacheID moves per-instance configuration from one cache id to
+// another when a repointed row collides with an already-cached new instance.
+// The destination's existing configuration wins when both are present.
+func mergeConfigToCacheID(tx *sql.Tx, fromID, toID int) error {
+	stmts := []string{
+		`INSERT INTO instance_scripts (cache_id, script)
+		 SELECT ?, script FROM instance_scripts WHERE cache_id=?
+		 ON CONFLICT(cache_id) DO NOTHING`,
+		`INSERT INTO instance_root_passwords (cache_id, password)
+		 SELECT ?, password FROM instance_root_passwords WHERE cache_id=?
+		 ON CONFLICT(cache_id) DO NOTHING`,
+		`INSERT INTO instance_auto_rebuild
+		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec, updated_at)
+		 SELECT ?, user_id, token_id, enabled, port, threshold, interval_sec, updated_at
+		   FROM instance_auto_rebuild WHERE cache_id=?
+		 ON CONFLICT(cache_id) DO NOTHING`,
+		`INSERT INTO instance_failover
+		   (cache_id, user_id, group_id, token_id, enabled, threshold, interval_sec, updated_at)
+		 SELECT ?, user_id, group_id, token_id, enabled, threshold, interval_sec, updated_at
+		   FROM instance_failover WHERE cache_id=?
+		 ON CONFLICT(cache_id) DO NOTHING`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt, toID, fromID); err != nil {
+			return err
+		}
+	}
+	for _, table := range []string{"instance_scripts", "instance_root_passwords", "instance_auto_rebuild", "instance_failover"} {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE cache_id=?`, fromID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AccountOptionsSnapshot is the cached /api/account/options payload for one
+// token: regions, types and images as fetched from the Linode API.
+type AccountOptionsSnapshot struct {
+	Regions []linode.Region     `json:"regions"`
+	Types   []linode.LinodeType `json:"types"`
+	Images  []linode.Image      `json:"images"`
+}
+
+// CacheAccountOptions stores the options snapshot for a token, replacing any
+// previous one. Called after a successful fetch so later reads can skip the
+// upstream API.
+func (s *Store) CacheAccountOptions(tokenID int, snap *AccountOptionsSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	regions, err := json.Marshal(orEmptyRegions(snap.Regions))
+	if err != nil {
+		return err
+	}
+	types, err := json.Marshal(orEmptyTypes(snap.Types))
+	if err != nil {
+		return err
+	}
+	images, err := json.Marshal(orEmptyImages(snap.Images))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO account_options_cache (token_id, regions, types, images, fetched_at)
+		 VALUES(?,?,?,?,?)
+		 ON CONFLICT(token_id) DO UPDATE SET
+			regions=excluded.regions, types=excluded.types,
+			images=excluded.images, fetched_at=excluded.fetched_at`,
+		tokenID, string(regions), string(types), string(images),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+// CachedAccountOptions returns the cached options snapshot for a token, or nil
+// when nothing is cached.
+func (s *Store) CachedAccountOptions(tokenID int) *AccountOptionsSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var regions, types, images string
+	err := s.db.QueryRow(
+		`SELECT regions, types, images FROM account_options_cache WHERE token_id=?`, tokenID,
+	).Scan(&regions, &types, &images)
+	if err != nil {
+		return nil
+	}
+	snap := &AccountOptionsSnapshot{}
+	_ = json.Unmarshal([]byte(regions), &snap.Regions)
+	_ = json.Unmarshal([]byte(types), &snap.Types)
+	_ = json.Unmarshal([]byte(images), &snap.Images)
+	if snap.Regions == nil {
+		snap.Regions = []linode.Region{}
+	}
+	if snap.Types == nil {
+		snap.Types = []linode.LinodeType{}
+	}
+	if snap.Images == nil {
+		snap.Images = []linode.Image{}
+	}
+	return snap
+}
+
+func orEmptyRegions(in []linode.Region) []linode.Region {
+	if in == nil {
+		return []linode.Region{}
+	}
+	return in
+}
+
+func orEmptyTypes(in []linode.LinodeType) []linode.LinodeType {
+	if in == nil {
+		return []linode.LinodeType{}
+	}
+	return in
+}
+
+func orEmptyImages(in []linode.Image) []linode.Image {
+	if in == nil {
+		return []linode.Image{}
+	}
+	return in
 }
 
 // --- internal helpers (callers hold s.mu) ---

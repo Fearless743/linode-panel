@@ -121,16 +121,16 @@ func (m *Manager) runToCompletion(t *testing.T, id string) Task {
 }
 
 // startRebuild starts a rebuild against the fake API and returns the task id.
-func startRebuild(t *testing.T, mgr *Manager, id int, script, reserved string) string {
+func startRebuild(t *testing.T, mgr *Manager, id int, script string) string {
 	t.Helper()
-	taskID, err := mgr.Start(id, script, reserved, "", "")
+	taskID, err := mgr.Start(id, script, "", "", "")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	return taskID
 }
 
-// TestRebuildHappyPath drives the full success sequence with a reserved IP.
+// TestRebuildHappyPath drives the full success sequence.
 func TestRebuildHappyPath(t *testing.T) {
 	h := newStatefulHarness(t)
 	// Override createInstance to also assert the exact create options.
@@ -167,7 +167,7 @@ func TestRebuildHappyPath(t *testing.T) {
 	}
 	h.mgr.sshPort = 22
 
-	id := startRebuild(t, h.mgr, 42, "echo hi", "192.0.2.10")
+	id := startRebuild(t, h.mgr, 42, "echo hi")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusSuccess {
 		t.Fatalf("status = %s, want success (err=%q log=%v)", task.Status, task.Err, task.Log)
@@ -183,7 +183,7 @@ func TestRebuildHappyPath(t *testing.T) {
 	}
 
 	got := h.sequence()
-	for _, want := range []string{"GetInstance", "Shutdown", "GetConfigID", "UpdateConfigNetworkHelper", "DeleteInstance", "CreateInstance", "AttachAllowAllFirewall", "AssignIP", "Boot", "GetInstanceIPs"} {
+	for _, want := range []string{"GetInstance", "Shutdown", "DeleteInstance", "CreateInstance", "GetInstanceIPs"} {
 		found := false
 		for _, g := range got {
 			if g == want {
@@ -207,7 +207,7 @@ func TestRebuildCreateFails(t *testing.T) {
 		return linode.Instance{}, errors.New("boom")
 	}
 
-	id := startRebuild(t, h.mgr, 42, "echo hi", "")
+	id := startRebuild(t, h.mgr, 42, "echo hi")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)
@@ -217,34 +217,6 @@ func TestRebuildCreateFails(t *testing.T) {
 	}
 	if task.EndedAt == "" {
 		t.Fatalf("EndedAt not set")
-	}
-}
-
-// TestRebuildFirewallAttachFailsNonFatal verifies a failed allow-all firewall
-// attach is logged but does not fail the rebuild.
-func TestRebuildFirewallAttachFailsNonFatal(t *testing.T) {
-	h := newStatefulHarness(t)
-	// 绑定防火墙失败，但重建仍应成功。
-	h.api.attachFirewall = func(_ context.Context, _ string, _ int) error {
-		return errors.New("firewall scope missing")
-	}
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
-	}
-
-	id := startRebuild(t, h.mgr, 42, "echo hi", "")
-	task := h.mgr.runToCompletion(t, id)
-	if task.Status != StatusSuccess {
-		t.Fatalf("status = %s, want success (err=%q log=%v)", task.Status, task.Err, task.Log)
-	}
-	found := false
-	for _, line := range task.Log {
-		if strings.Contains(line, "防火墙绑定失败") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("log does not mention firewall attach failure: %v", task.Log)
 	}
 }
 
@@ -262,7 +234,7 @@ func TestRebuildPollTimeout(t *testing.T) {
 		return linode.Instance{ID: 99, Region: "r", Type: "t", Image: "i"}, nil
 	}
 
-	id := startRebuild(t, h.mgr, 42, "echo hi", "")
+	id := startRebuild(t, h.mgr, 42, "echo hi")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)
@@ -280,7 +252,7 @@ func TestRebuildSSHNonZeroExit(t *testing.T) {
 		return sshrun.Result{Exit: 3, Stdout: "out", Stderr: "some error line"}, nil
 	}
 
-	id := startRebuild(t, h.mgr, 42, "bad script", "")
+	id := startRebuild(t, h.mgr, 42, "bad script")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)
@@ -298,7 +270,7 @@ func TestRebuildSSHTransportError(t *testing.T) {
 		return sshrun.Result{}, errors.New("dial tcp: connection refused")
 	}
 
-	id := startRebuild(t, h.mgr, 42, "echo hi", "")
+	id := startRebuild(t, h.mgr, 42, "echo hi")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)
@@ -347,9 +319,9 @@ func TestTaskListNewestFirst(t *testing.T) {
 	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
 		return linode.Instance{ID: id, Region: "r", Type: "t", Image: "i"}, nil
 	}
-	id1 := startRebuild(t, h.mgr, 42, "s1", "")
+	id1 := startRebuild(t, h.mgr, 42, "s1")
 	h.mgr.runToCompletion(t, id1)
-	id2 := startRebuild(t, h.mgr, 43, "s2", "")
+	id2 := startRebuild(t, h.mgr, 43, "s2")
 	h.mgr.runToCompletion(t, id2)
 
 	list := h.mgr.List()
@@ -398,6 +370,7 @@ func rebuildServer(t *testing.T, h *rebuildHarness) (*Server, string) {
 	session := st.NewSession(1, time.Hour)
 	s := New(h.api, st)
 	s.Tasks = h.mgr
+	s.Tasks.RepointCache = s.repointInstanceCache
 	return s, session
 }
 
@@ -414,7 +387,7 @@ func TestRebuildHTTPEmptyScriptFallsBackToDefault(t *testing.T) {
 		return linode.Instance{ID: id, Region: "r", Type: "t", Image: "i"}, nil
 	}
 	srv, session := rebuildServer(t, h)
-	body := `{"script":"","reserved_ip":""}`
+	body := `{"script":""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/instances/42/rebuild", bytes.NewBufferString(body))
 	authed(req, session)
 	rr := httptest.NewRecorder()
@@ -527,6 +500,137 @@ func TestInstanceScriptHTTP(t *testing.T) {
 	}
 }
 
+// TestRebuildInheritsInstanceConfig verifies the stable-cache-id design: after
+// a delete+recreate rebuild the new Linode id inherits the old instance's
+// boot script, auto-rebuild and failover configuration.
+func TestRebuildInheritsInstanceConfig(t *testing.T) {
+	h := newStatefulHarness(t)
+	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+		return sshrun.Result{}, nil
+	}
+	var createdOpts linode.CreateOptions
+	inner := h.api.createInstance
+	h.api.createInstance = func(ctx context.Context, opts linode.CreateOptions) (linode.Instance, error) {
+		createdOpts = opts
+		return inner(ctx, opts)
+	}
+	srv, session := rebuildServer(t, h)
+	tok := srv.Store.TokensOf(1)[0]
+	if err := srv.Store.CacheInstances(tok.ID, []linode.Instance{{ID: 42, Label: "web"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.SetInstanceScript(42, "echo inherited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.SetInstanceRootPassword(42, "Secret123!"); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.SetAutoRebuild(store.AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: tok.ID, Enabled: true,
+		Port: 22, Threshold: 3, IntervalSec: 300,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.SetFailover(store.Failover{
+		InstanceID: 42, UserID: 1, GroupID: 1, TokenID: tok.ID, Enabled: true,
+		Threshold: 3, IntervalSec: 300,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/instances/42/rebuild", bytes.NewBufferString(`{}`))
+	authed(req, session)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	wantStatus(t, rr, http.StatusAccepted)
+	var resp rebuildResponse
+	decodeJSON(t, rr, &resp)
+	task := h.mgr.runToCompletion(t, resp.TaskID)
+	if task.Status != StatusSuccess {
+		t.Fatalf("task = %+v", task)
+	}
+	newID := task.NewInstanceID
+	if newID <= 0 || newID == 42 {
+		t.Fatalf("new instance id = %d", newID)
+	}
+
+	// The cached snapshot points at the new instance with the same row.
+	cached := srv.Store.CachedInstances(tok.ID)
+	if len(cached) != 1 || cached[0].ID != newID {
+		t.Fatalf("cached instances = %+v, want only id %d", cached, newID)
+	}
+	if script, ok := srv.Store.InstanceScript(newID); !ok || script != "echo inherited" {
+		t.Fatalf("InstanceScript(%d) = %q, %v", newID, script, ok)
+	}
+	if cfg, ok := srv.Store.AutoRebuild(newID); !ok || !cfg.Enabled {
+		t.Fatalf("AutoRebuild(%d) = %+v, %v", newID, cfg, ok)
+	}
+	if cfg, ok := srv.Store.Failover(newID); !ok || !cfg.Enabled {
+		t.Fatalf("Failover(%d) = %+v, %v", newID, cfg, ok)
+	}
+	// The replacement instance is created with the inherited root password.
+	if createdOpts.RootPass != "Secret123!" {
+		t.Fatalf("CreateInstance RootPass = %q, want inherited password", createdOpts.RootPass)
+	}
+	if pass, ok := srv.Store.InstanceRootPassword(newID); !ok || pass != "Secret123!" {
+		t.Fatalf("InstanceRootPassword(%d) = %q, %v", newID, pass, ok)
+	}
+}
+
+// TestInstanceRootPasswordHTTP covers the per-instance root password
+// endpoints (set / check / clear, never echoing the secret).
+func TestInstanceRootPasswordHTTP(t *testing.T) {
+	h := newRebuildHarness(t)
+	srv, session := rebuildServer(t, h)
+
+	get := func() map[string]any {
+		req := httptest.NewRequest(http.MethodGet, "/api/instances/42/root-password", nil)
+		authed(req, session)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		wantStatus(t, rr, http.StatusOK)
+		var got map[string]any
+		decodeJSON(t, rr, &got)
+		return got
+	}
+	if got := get(); got["configured"] != false {
+		t.Fatalf("initial = %+v", got)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/instances/42/root-password",
+		bytes.NewBufferString(`{"password":"Secret123!"}`))
+	authed(req, session)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	wantStatus(t, rr, http.StatusOK)
+	if resp := get(); resp["configured"] != true {
+		t.Fatalf("after put = %+v", resp)
+	} else if _, leaked := resp["password"]; leaked {
+		t.Fatal("GET must not return the password")
+	}
+	if pass, ok := srv.Store.InstanceRootPassword(42); !ok || pass != "Secret123!" {
+		t.Fatalf("stored password = %q, %v", pass, ok)
+	}
+
+	// Empty password is rejected.
+	req = httptest.NewRequest(http.MethodPut, "/api/instances/42/root-password",
+		bytes.NewBufferString(`{"password":"  "}`))
+	authed(req, session)
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	wantStatus(t, rr, http.StatusBadRequest)
+
+	// Delete clears it.
+	req = httptest.NewRequest(http.MethodDelete, "/api/instances/42/root-password", nil)
+	authed(req, session)
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	wantStatus(t, rr, http.StatusOK)
+	if got := get(); got["configured"] != false {
+		t.Fatalf("after delete = %+v", got)
+	}
+}
+
 func TestRebuildHTTPConflict(t *testing.T) {
 	h := newRebuildHarness(t)
 	release := make(chan struct{})
@@ -624,7 +728,7 @@ func TestRebuildProbeFail(t *testing.T) {
 		return errors.New("probe refused")
 	}
 
-	id := startRebuild(t, h.mgr, 42, "echo hi", "")
+	id := startRebuild(t, h.mgr, 42, "echo hi")
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)

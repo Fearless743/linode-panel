@@ -125,7 +125,7 @@ func TestNextCommandsFIFO(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmds := h.NextCommands(agent.ID, 0)
+	cmds := h.NextCommands(context.Background(), agent.ID, 0)
 	if len(cmds) != 3 {
 		t.Fatalf("NextCommands len = %d, want 3", len(cmds))
 	}
@@ -137,14 +137,14 @@ func TestNextCommandsFIFO(t *testing.T) {
 		t.Fatalf("status after dequeue = %q, want in_flight", cmds[0].Status)
 	}
 	// Second call drains nothing.
-	if got := h.NextCommands(agent.ID, 0); len(got) != 0 {
+	if got := h.NextCommands(context.Background(), agent.ID, 0); len(got) != 0 {
 		t.Fatalf("second NextCommands len = %d, want 0", len(got))
 	}
 }
 
 func TestNextCommandsUnknownAgentReturnsEmpty(t *testing.T) {
 	h := NewHub()
-	cmds := h.NextCommands(99, 0)
+	cmds := h.NextCommands(context.Background(), 99, 0)
 	if cmds == nil {
 		t.Fatal("NextCommands returned nil for unknown agent, want non-nil empty")
 	}
@@ -157,7 +157,7 @@ func TestNextCommandsTimeoutReturnsEmpty(t *testing.T) {
 	h := NewHub()
 	agent, _ := h.Register("a")
 	start := time.Now()
-	cmds := h.NextCommands(agent.ID, 30*time.Millisecond)
+	cmds := h.NextCommands(context.Background(), agent.ID, 30*time.Millisecond)
 	if time.Since(start) < 25*time.Millisecond {
 		t.Fatalf("returned before wait elapsed: %v", time.Since(start))
 	}
@@ -179,7 +179,7 @@ func TestNextCommandsWakeOnEnqueue(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		got = h.NextCommands(agent.ID, 5*time.Second)
+		got = h.NextCommands(context.Background(), agent.ID, 5*time.Second)
 	}()
 
 	time.Sleep(delay)
@@ -204,7 +204,7 @@ func TestNextCommandsWakeOnEnqueue(t *testing.T) {
 func TestNextCommandsUpdatesLastSeen(t *testing.T) {
 	h := NewHub()
 	agent, _ := h.Register("a")
-	h.NextCommands(agent.ID, 0)
+	h.NextCommands(context.Background(), agent.ID, 0)
 	updated, ok := h.Agent(agent.ID)
 	if !ok || updated.LastSeen == "" {
 		t.Fatalf("LastSeen not updated: %+v", updated)
@@ -215,7 +215,7 @@ func TestCompleteCommand(t *testing.T) {
 	h := NewHub()
 	agent, _ := h.Register("a")
 	cmd, _ := h.Enqueue(agent.ID, Command{Type: CmdList})
-	h.NextCommands(agent.ID, 0)
+	h.NextCommands(context.Background(), agent.ID, 0)
 
 	if h.CompleteCommand(999, Result{OK: true}) {
 		t.Fatal("CompleteCommand(999) returned true for unknown ID")
@@ -251,7 +251,7 @@ func TestResultsNewestFirst(t *testing.T) {
 		c, _ := h.Enqueue(agent.ID, Command{Type: CmdList})
 		ids = append(ids, c.ID)
 	}
-	h.NextCommands(agent.ID, 0)
+	h.NextCommands(context.Background(), agent.ID, 0)
 	for _, id := range ids {
 		if !h.CompleteCommand(id, Result{OK: true}) {
 			t.Fatalf("CompleteCommand(%d) failed", id)
@@ -294,7 +294,7 @@ func TestPendingCommandsOldestFirst(t *testing.T) {
 	}
 
 	// Dequeue all: every command becomes in_flight, still oldest first.
-	h.NextCommands(agent.ID, 0)
+	h.NextCommands(context.Background(), agent.ID, 0)
 	pending = h.PendingCommands()
 	if len(pending) != 3 {
 		t.Fatalf("PendingCommands after dequeue len = %d, want 3", len(pending))
@@ -326,7 +326,7 @@ func TestConcurrentUse(t *testing.T) {
 				t.Errorf("Enqueue: %v", err)
 				return
 			}
-			got := h.NextCommands(agent.ID, 0)
+			got := h.NextCommands(context.Background(), agent.ID, 0)
 			for _, c := range got {
 				if !h.CompleteCommand(c.ID, Result{OK: true, Error: ""}) {
 					t.Errorf("CompleteCommand(%d) failed", c.ID)
@@ -363,13 +363,13 @@ func TestConcurrentPollAndEnqueue(t *testing.T) {
 			case <-done:
 				// Drain any commands still queued so the result count is
 				// exact even if the poller was idle when done closed.
-				for _, c := range h.NextCommands(agent.ID, 0) {
+				for _, c := range h.NextCommands(context.Background(), agent.ID, 0) {
 					h.CompleteCommand(c.ID, Result{OK: true})
 				}
 				return
 			default:
 			}
-			cmds := h.NextCommands(agent.ID, 5*time.Millisecond)
+			cmds := h.NextCommands(context.Background(), agent.ID, 5*time.Millisecond)
 			for _, c := range cmds {
 				h.CompleteCommand(c.ID, Result{OK: true})
 			}
@@ -442,7 +442,7 @@ func TestPendingFor(t *testing.T) {
 		t.Fatalf("PendingFor = %d, want 3", n)
 	}
 	// In-flight commands still count as pending.
-	h.NextCommands(a.ID, 0)
+	h.NextCommands(context.Background(), a.ID, 0)
 	if n := h.PendingFor(a.ID); n != 3 {
 		t.Fatalf("PendingFor after dequeue = %d, want 3", n)
 	}
@@ -454,11 +454,11 @@ func TestNextCommandsContextCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if cmds := h.NextCommandsContext(ctx, a.ID, 10*time.Second); len(cmds) != 0 {
+	if cmds := h.NextCommands(ctx, a.ID, 10*time.Second); len(cmds) != 0 {
 		t.Fatalf("expected empty on context timeout, got %d", len(cmds))
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("NextCommandsContext blocked too long: %v", elapsed)
+		t.Fatalf("NextCommands blocked too long: %v", elapsed)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"linode-panel/internal/agentcrypto"
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/store"
 )
@@ -74,7 +73,7 @@ func (s *Server) handleAgentPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	// Watch the request context so a dropped client disconnect does not hold
 	// the handler (and an httptest.Server) open for the full 25s poll.
-	cmds := s.Hub.NextCommandsContext(r.Context(), agent.ID, 25*time.Second)
+	cmds := s.Hub.NextCommands(r.Context(), agent.ID, 25*time.Second)
 	writeJSON(w, http.StatusOK, map[string]any{"commands": cmds})
 }
 
@@ -100,7 +99,7 @@ func (s *Server) handleAgentResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "命令不存在"})
 		return
 	}
-	s.Hub.CompleteCommand(res.CommandID, agenthub.Result{
+	s.completeAgentCommand(cmd, agenthub.Result{
 		OK:      res.OK,
 		Error:   res.Error,
 		Payload: res.Payload,
@@ -108,49 +107,37 @@ func (s *Server) handleAgentResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
+// completeAgentCommand records a command result and, for a successful rebuild,
+// re-points the instance's stable cache row at the replacement Linode id so
+// per-instance configuration is inherited even when the rebuild ran on an
+// agent.
+func (s *Server) completeAgentCommand(cmd agenthub.Command, result agenthub.Result) {
+	if cmd.Type == agenthub.CmdReboot {
+		oldID, oldOK := agenthub.IntParam(cmd.Params["id"])
+		newID, newOK := agenthub.IntParam(result.Payload["new_instance_id"])
+		if oldOK && newOK && newID > 0 {
+			s.repointInstanceCache(oldID, newID)
+		}
+	}
+	s.Hub.CompleteCommand(cmd.ID, result)
+}
+
 // handleListAgents returns all registered agents with pending command counts.
-// The panel's own self-agent is flagged as local=true; agents created from the
-// UI are flagged as manual=true (both are renameable by the panel).
+// The panel's own self-agent is flagged as local=true.
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents := s.Hub.Agents()
 	resp := make([]map[string]any, 0, len(agents))
 	for _, a := range agents {
-		local := a.ID == s.localAgentID
 		resp = append(resp, map[string]any{
 			"id":        a.ID,
 			"name":      a.Name,
 			"hostname":  a.Hostname,
 			"last_seen": a.LastSeen,
 			"pending":   s.Hub.PendingFor(a.ID),
-			"local":     local,
-			"manual":    a.Manual && !local,
+			"local":     a.ID == s.localAgentID,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": resp})
-}
-
-// handleCreateAgent registers a new agent and returns its token plus the
-// current registration code (so an operator can hand both to the agent). The
-// agent is flagged manual so the panel can rename it later.
-func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})
-		return
-	}
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		name = "agent"
-	}
-	agent, token := s.Hub.Register(name)
-	s.Hub.MarkManual(agent.ID)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"agent_id":          agent.ID,
-		"agent_token":       token,
-		"registration_code": s.Store.RegCode(),
-	})
 }
 
 // handleDeleteAgent removes an agent by id. The panel's own self-agent cannot
@@ -172,11 +159,10 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-// handleRenameAgent renames an agent the panel owns: its own self-agent (new
-// name persisted, surviving restarts) or one created from the UI (manual).
-// Agents that self-registered with the registration code cannot be renamed —
-// their name is chosen by the agent process at registration and reclaimed on
-// every poll.
+// handleRenameAgent renames the panel's own self-agent (the new name is
+// persisted, surviving restarts). Agents that self-registered with the
+// registration code cannot be renamed — their name is chosen by the agent
+// process at registration.
 func (s *Server) handleRenameAgent(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil || id <= 0 {
@@ -185,15 +171,12 @@ func (s *Server) handleRenameAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	isLocal := id == s.localAgentID
 	if !isLocal {
-		a, ok := s.Hub.Agent(id)
-		if !ok {
+		if _, ok := s.Hub.Agent(id); !ok {
 			writeJSON(w, http.StatusNotFound, errorResponse{Error: "agent 不存在"})
 			return
 		}
-		if !a.Manual {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "只能重命名本地面板 agent 或手动创建的 agent"})
-			return
-		}
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "只能重命名本地面板 agent"})
+		return
 	}
 	var req struct {
 		Name string `json:"name"`
@@ -277,29 +260,13 @@ func (s *Server) handleSetRegCode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-// sealPATForAgent seals the user's PAT with the key that agentID expects. The
-// panel's own self-agent uses its own key, so it works without a registration
-// code; remote agents require the registration code.
-func (s *Server) sealPATForAgent(user store.User, tokenID string, agentID int) (string, bool) {
-	var key []byte
-	if s.localAgentID > 0 && agentID == s.localAgentID {
-		key = s.localAgentKey
-	} else {
-		code := s.Store.RegCode()
-		if code == "" {
-			return "", false
-		}
-		key = agentcrypto.DeriveKey(code)
-	}
+// resolvePATForAgent returns the user's PAT in plaintext for the agent to use.
+func (s *Server) resolvePATForAgent(user store.User, tokenID string) (string, bool) {
 	pat, err := s.resolveToken(user, tokenID)
 	if err != nil {
 		return "", false
 	}
-	sealed, err := agentcrypto.Seal(key, []byte(pat))
-	if err != nil {
-		return "", false
-	}
-	return sealed, true
+	return pat, true
 }
 
 // enqueueAgentCommand queues an agent command for the agent that should
@@ -311,50 +278,66 @@ func (s *Server) sealPATForAgent(user store.User, tokenID string, agentID int) (
 //  3. the panel's own agent (本地面板) when enabled, otherwise the first
 //     registered agent (backward-compatible default).
 //
-// The account's PAT is sealed under the target agent's key and attached as
-// params["sealed_pat"]. The panel's own agent needs no registration code;
-// remote agents do.
+// The account's PAT is attached as params["pat"] in plaintext.
 func (s *Server) enqueueAgentCommand(w http.ResponseWriter, r *http.Request, typ string, params map[string]any) (int64, bool) {
+	return s.enqueueAgentCommandForToken(w, r, r.URL.Query().Get("token_id"), typ, params)
+}
+
+// enqueueAgentCommandForToken is enqueueAgentCommand with an explicit token id,
+// so callers whose target account arrives in the request body (rebuild) resolve
+// the PAT and the bound agent from the same account.
+func (s *Server) enqueueAgentCommandForToken(w http.ResponseWriter, r *http.Request, tokenID, typ string, params map[string]any) (int64, bool) {
 	user, _ := UserFrom(r.Context())
-	agentID := s.agentIDForRequest(user, r)
+	// 1. 显式 ?agent_id=N 覆盖；2. 账号绑定的 Agent；3. 默认 Agent。
+	agentID := s.agentOverrideID(r)
 	if agentID == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有已注册的 agent 或未设置注册码"})
+		agentID = s.agentIDForRequest(user, tokenID)
+	}
+	if agentID == 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有已注册的 agent"})
 		return 0, false
 	}
-	sealed, ok := s.sealPATForAgent(user, r.URL.Query().Get("token_id"), agentID)
+	pat, ok := s.resolvePATForAgent(user, tokenID)
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有已注册的 agent 或未设置注册码"})
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "未找到有效的 PAT"})
 		return 0, false
 	}
-	params["sealed_pat"] = sealed
+	params["pat"] = pat
 
 	cmd, err := s.Hub.Enqueue(agentID, agenthub.Command{Type: typ, Params: params})
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有已注册的 agent 或未设置注册码"})
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "没有已注册的 agent"})
 		return 0, false
 	}
 	return cmd.ID, true
 }
 
-// agentIDForRequest resolves which agent should run the operation described by
-// r, following the precedence documented on enqueueAgentCommand. It returns 0
-// when no agent can be found.
-func (s *Server) agentIDForRequest(user store.User, r *http.Request) int {
-	// 1. Explicit per-request override (?agent_id=N), as selected in the UI.
-	if v := r.URL.Query().Get("agent_id"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if _, ok := s.Hub.Agent(n); ok {
-				return n
-			}
-		}
-	}
-	// 2. The agent bound to the account the operation targets.
-	if id := s.boundAgentID(user, r.URL.Query().Get("token_id")); id > 0 {
+// agentIDForRequest resolves which agent should run the operation for tokenID
+// after the explicit override: the account's bound agent, else the default.
+func (s *Server) agentIDForRequest(user store.User, tokenID string) int {
+	if id := s.boundAgentID(user, tokenID); id > 0 {
 		return id
 	}
 	// 3. The panel's own agent (本地面板) when enabled, otherwise the first
 	// registered agent (backward-compatible default).
 	return s.defaultAgentID()
+}
+
+// agentOverrideID returns the explicit ?agent_id=N override when present and
+// registered, else 0.
+func (s *Server) agentOverrideID(r *http.Request) int {
+	v := r.URL.Query().Get("agent_id")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if _, ok := s.Hub.Agent(n); !ok {
+		return 0
+	}
+	return n
 }
 
 // defaultAgentID returns the panel's own self-agent when it is enabled,
@@ -368,6 +351,20 @@ func (s *Server) defaultAgentID() int {
 		return 0
 	}
 	return agents[0].ID
+}
+
+// viaAgentForRequest reports whether an operation should run through an agent.
+// An explicit via_agent=1/0 forces agent/direct; when it is absent, the account
+// the operation targets decides: bound to an agent -> run through that agent,
+// unbound -> call the Linode API directly from the panel.
+func (s *Server) viaAgentForRequest(user store.User, tokenID, viaAgentParam string) bool {
+	switch viaAgentParam {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	return s.boundAgentID(user, tokenID) > 0
 }
 
 // boundAgentID returns the agent bound to the token identified by tokenID

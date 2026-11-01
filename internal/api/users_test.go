@@ -64,6 +64,16 @@ func TestUsersCRUD(t *testing.T) {
 	if cookieBob == nil {
 		t.Fatal("bob login with new password failed")
 	}
+	// PATCH password only: group stays at 3, no "权限组 -1" error.
+	rr = authedPatch(t, srv, cookie, "/api/users/"+itoa(bobID), `{"password":"bobpw2"}`)
+	wantStatus(t, rr, http.StatusOK)
+	rr = authedGet(t, srv, cookie, "/api/users")
+	decodeJSON(t, rr, &users)
+	for _, u := range users.Users {
+		if u.ID == bobID && u.GroupID != 3 {
+			t.Fatalf("bob group after password-only patch = %d, want 3", u.GroupID)
+		}
+	}
 	// DELETE.
 	rr = authedDelete(t, srv, cookie, "/api/users/"+itoa(bobID))
 	wantStatus(t, rr, http.StatusOK)

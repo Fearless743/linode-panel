@@ -11,6 +11,7 @@ import {
   listInstances,
   getInstanceStatus,
   instanceAction,
+  deleteInstance,
   rebuildInstance,
   createUser,
   listGroups,
@@ -251,6 +252,29 @@ describe("端点封装", () => {
     expect(url).toBe("/api/instances/7/boot?token_id=7&via_agent=1&agent_id=3");
   });
 
+  it("instanceAction viaAgent=false 显式面板直发", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await instanceAction("7", "boot", { tokenId: 7, viaAgent: false });
+    const [url] = await lastCall();
+    expect(url).toBe("/api/instances/7/boot?token_id=7&via_agent=0");
+  });
+
+  it("instanceAction 省略 viaAgent 时跟随账号绑定（不带 via_agent）", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await instanceAction("7", "boot", { tokenId: 7 });
+    const [url] = await lastCall();
+    expect(url).toBe("/api/instances/7/boot?token_id=7");
+  });
+
+  it("deleteInstance DELETE 编码 id 并附带 token_id", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ ok: true }));
+    await expect(deleteInstance("i/1", 7)).resolves.toEqual({ ok: true });
+    const [url, opts] = await lastCall();
+    expect(url).toBe("/api/instances/i%2F1?token_id=7");
+    expect(opts.method).toBe("DELETE");
+    expect(opts.body).toBeUndefined();
+  });
+
   it("rebuildInstance POST JSON + via_agent", async () => {
     vi.mocked(fetch).mockResolvedValue(mockResponse({ task: "t1" }));
     await rebuildInstance("i1", { script: "s" }, true);
@@ -265,6 +289,20 @@ describe("端点封装", () => {
     await rebuildInstance("i1", { script: "s" }, true, 5);
     const [url] = await lastCall();
     expect(url).toBe("/api/instances/i1/rebuild?via_agent=1&agent_id=5");
+  });
+
+  it("rebuildInstance viaAgent=false 显式面板直发", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ task: "t1" }));
+    await rebuildInstance("i1", { script: "s" }, false);
+    const [url] = await lastCall();
+    expect(url).toBe("/api/instances/i1/rebuild?via_agent=0");
+  });
+
+  it("rebuildInstance 省略 viaAgent 时跟随账号绑定（不带 via_agent）", async () => {
+    vi.mocked(fetch).mockResolvedValue(mockResponse({ task: "t1" }));
+    await rebuildInstance("i1", { script: "s" });
+    const [url] = await lastCall();
+    expect(url).toBe("/api/instances/i1/rebuild");
   });
 
   it("createUser POST /api/users", async () => {

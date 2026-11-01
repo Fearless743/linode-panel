@@ -13,42 +13,35 @@ import (
 	"testing"
 	"time"
 
-	"linode-panel/internal/agentcrypto"
-	"linode-panel/internal/linode"
+	"linode-panel/internal/agenthub"
 )
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// newTestAgent wires a fake panel + fake Linode API into an agent with a temp
-// state file and fast seams.
-func newTestAgent(t *testing.T, panel *fakePanel, fake *fakeLinodeAPI, code, statePath string) *agent {
+// newTestAgent wires a fake panel + fake Linode API into an agent with fast
+// seams.
+func newTestAgent(t *testing.T, panel *fakePanel, fake *fakeLinodeAPI, statePath string) *agent {
 	t.Helper()
-	key := agentcrypto.DeriveKey(code)
 	pc := newPanelClient(panel.URL, "")
-	ex := &executor{
-		apiBase: panel.URL + "/linode",
-		sshPort: 22,
-		run: func(ctx context.Context, host string, port int, privPEM []byte, script string) error {
+	ex := &agenthub.Executor{
+		APIBase: panel.URL + "/linode",
+		SSHPort: 22,
+		Run: func(ctx context.Context, host string, port int, privPEM []byte, script string) error {
 			return nil
 		},
-		probe: func(ctx context.Context, host string, port int) error { return nil },
-		log:   testLogger(),
+		Probe: func(ctx context.Context, host string, port int) error { return nil },
+		Log:   testLogger(),
 	}
-	// Replace newAPI so the executor talks to the fake Linode API.
-	ex.newAPI = func(pat string) linodeAPI { return fake }
-	a := &agent{
-		pc:        pc,
-		st:        &state{},
-		statePath: statePath,
-		key:       key,
-		code:      code,
-		hostname:  "testhost",
-		exec:      ex,
-		log:       testLogger(),
+	// Replace NewAPI so the executor talks to the fake Linode API.
+	ex.NewAPI = func(pat string) agenthub.LinodeAPI { return fake }
+	return &agent{
+		pc:       pc,
+		hostname: "testhost",
+		exec:     ex,
+		log:      testLogger(),
 	}
-	return a
 }
 
 func testLogger() *slog.Logger { return discardLogger() }
@@ -80,55 +73,6 @@ func TestRegisterPersistsToken(t *testing.T) {
 	if reloaded.AgentToken != "tok123" {
 		t.Fatalf("persisted token = %q, want tok123", reloaded.AgentToken)
 	}
-	// The registration code is persisted so a restart without --code can
-	// still derive the PAT encryption key.
-	if reloaded.RegistrationCode != "regcode" {
-		t.Fatalf("persisted code = %q, want regcode", reloaded.RegistrationCode)
-	}
-}
-
-func TestAdoptTokenPersistsToken(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	st, err := loadState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := adoptToken(&st, path, "tok-abc", "regcode"); err != nil {
-		t.Fatalf("adoptToken: %v", err)
-	}
-	if st.AgentToken != "tok-abc" || st.RegistrationCode != "regcode" {
-		t.Fatalf("state = %+v, want token=tok-abc code=regcode", st)
-	}
-	reloaded, err := loadState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reloaded.AgentToken != "tok-abc" {
-		t.Fatalf("persisted token = %q, want tok-abc", reloaded.AgentToken)
-	}
-	// A second adoption must not clobber the registered identity.
-	if err := adoptToken(&reloaded, path, "other-tok", "other-code"); err != nil {
-		t.Fatalf("adoptToken again: %v", err)
-	}
-	if reloaded.AgentToken != "tok-abc" || reloaded.RegistrationCode != "regcode" {
-		t.Fatalf("state = %+v, want identity kept", reloaded)
-	}
-}
-
-func TestAdoptTokenNoOpWithoutFlag(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	st := &state{}
-	if err := adoptToken(st, path, "", "regcode"); err != nil {
-		t.Fatalf("adoptToken: %v", err)
-	}
-	if st.AgentToken != "" {
-		t.Fatalf("token = %q, want empty", st.AgentToken)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("state file written without a token: err = %v", err)
-	}
 }
 
 func TestRegisterWrongCode(t *testing.T) {
@@ -143,51 +87,6 @@ func TestRegisterWrongCode(t *testing.T) {
 	}
 }
 
-func TestSetPATDecryptsAndPersists(t *testing.T) {
-	code := "regcode"
-	key := agentcrypto.DeriveKey(code)
-	panel := newFakePanel(code, "tok")
-	defer panel.Close()
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "state.json")
-	fake := newFakeLinodeAPI()
-	a := newTestAgent(t, panel, fake, code, statePath)
-	a.st.AgentToken = "tok"
-	a.pc.token = "tok"
-
-	sealed, err := agentcrypto.Seal(key, []byte("pat-abc"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := pollCommand{ID: 1, Type: cmdSetPAT, Params: map[string]any{"sealed_pat": sealed}}
-	if err := a.execute(context.Background(), cmd); err != nil {
-		t.Fatalf("execute set_pat: %v", err)
-	}
-	if len(a.exec.pats) != 1 || a.exec.pats[0] != "pat-abc" {
-		t.Fatalf("pats = %v, want [pat-abc]", a.exec.pats)
-	}
-	// The state file must hold the sealed PAT encrypted at rest.
-	reloaded, err := loadState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reloaded.SealedPAT == "" {
-		t.Fatal("sealed PAT not persisted")
-	}
-	plain, err := agentcrypto.Open(key, reloaded.SealedPAT)
-	if err != nil || string(plain) != "pat-abc" {
-		t.Fatalf("reload open = %q err=%v, want pat-abc", plain, err)
-	}
-	// A final result must have been reported.
-	res := panel.lastResult()
-	if res == nil {
-		t.Fatal("no result reported")
-	}
-	if res["ok"] != true || res["command_id"] != float64(1) {
-		t.Fatalf("result = %v, want ok command 1", res)
-	}
-}
-
 func TestPollAndExecutePower(t *testing.T) {
 	code := "regcode"
 	panel := newFakePanel(code, "tok")
@@ -195,10 +94,8 @@ func TestPollAndExecutePower(t *testing.T) {
 	dir := t.TempDir()
 	fake := newFakeLinodeAPI()
 	fake.seed(42, "running")
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
-	a.exec.pats = []string{"pat-1"}
 
 	// Run the loop in the background.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -206,7 +103,7 @@ func TestPollAndExecutePower(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- a.run(ctx) }()
 
-	panel.enqueue("power", map[string]any{"action": "shutdown", "id": 42})
+	panel.enqueue("power", map[string]any{"action": "shutdown", "id": 42, "pat": "pat-1"})
 	if !waitFor(3*time.Second, func() bool { return panel.resultsCount() >= 1 }) {
 		t.Fatal("no result within timeout")
 	}
@@ -220,21 +117,16 @@ func TestPollAndExecutePower(t *testing.T) {
 	}
 }
 
-// TestAuthLossReregisters verifies that a 401 on poll clears the token and
-// re-registers using the stored registration code.
-func TestAuthLossReregisters(t *testing.T) {
+// TestAuthLossStops verifies that a 401 on poll stops the agent (no silent
+// token re-registration) and surfaces a fatal error.
+func TestAuthLossStops(t *testing.T) {
 	code := "regcode"
 	panel := newFakePanel(code, "tok")
 	defer panel.Close()
 	dir := t.TempDir()
-	statePath := filepath.Join(dir, "state.json")
 	fake := newFakeLinodeAPI()
-	a := newTestAgent(t, panel, fake, code, statePath)
-	a.st.AgentToken = "tok"
-	a.st.RegistrationCode = code
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
-	a.exec.pats = []string{"pat-1"}
-	a.code = code
 
 	// Revoke the token: poll returns 401.
 	panel.mu.Lock()
@@ -246,25 +138,19 @@ func TestAuthLossReregisters(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- a.run(ctx) }()
 
-	// The agent must re-register (register returns the token) and resume
-	// polling; once valid again, a queued command executes.
-	if !waitFor(3*time.Second, func() bool {
-		panel.mu.Lock()
-		defer panel.mu.Unlock()
-		return panel.regCalls >= 1
-	}) {
-		t.Fatal("agent did not re-register")
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "面板拒绝身份") {
+			t.Fatalf("err = %v, want panel rejection", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("agent did not stop on auth loss")
 	}
+	// It must not have tried to re-register.
 	panel.mu.Lock()
-	panel.validToken = true
-	panel.mu.Unlock()
-	panel.enqueue("power", map[string]any{"action": "reboot", "id": 42})
-	if !waitFor(3*time.Second, func() bool { return panel.resultsCount() >= 1 }) {
-		t.Fatal("no result after re-registration")
-	}
-	res := panel.lastResult()
-	if res["ok"] != true {
-		t.Fatalf("result = %v, want ok", res)
+	defer panel.mu.Unlock()
+	if panel.regCalls != 0 {
+		t.Fatalf("regCalls = %d, want 0 (no re-registration)", panel.regCalls)
 	}
 }
 
@@ -285,12 +171,10 @@ func TestListCommandAggregates(t *testing.T) {
 	fake := newFakeLinodeAPI()
 	fake.seed(1, "running")
 	fake.seed(2, "offline")
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
-	a.exec.pats = []string{"pat-1"}
 
-	cmd := pollCommand{ID: 5, Type: "list", Params: map[string]any{}}
+	cmd := pollCommand{ID: 5, Type: "list", Params: map[string]any{"pat": "pat-1"}}
 	if err := a.execute(context.Background(), cmd); err != nil {
 		t.Fatalf("execute list: %v", err)
 	}
@@ -305,30 +189,23 @@ func TestListCommandAggregates(t *testing.T) {
 	}
 }
 
-// TestListNoPATs verifies list with no local PAT returns an empty array (not
-// null / not an error).
-func TestListNoPATs(t *testing.T) {
+// TestListNoPAT verifies a list command without a PAT fails cleanly.
+func TestListNoPAT(t *testing.T) {
 	code := "regcode"
 	panel := newFakePanel(code, "tok")
 	defer panel.Close()
 	dir := t.TempDir()
 	fake := newFakeLinodeAPI()
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
-	// no pats
+
 	cmd := pollCommand{ID: 6, Type: "list", Params: map[string]any{}}
 	if err := a.execute(context.Background(), cmd); err != nil {
 		t.Fatalf("execute list: %v", err)
 	}
 	res := panel.lastResult()
-	if res["ok"] != true {
-		t.Fatalf("result = %v, want ok", res)
-	}
-	payload, _ := res["payload"].(map[string]any)
-	insts, ok := payload["instances"].([]any)
-	if !ok || len(insts) != 0 {
-		t.Fatalf("instances = %v (ok=%v), want empty array", insts, ok)
+	if res["ok"] != false {
+		t.Fatalf("result = %v, want not ok", res)
 	}
 }
 
@@ -336,19 +213,15 @@ func TestListNoPATs(t *testing.T) {
 // ok=false with a payload.progress string, distinct from the final result.
 func TestRebuildProgressReports(t *testing.T) {
 	code := "regcode"
-	key := agentcrypto.DeriveKey(code)
 	panel := newFakePanel(code, "tok")
 	defer panel.Close()
 	dir := t.TempDir()
 	fake := newFakeLinodeAPI()
 	fake.seed(7, "running")
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
-	a.exec.pats = []string{"pat-1"}
-	sealed, _ := agentcrypto.Seal(key, []byte("pat-1"))
 	cmd := pollCommand{ID: 11, Type: "rebuild", Params: map[string]any{
-		"id": 7, "script": "echo boot", "sealed_pat": sealed,
+		"id": 7, "script": "echo boot", "pat": "pat-1",
 	}}
 	if err := a.execute(context.Background(), cmd); err != nil {
 		t.Fatalf("execute rebuild: %v", err)
@@ -373,24 +246,17 @@ func TestRebuildProgressReports(t *testing.T) {
 
 func TestRebuildFullOrchestration(t *testing.T) {
 	code := "regcode"
-	key := agentcrypto.DeriveKey(code)
 	panel := newFakePanel(code, "tok")
 	defer panel.Close()
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
 	fake := newFakeLinodeAPI()
 	fake.seed(7, "running")
-	a := newTestAgent(t, panel, fake, code, statePath)
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, statePath)
 	a.pc.token = "tok"
-	a.exec.pats = []string{"pat-1"}
 
-	sealed, err := agentcrypto.Seal(key, []byte("pat-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	cmd := pollCommand{ID: 9, Type: "rebuild", Params: map[string]any{
-		"id": 7, "script": "echo boot", "reserved_ip": "203.0.113.50", "sealed_pat": sealed,
+		"id": 7, "script": "echo boot", "pat": "pat-1",
 	}}
 	if err := a.execute(context.Background(), cmd); err != nil {
 		t.Fatalf("execute rebuild: %v", err)
@@ -399,10 +265,10 @@ func TestRebuildFullOrchestration(t *testing.T) {
 	if res["ok"] != true {
 		t.Fatalf("result = %v, want ok", res)
 	}
-	// Verify the orchestration sequence: GetInstance, Shutdown, GetConfigID,
-	// UpdateConfigNetworkHelper, DeleteInstance, CreateInstance, Boot, etc.
+	// Verify the orchestration sequence: GetInstance, Shutdown, DeleteInstance,
+	// CreateInstance, GetInstanceIPs, etc.
 	seq := fake.sequence()
-	for _, want := range []string{"Shutdown", "DeleteInstance", "CreateInstance", "Boot", "GetInstanceIPs"} {
+	for _, want := range []string{"Shutdown", "DeleteInstance", "CreateInstance", "GetInstanceIPs"} {
 		if !contains(seq, want) {
 			t.Fatalf("sequence %v missing %s", seq, want)
 		}
@@ -429,18 +295,17 @@ func contains(s []string, v string) bool {
 	return false
 }
 
-func TestRebuildSealedPATError(t *testing.T) {
+func TestRebuildMissingPAT(t *testing.T) {
 	code := "regcode"
 	panel := newFakePanel(code, "tok")
 	defer panel.Close()
 	dir := t.TempDir()
 	fake := newFakeLinodeAPI()
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
 
 	cmd := pollCommand{ID: 3, Type: "rebuild", Params: map[string]any{
-		"id": 7, "script": "x", "sealed_pat": "not-valid-base64!",
+		"id": 7, "script": "x",
 	}}
 	if err := a.execute(context.Background(), cmd); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -521,8 +386,7 @@ func TestResultRetryAfterFailure(t *testing.T) {
 	defer panel.Close()
 	dir := t.TempDir()
 	fake := newFakeLinodeAPI()
-	a := newTestAgent(t, panel, fake, code, filepath.Join(dir, "state.json"))
-	a.st.AgentToken = "tok"
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
 	a.pc.token = "tok"
 
 	panel.mu.Lock()
@@ -575,67 +439,23 @@ func TestStateFileMode(t *testing.T) {
 	}
 }
 
-// --- power action across PATs (404/403 skip) ---
+// --- power action (single PAT) ---
 
-func TestPowerActionSkipsForbiddenPAT(t *testing.T) {
-	// First PAT returns 404; second succeeds.
+func TestPowerSinglePAT(t *testing.T) {
 	fake := newFakeLinodeAPI()
 	fake.seed(42, "running")
-	ex := &executor{
-		apiBase: "http://x",
-		sshPort: 22,
-		run:     func(ctx context.Context, h string, p int, k []byte, s string) error { return nil },
-		probe:   func(ctx context.Context, h string, p int) error { return nil },
-		log:     testLogger(),
+	ex := &agenthub.Executor{
+		APIBase: "http://x",
+		SSHPort: 22,
+		Run:     func(ctx context.Context, h string, p int, k []byte, s string) error { return nil },
+		Probe:   func(ctx context.Context, h string, p int) error { return nil },
+		Log:     testLogger(),
 	}
-	// Override newAPI: first call returns a 404 API, second the real fake.
-	calls := 0
-	var mu sync.Mutex
-	ex.newAPI = func(pat string) linodeAPI {
-		mu.Lock()
-		defer mu.Unlock()
-		calls++
-		if calls == 1 {
-			return &errLinodeAPI{err: &linode.APIError{StatusCode: 404}}
-		}
-		return fake
-	}
-	ex.pats = []string{"pat-bad", "pat-good"}
-	if err := ex.powerAction(context.Background(), "boot", 42); err != nil {
-		t.Fatalf("powerAction: %v", err)
+	ex.NewAPI = func(pat string) agenthub.LinodeAPI { return fake }
+	if err := ex.Power(context.Background(), "pat-good", "boot", 42); err != nil {
+		t.Fatalf("Power: %v", err)
 	}
 	if !fakeCalled(fake, "Boot") {
 		t.Fatal("fake did not Boot")
 	}
-}
-
-// errLinodeAPI always returns err for every method.
-type errLinodeAPI struct{ err error }
-
-func (e *errLinodeAPI) ListInstances(context.Context) ([]linode.Instance, error) { return nil, e.err }
-
-func (e *errLinodeAPI) GetInstance(context.Context, int) (linode.Instance, error) {
-	return linode.Instance{}, e.err
-}
-func (e *errLinodeAPI) Boot(context.Context, int) error     { return e.err }
-func (e *errLinodeAPI) Shutdown(context.Context, int) error { return e.err }
-func (e *errLinodeAPI) Reboot(context.Context, int) error   { return e.err }
-func (e *errLinodeAPI) GetInstanceIPs(context.Context, int) (linode.InstanceIPs, error) {
-	return linode.InstanceIPs{}, e.err
-}
-
-func (e *errLinodeAPI) CreateInstance(context.Context, linode.CreateOptions) (linode.Instance, error) {
-	return linode.Instance{}, e.err
-}
-func (e *errLinodeAPI) DeleteInstance(context.Context, int) error { return e.err }
-func (e *errLinodeAPI) GetConfigID(context.Context, int) (int, error) {
-	return 0, e.err
-}
-
-func (e *errLinodeAPI) UpdateConfigNetworkHelper(context.Context, int, int, bool) error {
-	return e.err
-}
-func (e *errLinodeAPI) AssignIP(context.Context, string, string, int) error { return e.err }
-func (e *errLinodeAPI) AttachAllowAllFirewall(context.Context, string, int) error {
-	return e.err
 }

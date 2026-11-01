@@ -21,19 +21,15 @@ type fakeAPI struct {
 	mu    sync.Mutex
 	calls []string
 
-	listInstances   func(context.Context) ([]linode.Instance, error)
-	getInstance     func(context.Context, int) (linode.Instance, error)
-	boot            func(context.Context, int) error
-	shutdown        func(context.Context, int) error
-	reboot          func(context.Context, int) error
-	getIPs          func(context.Context, int) (linode.InstanceIPs, error)
-	listSSHKeys     func(context.Context) ([]linode.SSHKey, error)
-	createInstance  func(context.Context, linode.CreateOptions) (linode.Instance, error)
-	deleteInstance  func(context.Context, int) error
-	getConfigID     func(context.Context, int) (int, error)
-	updateNetHelper func(context.Context, int, int, bool) error
-	assignIP        func(context.Context, string, string, int) error
-	attachFirewall  func(context.Context, string, int) error
+	listInstances  func(context.Context) ([]linode.Instance, error)
+	getInstance    func(context.Context, int) (linode.Instance, error)
+	boot           func(context.Context, int) error
+	shutdown       func(context.Context, int) error
+	reboot         func(context.Context, int) error
+	getIPs         func(context.Context, int) (linode.InstanceIPs, error)
+	createInstance func(context.Context, linode.CreateOptions) (linode.Instance, error)
+	deleteInstance func(context.Context, int) error
+	attachFirewall func(context.Context, string, int) error
 }
 
 func (f *fakeAPI) record(name string) {
@@ -101,14 +97,6 @@ func (f *fakeAPI) GetInstanceIPs(ctx context.Context, id int) (linode.InstanceIP
 	return linode.InstanceIPs{}, nil
 }
 
-func (f *fakeAPI) ListSSHKeys(ctx context.Context) ([]linode.SSHKey, error) {
-	f.record("ListSSHKeys")
-	if f.listSSHKeys != nil {
-		return f.listSSHKeys(ctx)
-	}
-	return nil, nil
-}
-
 func (f *fakeAPI) CreateInstance(ctx context.Context, opts linode.CreateOptions) (linode.Instance, error) {
 	f.record("CreateInstance")
 	if f.createInstance != nil {
@@ -121,30 +109,6 @@ func (f *fakeAPI) DeleteInstance(ctx context.Context, id int) error {
 	f.record("DeleteInstance")
 	if f.deleteInstance != nil {
 		return f.deleteInstance(ctx, id)
-	}
-	return nil
-}
-
-func (f *fakeAPI) GetConfigID(ctx context.Context, id int) (int, error) {
-	f.record("GetConfigID")
-	if f.getConfigID != nil {
-		return f.getConfigID(ctx, id)
-	}
-	return 1, nil
-}
-
-func (f *fakeAPI) UpdateConfigNetworkHelper(ctx context.Context, id, configID int, enabled bool) error {
-	f.record("UpdateConfigNetworkHelper")
-	if f.updateNetHelper != nil {
-		return f.updateNetHelper(ctx, id, configID, enabled)
-	}
-	return nil
-}
-
-func (f *fakeAPI) AssignIP(ctx context.Context, region, address string, linodeID int) error {
-	f.record("AssignIP")
-	if f.assignIP != nil {
-		return f.assignIP(ctx, region, address, linodeID)
 	}
 	return nil
 }
@@ -314,6 +278,50 @@ func TestActionPassthrough(t *testing.T) {
 	}
 }
 
+func TestDeleteInstance(t *testing.T) {
+	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{
+		"pat1": {{ID: 7, Label: "web", Status: "running", IPv4: []string{"10.0.0.1"}}},
+	})
+	addAliceToken(t, srv, "main", "pat1")
+	tokID := srv.Store.TokensOf(aliceID)[0].ID
+	path := "/api/instances/7?token_id=" + strconv.Itoa(tokID)
+
+	// 先列出一次以填充该账号的缓存快照。
+	wantStatus(t, authedGet(t, srv, cookie, "/api/instances"), http.StatusOK)
+	if cached := srv.Store.CachedInstances(tokID); len(cached) != 1 {
+		t.Fatalf("cached before delete = %d, want 1", len(cached))
+	}
+
+	rr := authedDelete(t, srv, cookie, path)
+	wantStatus(t, rr, http.StatusOK)
+	var resp struct {
+		OK bool `json:"ok"`
+	}
+	decodeJSON(t, rr, &resp)
+	if !resp.OK {
+		t.Fatalf("ok = false")
+	}
+	// 删除后应清空该实例的缓存，列表不再展示。
+	if cached := srv.Store.CachedInstances(tokID); len(cached) != 0 {
+		t.Fatalf("cached after delete = %d, want 0", len(cached))
+	}
+}
+
+func TestDeleteInstanceNotFound(t *testing.T) {
+	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{"pat1": {}})
+	addAliceToken(t, srv, "main", "pat1")
+	tokID := srv.Store.TokensOf(aliceID)[0].ID
+	rr := authedDelete(t, srv, cookie, "/api/instances/99?token_id="+strconv.Itoa(tokID))
+	wantStatus(t, rr, http.StatusNotFound)
+}
+
+func TestDeleteInstanceInvalidID(t *testing.T) {
+	srv, cookie := linodeServerFor(t, map[string][]linode.Instance{"pat1": {}})
+	addAliceToken(t, srv, "main", "pat1")
+	rr := authedDelete(t, srv, cookie, "/api/instances/abc")
+	wantStatus(t, rr, http.StatusBadRequest)
+}
+
 func TestStatusReady(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -411,38 +419,6 @@ func TestStatusIPv6Fallback(t *testing.T) {
 	}
 	if resp.SSHReady {
 		t.Fatal("ssh_ready = true; IPv6 SLAAC not routable here, should probe fail (or skip)")
-	}
-}
-
-func TestListSSHKeys(t *testing.T) {
-	// SSH keys come from the Linode profile; the fake server returns an empty
-	// list for the default route, so use a dedicated server.
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []linode.SSHKey{{ID: 1, Label: "laptop", SSHKey: "ssh-ed25519 AAAA user@host", Created: "2024-01-01T00:00:00"}},
-			"page": 1, "pages": 1,
-		})
-	}))
-	t.Cleanup(ts.Close)
-	srv := testServer(t, &fakeAPI{})
-	srv.APIBase = ts.URL
-	addAliceToken(t, srv, "main", "pat1")
-	cookie := loginAlice(t, srv)
-	rr := authedGet(t, srv, cookie, "/api/ssh-keys")
-	wantStatus(t, rr, http.StatusOK)
-	var resp struct {
-		Keys []struct {
-			ID      int    `json:"id"`
-			Label   string `json:"label"`
-			Key     string `json:"key"`
-			Created string `json:"created"`
-		} `json:"keys"`
-	}
-	decodeJSON(t, rr, &resp)
-	if len(resp.Keys) != 1 || resp.Keys[0].ID != 1 || resp.Keys[0].Label != "laptop" ||
-		resp.Keys[0].Key != "ssh-ed25519 AAAA user@host" || resp.Keys[0].Created != "2024-01-01T00:00:00" {
-		t.Fatalf("unexpected keys: %+v", resp.Keys)
 	}
 }
 

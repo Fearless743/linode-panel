@@ -39,7 +39,7 @@ function stopTimer(st) {
   }
 }
 
-export default function useInstancePolling({ findInstance, showBanner }) {
+export default function useInstancePolling({ findInstance, showBanner, onInstanceMissing }) {
   const rowStates = useRef(new Map());
   const [, setTick] = useState(0);
 
@@ -64,6 +64,13 @@ export default function useInstancePolling({ findInstance, showBanner }) {
         const tokenId = inst && inst.token_id != null ? inst.token_id : "";
         data = await getInstanceStatus(id, tokenId);
       } catch (err) {
+        // 404：实例已在上游不存在（被删除/替换），停止轮询并从列表移除。
+        if (err && err.status === 404) {
+          stopTimer(st);
+          if (onInstanceMissing) onInstanceMissing(id);
+          showBanner("该实例在 Linode 已不存在，已从列表移除", false);
+          return;
+        }
         showBanner(err.message || "状态查询失败", false);
         return;
       }
@@ -109,7 +116,7 @@ export default function useInstancePolling({ findInstance, showBanner }) {
         st.startedAt = 0;
       }
     },
-    [getRowState, bump, findInstance, showBanner]
+    [getRowState, bump, findInstance, showBanner, onInstanceMissing]
   );
 
   // 开始轮询：立即查询一次，随后每 POLL_INTERVAL_MS 查询一次。

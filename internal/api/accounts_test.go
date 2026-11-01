@@ -12,6 +12,33 @@ import (
 	"linode-panel/internal/linode"
 )
 
+// accountHealthAPI mocks GET /account per PAT, returning different balances or
+// errors so the health snapshot in handleListMyTokens can be verified.
+func accountHealthAPI(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/account" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"errors":[{"reason":"not found"}]}`)
+			return
+		}
+		pat := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch pat {
+		case "pat_ok":
+			_, _ = io.WriteString(w, `{"balance":-1.5,"balance_uninvoiced":0}`)
+		case "pat_nobalance":
+			_, _ = io.WriteString(w, `{"balance":2.0,"balance_uninvoiced":0}`)
+		case "pat_banned":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"errors":[{"reason":"Account suspended"}]}`)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"errors":[{"reason":"internal"}]}`)
+		}
+	}))
+}
+
 // mockLinodeAPI serves minimal /regions /linode/types /images and
 // POST /linode/instances responses for clientFor-backed handlers, plus the
 // Cloud Firewall endpoints so the default allow-all attach succeeds.
@@ -107,6 +134,76 @@ func TestAccountTokensHTTP(t *testing.T) {
 	}
 }
 
+func TestAccountTokensWithHealth(t *testing.T) {
+	mock := accountHealthAPI(t)
+	defer mock.Close()
+	h := newRebuildHarness(t)
+	srv, session := rebuildServer(t, h)
+	srv.APIBase = mock.URL
+
+	// 为 admin 绑定 4 个不同状态的 PAT。
+	for _, p := range []struct {
+		label string
+		pat   string
+	}{
+		{"ok", "pat_ok"},
+		{"no_balance", "pat_nobalance"},
+		{"banned", "pat_banned"},
+		{"error", "pat_unknown"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/account/tokens",
+			bytes.NewBufferString(`{"label":"`+p.label+`","token":"`+p.pat+`"}`))
+		authed(req, session)
+		srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/account/tokens", nil)
+	authed(req, session)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	wantStatus(t, rr, http.StatusOK)
+
+	var list struct {
+		Tokens []tokenJSON `json:"tokens"`
+	}
+	decodeJSON(t, rr, &list)
+	if len(list.Tokens) != 5 {
+		t.Fatalf("tokens = %d, want 5 (body=%s)", len(list.Tokens), rr.Body.String())
+	}
+
+	wantStatusByLabel := map[string]string{
+		"ok":         HealthOK,
+		"no_balance": HealthNoBalance,
+		"banned":     HealthBanned,
+		"error":      HealthError,
+	}
+	for _, tok := range list.Tokens {
+		want, found := wantStatusByLabel[tok.Label]
+		if !found {
+			// test-token 没有 mock 的 /account 路由 → 404 → error
+			if tok.Label != "test-token" {
+				t.Fatalf("unexpected label %q", tok.Label)
+			}
+			if tok.HealthStatus != HealthError {
+				t.Fatalf("test-token: health_status = %q, want %q", tok.HealthStatus, HealthError)
+			}
+			continue
+		}
+		if tok.HealthStatus != want {
+			t.Fatalf("label=%q: health_status = %q, want %q (detail=%q)", tok.Label, tok.HealthStatus, want, tok.HealthDetail)
+		}
+		if tok.HealthCheckedAt == "" {
+			t.Fatalf("label=%q: health_checked_at empty", tok.Label)
+		}
+		if want == HealthOK && (tok.Balance != -1.5 || tok.BalanceUninvoiced != 0) {
+			t.Fatalf("label=ok: balance=%.2f uninvoiced=%.2f, want -1.5/0", tok.Balance, tok.BalanceUninvoiced)
+		}
+		if want == HealthNoBalance && tok.Balance != 2.0 {
+			t.Fatalf("label=no_balance: balance = %.2f, want 2.0", tok.Balance)
+		}
+	}
+}
+
 // TestAccountOptionsAndCreateHTTP covers create-instance option loading and
 // instance creation against a mocked Linode API.
 func TestAccountOptionsAndCreateHTTP(t *testing.T) {
@@ -168,6 +265,10 @@ func TestAccountOptionsAndCreateHTTP(t *testing.T) {
 	if got, ok := srv.Store.InstanceScript(100); !ok || got != "#!/usr/bin/env bash\necho hi" {
 		t.Fatalf("InstanceScript(100) = %q, %v; want saved script", got, ok)
 	}
+	// root 密码也保存为该实例配置，供重建时继承。
+	if got, ok := srv.Store.InstanceRootPassword(100); !ok || got != "Secret123!" {
+		t.Fatalf("InstanceRootPassword(100) = %q, %v; want saved password", got, ok)
+	}
 
 	// 不填脚本（或全空白）时不清除已有配置。
 	req4 := httptest.NewRequest(http.MethodPost, "/api/account/instances",
@@ -179,4 +280,39 @@ func TestAccountOptionsAndCreateHTTP(t *testing.T) {
 	if got, ok := srv.Store.InstanceScript(100); !ok || got != "#!/usr/bin/env bash\necho hi" {
 		t.Fatalf("after blank script, InstanceScript(100) = %q, %v; want unchanged", got, ok)
 	}
+
+	// 首次请求已把 options 快照写入缓存，可直接读出。
+	if snap := srv.Store.CachedAccountOptions(1); snap == nil {
+		t.Fatalf("CachedAccountOptions(1) = nil; want cached snapshot")
+	}
+
+	// 关闭 mock 后再次读取：命中数据库缓存，不再请求 Linode API。
+	mock.Close()
+	req5 := httptest.NewRequest(http.MethodGet, "/api/account/options?token_id=1", nil)
+	authed(req5, session)
+	rr5 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr5, req5)
+	wantStatus(t, rr5, http.StatusOK)
+	var opts5 struct {
+		Regions []linode.Region     `json:"regions"`
+		Types   []linode.LinodeType `json:"types"`
+		Images  []linode.Image      `json:"images"`
+	}
+	decodeJSON(t, rr5, &opts5)
+	if len(opts5.Regions) != 4 || len(opts5.Types) != 3 || len(opts5.Images) != 3 {
+		t.Fatalf("cached opts = regions=%d types=%d images=%d; want 4/3/3", len(opts5.Regions), len(opts5.Types), len(opts5.Images))
+	}
+	// 命中缓存时同样按 country 升序（同国按 id）返回，与实时拉取路径一致。
+	for i, want := range wantRegionIDs {
+		if opts5.Regions[i].ID != want {
+			t.Fatalf("cached regions[%d] = %q, want %q (sorted)", i, opts5.Regions[i].ID, want)
+		}
+	}
+
+	// ?refresh=1 绕过缓存（mock 已关闭，必然失败）。
+	req6 := httptest.NewRequest(http.MethodGet, "/api/account/options?token_id=1&refresh=1", nil)
+	authed(req6, session)
+	rr6 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr6, req6)
+	wantStatus(t, rr6, http.StatusBadGateway)
 }

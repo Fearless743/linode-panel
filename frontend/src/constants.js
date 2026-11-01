@@ -19,6 +19,14 @@ export const STATUS_LABELS = {
   shutting_down: "关机中",
 };
 
+// 账号健康状态（GET /api/account/tokens 返回的 health_status）。
+export const HEALTH_STATUS_LABELS = {
+  ok: "正常",
+  no_balance: "余额不足",
+  banned: "封禁",
+  error: "检测失败",
+};
+
 export const TRANSITION_STATES = new Set([
   "booting",
   "rebooting",
@@ -40,7 +48,7 @@ export const AGENT_POLL_INTERVAL_MS = 5000;
 export const ACTION_LABELS = { boot: "开机", shutdown: "关机", reboot: "重启" };
 
 // ---------- 命令 / 任务状态 ----------
-export const COMMAND_TYPE_LABELS = { list: "列出实例", power: "电源操作", rebuild: "重建" };
+export const COMMAND_TYPE_LABELS = { list: "列出实例", power: "电源操作", rebuild: "重建", delete: "删除实例" };
 export const COMMAND_STATUS_LABELS = {
   queued: "排队中",
   in_flight: "执行中",
@@ -54,7 +62,6 @@ export const API_PATHS = {
   authLogout: "/api/auth/logout",
   instances: "/api/instances",
   instanceStatus: (id) => "/api/instances/" + id + "/status",
-  sshKeys: "/api/ssh-keys",
   rebuildTasks: "/api/rebuild/tasks",
   users: "/api/users",
   groups: "/api/groups",

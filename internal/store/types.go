@@ -40,16 +40,25 @@
 //	// agent registration code
 //	func (s *Store) RegCode() string
 //	func (s *Store) SetRegCode(code string) error
-//	// per-instance boot scripts
+//	// per-instance boot scripts (keyed internally by the stable cache id)
 //	func (s *Store) InstanceScript(instanceID int) (string, bool)
 //	func (s *Store) SetInstanceScript(instanceID int, script string) error
 //	func (s *Store) DeleteInstanceScript(instanceID int) error
 //	func (s *Store) InstanceScriptIDs() []int
-//	// per-token instance cache
+//	// per-instance root password (used when creating a replacement instance)
+//	func (s *Store) InstanceRootPassword(instanceID int) (string, bool)
+//	func (s *Store) InstanceRootPasswordConfigured(instanceID int) bool
+//	func (s *Store) SetInstanceRootPassword(instanceID int, password string) error
+//	func (s *Store) DeleteInstanceRootPassword(instanceID int) error
+//	// per-token instance cache with a stable auto-increment id
 //	func (s *Store) CacheInstances(tokenID int, insts []linode.Instance) error
 //	func (s *Store) CachedInstances(tokenID int) []linode.Instance
 //	func (s *Store) InvalidateInstanceCache(tokenID int) error
 //	func (s *Store) UpsertInstanceCache(tokenID int, inst linode.Instance) error
+//	func (s *Store) InstanceCacheStale(tokenID int) bool
+//	// RepointInstanceCache makes a rebuilt instance inherit the stable cache
+//	// row (and thus all per-instance configuration) under a new Linode id.
+//	func (s *Store) RepointInstanceCache(oldID, newID int) error
 package store
 
 import "time"

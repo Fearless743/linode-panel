@@ -13,7 +13,6 @@ import Layout from "./components/Layout";
 // 页面懒加载：每页单独 chunk，按需加载。
 const Login = lazy(() => import("./pages/Login"));
 const Instances = lazy(() => import("./pages/Instances"));
-const SSHKeys = lazy(() => import("./pages/SSHKeys"));
 const Tasks = lazy(() => import("./pages/Tasks"));
 const Users = lazy(() => import("./pages/Users"));
 const Agents = lazy(() => import("./pages/Agents"));
@@ -26,7 +25,6 @@ const PAGE_TITLES = {
   "/": "实例",
   "/accounts": "账号管理",
   "/account-groups": "账号组",
-  "/ssh-keys": "SSH 公钥",
   "/tasks": "重建任务",
   "/users": "用户管理",
   "/agents": "Agent",
@@ -60,7 +58,6 @@ export default function App() {
           <Route element={<RequireAuth />}>
             <Route element={<Layout />}>
               <Route index element={<Instances />} />
-              <Route path="/ssh-keys" element={<SSHKeys />} />
               <Route path="/tasks" element={<Tasks />} />
               <Route path="/users" element={<Users />} />
               <Route path="/agents" element={<Agents />} />

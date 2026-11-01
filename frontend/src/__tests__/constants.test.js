@@ -64,7 +64,12 @@ describe("ACTION_LABELS / COMMAND 标签", () => {
   });
 
   it("命令类型标签完整", () => {
-    expect(COMMAND_TYPE_LABELS).toEqual({ list: "列出实例", power: "电源操作", rebuild: "重建" });
+    expect(COMMAND_TYPE_LABELS).toEqual({
+      list: "列出实例",
+      power: "电源操作",
+      rebuild: "重建",
+      delete: "删除实例",
+    });
   });
 
   it("命令状态标签完整", () => {
@@ -83,7 +88,6 @@ describe("API_PATHS", () => {
     expect(API_PATHS.authLogout).toBe("/api/auth/logout");
     expect(API_PATHS.instances).toBe("/api/instances");
     expect(API_PATHS.instanceStatus("i1")).toBe("/api/instances/i1/status");
-    expect(API_PATHS.sshKeys).toBe("/api/ssh-keys");
     expect(API_PATHS.rebuildTasks).toBe("/api/rebuild/tasks");
     expect(API_PATHS.users).toBe("/api/users");
     expect(API_PATHS.groups).toBe("/api/groups");

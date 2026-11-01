@@ -262,7 +262,7 @@ func (m *AutoRebuildMonitor) triggerRebuild(ctx context.Context, cfg store.AutoR
 		m.log.Warn("自动换IP: 取 PAT 失败，暂不重建", "instance_id", id, "error", err)
 		return
 	}
-	taskID, err := m.srv.Tasks.Start(id, m.srv.rebuildScriptFor(id), "", pat, "自动换IP")
+	taskID, err := m.srv.Tasks.Start(id, m.srv.rebuildScriptFor(id), m.srv.rootPasswordFor(id), pat, "自动换IP")
 	if err != nil {
 		if errors.Is(err, ErrBusy) {
 			m.log.Info("自动换IP: 已有重建任务进行中，等待下一轮", "instance_id", id)
@@ -282,34 +282,38 @@ func (m *AutoRebuildMonitor) triggerRebuild(ctx context.Context, cfg store.AutoR
 	m.log.Info("自动换IP: 已触发重建", "instance_id", id, "ip", ip, "task_id", taskID)
 	_ = m.srv.Store.UpdateAutoRebuildState(id, 0, "rebuilding",
 		"被墙，已触发重建换 IP（"+ip+"）", m.now(), m.now(), taskID)
-	go m.awaitRebuild(id, taskID)
+	go m.awaitRebuild(cfg, taskID)
 }
 
-// awaitRebuild polls the rebuild task until it finishes, then re-points the
-// instance's auto-rebuild config at the freshly created instance.
-func (m *AutoRebuildMonitor) awaitRebuild(oldID int, taskID string) {
+// awaitRebuild polls the rebuild task until it finishes. Configuration is
+// keyed by the instance's stable cache id, so it follows the replacement
+// instance automatically; only the monitor state needs to be updated.
+func (m *AutoRebuildMonitor) awaitRebuild(cfg store.AutoRebuild, taskID string) {
 	for {
 		t, err := m.srv.Tasks.Get(taskID)
 		if err != nil {
 			return
 		}
-		if t.Status != StatusRunning {
-			if t.NewInstanceID > 0 && t.NewInstanceID != oldID {
-				if err := m.srv.Store.MoveAutoRebuild(oldID, t.NewInstanceID); err != nil {
-					m.log.Warn("自动换IP: 迁移配置失败", "from", oldID, "to", t.NewInstanceID, "error", err)
-				} else {
-					m.log.Info("自动换IP: 配置已迁移到新实例", "from", oldID, "to", t.NewInstanceID)
-				}
-			}
-			if t.Status == StatusFailed {
-				// Keep the config so the monitor retries, but clear the fail
-				// counter so it does not rebuild again immediately.
-				_ = m.srv.Store.UpdateAutoRebuildState(oldID, 0, "error",
-					"重建失败: "+t.Err, m.now(), "", "")
-			}
+		if t.Status == StatusRunning {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		// Defensive: the direct rebuild path re-points the cache row as soon
+		// as the new instance exists. Do it here too in case this task was
+		// executed through an agent that did not report the id.
+		if t.NewInstanceID > 0 && t.NewInstanceID != cfg.InstanceID {
+			m.srv.repointInstanceCache(cfg.InstanceID, t.NewInstanceID)
+		}
+		if t.Status == StatusFailed {
+			// Keep the config so the monitor retries, but clear the fail
+			// counter so it does not rebuild again immediately.
+			_ = m.srv.Store.UpdateAutoRebuildStateByCache(cfg.CacheID, 0, "error",
+				"重建失败: "+t.Err, m.now(), "", "")
 			return
 		}
-		time.Sleep(5 * time.Second)
+		_ = m.srv.Store.UpdateAutoRebuildStateByCache(cfg.CacheID, 0, "idle",
+			"重建完成，等待下一轮检测", m.now(), "", "")
+		return
 	}
 }
 

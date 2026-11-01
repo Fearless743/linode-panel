@@ -160,40 +160,6 @@ func TestClient_GetInstanceIPs(t *testing.T) {
 	}
 }
 
-// TestClient_ListSSHKeys checks decoding and pagination for SSH keys.
-func TestClient_ListSSHKeys(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		if r.Method != http.MethodGet || r.URL.Path != "/profile/sshkeys" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		if got := r.URL.Query().Get("page_size"); got != "500" {
-			t.Errorf("page_size = %q, want 500", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"data":[{"id":9,"label":"laptop","ssh_key":"ssh-ed25519 AAAA user@host","created":"2024-01-01T00:00:00"}],"page":1,"pages":1}`)
-	}))
-	defer srv.Close()
-
-	c := New("t")
-	c.BaseURL = srv.URL
-	keys, err := c.ListSSHKeys(context.Background())
-	if err != nil {
-		t.Fatalf("ListSSHKeys error: %v", err)
-	}
-	if calls.Load() != 1 {
-		t.Errorf("expected 1 request, got %d", calls.Load())
-	}
-	if len(keys) != 1 {
-		t.Fatalf("got %d keys, want 1", len(keys))
-	}
-	k := keys[0]
-	if k.ID != 9 || k.Label != "laptop" || k.SSHKey != "ssh-ed25519 AAAA user@host" || k.Created != "2024-01-01T00:00:00" {
-		t.Errorf("unexpected key: %+v", k)
-	}
-}
-
 // TestClient_ActionMethods table-drives boot/shutdown/reboot.
 func TestClient_ActionMethods(t *testing.T) {
 	cases := []struct {
@@ -391,14 +357,32 @@ func TestClient_CreateFirewall(t *testing.T) {
 	if gotAuth != "Bearer t" {
 		t.Errorf("Authorization = %q", gotAuth)
 	}
-	if gotBody["region"] != "us-east" || gotBody["label"] != AllowAllFirewallLabel {
+	if gotBody["region"] != "us-east" || gotBody["label"] != allowAllFirewallLabel("us-east") {
 		t.Errorf("body = %v", gotBody)
+	}
+	// The label must be region-scoped: a fixed label collides as soon as a
+	// second region creates its own allow-all firewall.
+	if allowAllFirewallLabel("us-east") == allowAllFirewallLabel("ap-northeast") {
+		t.Error("firewall label is not region-scoped")
+	}
+	if allowAllFirewallLabel("us-east") == AllowAllFirewallLabel {
+		t.Error("firewall label must differ from the legacy region-less label")
+	}
+	// The label must also fit the API's 3-32 character limit for the longest
+	// region ids (Regions like "us-southeast" pushed a longer prefix over it).
+	for _, region := range []string{"us-east", "us-southeast", "ap-northeast", "ca-central"} {
+		if l := allowAllFirewallLabel(region); len(l) < 3 || len(l) > 32 {
+			t.Errorf("allowAllFirewallLabel(%q) = %q (%d chars), want 3-32", region, l, len(l))
+		}
 	}
 	tags, _ := gotBody["tags"].([]any)
 	if len(tags) != 1 || tags[0] != AllowAllFirewallTag {
 		t.Errorf("tags = %v", gotBody["tags"])
 	}
 	rules, _ := gotBody["rules"].(map[string]any)
+	if rules["inbound_policy"] != "ACCEPT" || rules["outbound_policy"] != "ACCEPT" {
+		t.Errorf("rules policies = %v, want ACCEPT/ACCEPT", rules)
+	}
 	for _, dir := range []string{"inbound", "outbound"} {
 		list, _ := rules[dir].([]any)
 		if len(list) != 3 {
@@ -472,6 +456,136 @@ func TestClient_EnsureAllowAllFirewallCreates(t *testing.T) {
 	}
 }
 
+// TestClient_EnsureAllowAllFirewallReusesByLabel checks a firewall in the region
+// whose label matches (but whose tag was stripped) is reused, not recreated.
+func TestClient_EnsureAllowAllFirewallReusesByLabel(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
+			fmt.Fprint(w, `{"data":[{"id":11,"label":"linode-panel-allow-all-us-east","region":"us-east","tags":[]}],"page":1,"pages":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
+			posts.Add(1)
+			fmt.Fprint(w, `{"id":99,"region":"us-east"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("t")
+	c.BaseURL = srv.URL
+	id, err := c.EnsureAllowAllFirewall(context.Background(), "us-east")
+	if err != nil {
+		t.Fatalf("EnsureAllowAllFirewall error: %v", err)
+	}
+	if id != 11 || posts.Load() != 0 {
+		t.Errorf("id = %d posts = %d, want 11 / 0", id, posts.Load())
+	}
+}
+
+// TestClient_EnsureAllowAllFirewallAdoptsLegacyLabel checks a firewall created
+// by an older panel version (region-less label, no tag) in the same region is
+// adopted instead of colliding on create.
+func TestClient_EnsureAllowAllFirewallAdoptsLegacyLabel(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
+			fmt.Fprint(w, `{"data":[{"id":12,"label":"linode-panel-allow-all","region":"us-east","tags":[]}],"page":1,"pages":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
+			posts.Add(1)
+			fmt.Fprint(w, `{"id":99,"region":"us-east"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("t")
+	c.BaseURL = srv.URL
+	id, err := c.EnsureAllowAllFirewall(context.Background(), "us-east")
+	if err != nil {
+		t.Fatalf("EnsureAllowAllFirewall error: %v", err)
+	}
+	if id != 12 || posts.Load() != 0 {
+		t.Errorf("id = %d posts = %d, want 12 / 0", id, posts.Load())
+	}
+}
+
+// TestClient_EnsureAllowAllFirewallCreatesForOtherRegion is the regression test
+// for the reported 400: an allow-all firewall already exists in another region,
+// so a request for a different region must create a region-scoped label rather
+// than reusing the account-unique bare label.
+func TestClient_EnsureAllowAllFirewallCreatesForOtherRegion(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
+			fmt.Fprint(w, `{"data":[{"id":9,"label":"linode-panel-allow-all-us-west","region":"us-west","tags":["linode-panel-allow-all"]}],"page":1,"pages":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			fmt.Fprint(w, `{"id":42,"region":"ap-northeast"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("t")
+	c.BaseURL = srv.URL
+	id, err := c.EnsureAllowAllFirewall(context.Background(), "ap-northeast")
+	if err != nil {
+		t.Fatalf("EnsureAllowAllFirewall error: %v", err)
+	}
+	if id != 42 {
+		t.Errorf("id = %d, want 42 (created in ap-northeast)", id)
+	}
+	if gotBody["label"] != allowAllFirewallLabel("ap-northeast") {
+		t.Errorf("create label = %v, want %q", gotBody["label"], allowAllFirewallLabel("ap-northeast"))
+	}
+}
+
+// TestClient_EnsureAllowAllFirewallRaceReuses checks a duplicate-label 400 on
+// create re-lists and reuses the firewall that won the race.
+func TestClient_EnsureAllowAllFirewallRaceReuses(t *testing.T) {
+	var lists atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
+			if lists.Add(1) == 1 {
+				fmt.Fprint(w, `{"data":[],"page":1,"pages":1}`)
+				return
+			}
+			fmt.Fprint(w, `{"data":[{"id":55,"label":"linode-panel-allow-all-ap-northeast","region":"ap-northeast","tags":["linode-panel-allow-all"]}],"page":1,"pages":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"errors":[{"reason":"Label must be unique among your Cloud Firewalls."}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("t")
+	c.BaseURL = srv.URL
+	id, err := c.EnsureAllowAllFirewall(context.Background(), "ap-northeast")
+	if err != nil {
+		t.Fatalf("EnsureAllowAllFirewall error: %v", err)
+	}
+	if id != 55 {
+		t.Errorf("id = %d, want 55 (reused after duplicate-label 400)", id)
+	}
+}
+
 // TestClient_AttachAllowAllFirewallAttaches drives ensure + device list + POST.
 func TestClient_AttachAllowAllFirewallAttaches(t *testing.T) {
 	var gotPath, gotMethod string
@@ -502,7 +616,7 @@ func TestClient_AttachAllowAllFirewallAttaches(t *testing.T) {
 	if gotMethod != http.MethodPost || gotPath != "/networking/firewalls/9/devices" {
 		t.Errorf("attach request = %s %s", gotMethod, gotPath)
 	}
-	if gotBody["linode_id"] != float64(99) {
+	if gotBody["id"] != float64(99) || gotBody["type"] != "linode" {
 		t.Errorf("attach body = %v", gotBody)
 	}
 }

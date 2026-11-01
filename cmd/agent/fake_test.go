@@ -6,12 +6,18 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"linode-panel/internal/linode"
 )
+
+// itoa is a local copy for test use.
+func itoa(n int) string {
+	return strconv.Itoa(n)
+}
 
 // --- fakePanel: httptest server speaking the frozen agent protocol ---
 
@@ -272,31 +278,6 @@ func (f *fakeLinodeAPI) DeleteInstance(_ context.Context, id int) error {
 	defer f.mu.Unlock()
 	delete(f.instances, id)
 	delete(f.status, id)
-	return nil
-}
-
-func (f *fakeLinodeAPI) GetConfigID(_ context.Context, id int) (int, error) {
-	f.record("GetConfigID")
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, ok := f.instances[id]; !ok {
-		return 0, &linode.APIError{StatusCode: 404}
-	}
-	return 1, nil
-}
-
-func (f *fakeLinodeAPI) UpdateConfigNetworkHelper(_ context.Context, id, configID int, enabled bool) error {
-	f.record("UpdateConfigNetworkHelper")
-	return nil
-}
-
-func (f *fakeLinodeAPI) AssignIP(_ context.Context, region, address string, linodeID int) error {
-	f.record("AssignIP")
-	return nil
-}
-
-func (f *fakeLinodeAPI) AttachAllowAllFirewall(_ context.Context, region string, linodeID int) error {
-	f.record("AttachAllowAllFirewall")
 	return nil
 }
 

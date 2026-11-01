@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -617,6 +618,34 @@ func TestInstanceCacheUpsert(t *testing.T) {
 	}
 }
 
+func TestInstanceCacheRemove(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{
+		{ID: 1, Label: "web"},
+		{ID: 2, Label: "db"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CacheInstances(8, []linode.Instance{{ID: 2, Label: "other"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Remove one instance from one token only.
+	if err := s.RemoveInstanceCache(7, 2); err != nil {
+		t.Fatalf("RemoveInstanceCache: %v", err)
+	}
+	got := s.CachedInstances(7)
+	if len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("token 7 cache = %+v, want only instance 1", got)
+	}
+	if got := s.CachedInstances(8); len(got) != 1 || got[0].ID != 2 {
+		t.Fatalf("token 8 cache should be unaffected: %+v", got)
+	}
+	// Removing a missing instance is a no-op.
+	if err := s.RemoveInstanceCache(7, 999); err != nil {
+		t.Fatalf("RemoveInstanceCache missing: %v", err)
+	}
+}
+
 func TestInstanceCacheIsolationAndInvalidation(t *testing.T) {
 	s, _ := newTestStore(t)
 	if err := s.CacheInstances(1, []linode.Instance{{ID: 1, Label: "a"}}); err != nil {
@@ -629,15 +658,240 @@ func TestInstanceCacheIsolationAndInvalidation(t *testing.T) {
 	if got := s.CachedInstances(1); len(got) != 1 || got[0].ID != 1 {
 		t.Fatalf("token 1 cache = %+v", got)
 	}
-	// Invalidate only one token.
+	// Invalidate only one token: rows (and their stable ids) stay, but the
+	// snapshot is marked stale so the list refetches.
 	if err := s.InvalidateInstanceCache(1); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.CachedInstances(1); len(got) != 0 {
-		t.Fatalf("token 1 cache after invalidate = %+v", got)
+	if got := s.CachedInstances(1); len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("token 1 cache after invalidate = %+v, want the row kept", got)
+	}
+	if !s.InstanceCacheStale(1) {
+		t.Fatal("token 1 cache should be stale after invalidate")
+	}
+	if s.InstanceCacheStale(2) {
+		t.Fatal("token 2 cache should not be stale")
 	}
 	if got := s.CachedInstances(2); len(got) != 1 || got[0].ID != 9 {
 		t.Fatalf("token 2 cache should be unaffected: %+v", got)
+	}
+	// Refreshing the snapshot clears the stale marker.
+	if err := s.CacheInstances(1, []linode.Instance{{ID: 1, Label: "a", Status: "running"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.InstanceCacheStale(1) {
+		t.Fatal("stale marker should clear after a successful refresh")
+	}
+}
+
+// TestInstanceCacheIDStableAcrossRefresh verifies that refreshing a token's
+// snapshot keeps each instance's stable auto-increment id instead of minting a
+// new one (configuration is keyed by that id).
+func TestInstanceCacheIDStableAcrossRefresh(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 1, Label: "web"}, {ID: 2, Label: "db"}}); err != nil {
+		t.Fatal(err)
+	}
+	var idBefore int
+	if err := s.db.QueryRow(`SELECT id FROM instance_cache WHERE token_id=7 AND instance_id=1`).Scan(&idBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 1, Label: "web2"}, {ID: 2, Label: "db"}}); err != nil {
+		t.Fatal(err)
+	}
+	var idAfter int
+	if err := s.db.QueryRow(`SELECT id FROM instance_cache WHERE token_id=7 AND instance_id=1`).Scan(&idAfter); err != nil {
+		t.Fatal(err)
+	}
+	if idBefore != idAfter {
+		t.Fatalf("cache id changed across refresh: %d -> %d", idBefore, idAfter)
+	}
+}
+
+// TestRepointInstanceCacheInheritsConfig is the core rebuild-inheritance test:
+// scripts / auto-rebuild / failover configuration keyed by the stable cache id
+// follows the instance when its Linode id changes.
+func TestRepointInstanceCacheInheritsConfig(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 42, Label: "web"}}); err != nil {
+		t.Fatal(err)
+	}
+	var cacheID int
+	if err := s.db.QueryRow(`SELECT id FROM instance_cache WHERE token_id=7 AND instance_id=42`).Scan(&cacheID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceScript(42, "echo hi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceRootPassword(42, "Secret123!"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAutoRebuild(AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 7, Enabled: true, Port: 2222, Threshold: 2, IntervalSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFailover(Failover{
+		InstanceID: 42, UserID: 1, GroupID: 3, TokenID: 7, Enabled: true, Threshold: 2, IntervalSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RepointInstanceCache(42, 99); err != nil {
+		t.Fatalf("RepointInstanceCache: %v", err)
+	}
+
+	// The cache row keeps its id and now points at the new instance.
+	var gotID, gotInstance int
+	if err := s.db.QueryRow(`SELECT id, instance_id FROM instance_cache WHERE token_id=7`).Scan(&gotID, &gotInstance); err != nil {
+		t.Fatal(err)
+	}
+	if gotID != cacheID || gotInstance != 99 {
+		t.Fatalf("cache row = (id=%d, instance_id=%d), want (id=%d, 99)", gotID, gotInstance, cacheID)
+	}
+	// All three configurations resolve under the new instance id.
+	if script, ok := s.InstanceScript(99); !ok || script != "echo hi" {
+		t.Fatalf("InstanceScript(99) = %q, %v", script, ok)
+	}
+	if pass, ok := s.InstanceRootPassword(99); !ok || pass != "Secret123!" {
+		t.Fatalf("InstanceRootPassword(99) = %q, %v", pass, ok)
+	}
+	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled || cfg.Port != 2222 {
+		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
+	}
+	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled || cfg.GroupID != 3 {
+		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
+	}
+	if _, ok := s.InstanceScript(42); ok {
+		t.Fatal("script should no longer resolve under the old instance id")
+	}
+
+	// A subsequent snapshot refresh must not change the stable id.
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 99, Label: "web"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT id FROM instance_cache WHERE token_id=7`).Scan(&gotID); err != nil {
+		t.Fatal(err)
+	}
+	if gotID != cacheID {
+		t.Fatalf("cache id changed after refresh: %d -> %d", cacheID, gotID)
+	}
+}
+
+// TestMigrateLegacyInstanceConfigToCacheID builds an old-schema database
+// (config tables keyed by Linode instance id, instance_cache without the
+// stable id) and verifies Open upgrades it without losing configuration.
+func TestMigrateLegacyInstanceConfigToCacheID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := `
+CREATE TABLE groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+CREATE TABLE instance_cache (
+	token_id INTEGER NOT NULL, instance_id INTEGER NOT NULL,
+	label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '',
+	region TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT '',
+	image TEXT NOT NULL DEFAULT '', ipv4 TEXT NOT NULL DEFAULT '[]',
+	ipv6 TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]',
+	created TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL DEFAULT '',
+	fetched_at TEXT NOT NULL, PRIMARY KEY (token_id, instance_id));
+CREATE TABLE instance_scripts (instance_id INTEGER PRIMARY KEY, script TEXT NOT NULL);
+CREATE TABLE instance_auto_rebuild (
+	instance_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0,
+	token_id INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 0,
+	port INTEGER NOT NULL DEFAULT 22, threshold INTEGER NOT NULL DEFAULT 3,
+	interval_sec INTEGER NOT NULL DEFAULT 300, fail_count INTEGER NOT NULL DEFAULT 0,
+	last_status TEXT NOT NULL DEFAULT '', last_detail TEXT NOT NULL DEFAULT '',
+	last_check_at TEXT NOT NULL DEFAULT '', last_blocked_at TEXT NOT NULL DEFAULT '',
+	last_task_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+CREATE TABLE instance_failover (
+	instance_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0,
+	group_id INTEGER NOT NULL DEFAULT 0, token_id INTEGER NOT NULL DEFAULT 0,
+	enabled INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 3,
+	interval_sec INTEGER NOT NULL DEFAULT 300, fail_count INTEGER NOT NULL DEFAULT 0,
+	last_status TEXT NOT NULL DEFAULT '', last_detail TEXT NOT NULL DEFAULT '',
+	last_check_at TEXT NOT NULL DEFAULT '', last_task_id TEXT NOT NULL DEFAULT '',
+	replaced_by INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '');
+INSERT INTO groups(name) VALUES('legacy');
+INSERT INTO instance_cache(token_id, instance_id, label, fetched_at) VALUES(7, 42, 'web', '2026-01-01T00:00:00Z');
+INSERT INTO instance_scripts(instance_id, script) VALUES(42, 'echo inherited');
+INSERT INTO instance_auto_rebuild(instance_id, user_id, token_id, enabled, port) VALUES(42, 1, 7, 1, 22);
+INSERT INTO instance_failover(instance_id, user_id, group_id, token_id, enabled) VALUES(42, 1, 3, 7, 1);
+`
+	if _, err := db.Exec(legacy); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	db.Close()
+
+	s, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy db: %v", err)
+	}
+	if script, ok := s.InstanceScript(42); !ok || script != "echo inherited" {
+		t.Fatalf("InstanceScript(42) = %q, %v", script, ok)
+	}
+	if cfg, ok := s.AutoRebuild(42); !ok || !cfg.Enabled {
+		t.Fatalf("AutoRebuild(42) = %+v, %v", cfg, ok)
+	}
+	if cfg, ok := s.Failover(42); !ok || !cfg.Enabled || cfg.GroupID != 3 {
+		t.Fatalf("Failover(42) = %+v, %v", cfg, ok)
+	}
+	// The migrated configuration is inherited by a rebuilt instance id.
+	if err := s.RepointInstanceCache(42, 99); err != nil {
+		t.Fatal(err)
+	}
+	if script, ok := s.InstanceScript(99); !ok || script != "echo inherited" {
+		t.Fatalf("InstanceScript(99) = %q, %v", script, ok)
+	}
+	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled {
+		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
+	}
+	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled {
+		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
+	}
+}
+
+// TestRepointInstanceCacheMergesDuplicateRow covers the race where the new
+// instance was already cached (e.g. a list refresh ran during the rebuild):
+// the repoint must merge into the old row instead of failing on the unique
+// (token_id, instance_id) constraint.
+func TestRepointInstanceCacheMergesDuplicateRow(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.CacheInstances(7, []linode.Instance{{ID: 42, Label: "old"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInstanceScript(42, "old script"); err != nil {
+		t.Fatal(err)
+	}
+	var oldCacheID int
+	if err := s.db.QueryRow(`SELECT id FROM instance_cache WHERE token_id=7 AND instance_id=42`).Scan(&oldCacheID); err != nil {
+		t.Fatal(err)
+	}
+	// A refresh already cached the replacement under the same token.
+	if err := s.UpsertInstanceCache(7, linode.Instance{ID: 99, Label: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RepointInstanceCache(42, 99); err != nil {
+		t.Fatalf("RepointInstanceCache with duplicate: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM instance_cache WHERE token_id=7`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("cache rows = %d, want 1 after merge", n)
+	}
+	var gotID, gotInstance int
+	if err := s.db.QueryRow(`SELECT id, instance_id FROM instance_cache WHERE token_id=7`).Scan(&gotID, &gotInstance); err != nil {
+		t.Fatal(err)
+	}
+	if gotID != oldCacheID || gotInstance != 99 {
+		t.Fatalf("row = (id=%d, instance_id=%d), want (id=%d, 99)", gotID, gotInstance, oldCacheID)
+	}
+	if script, ok := s.InstanceScript(99); !ok || script != "old script" {
+		t.Fatalf("InstanceScript(99) = %q, %v", script, ok)
 	}
 }
 

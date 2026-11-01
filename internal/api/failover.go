@@ -298,12 +298,15 @@ func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, statu
 	m.log.Info("账号替换: 在新账号创建替换实例",
 		"instance_id", id, "from_token", cfg.TokenID, "to_token", newTokenID,
 		"region", cfgJSON.Region, "type", cfgJSON.Type, "image", cfgJSON.Image, "label", cfgJSON.Label)
+	// 若旧实例保存过 root 密码，替换实例沿用同一密码。
+	rootPass, _ := m.srv.Store.InstanceRootPassword(id)
 	newInst, err := m.clientFor(newPAT).CreateInstance(ctx, linode.CreateOptions{
-		Region: cfgJSON.Region,
-		Type:   cfgJSON.Type,
-		Image:  cfgJSON.Image,
-		Label:  cfgJSON.Label,
-		Booted: &booted,
+		Region:   cfgJSON.Region,
+		Type:     cfgJSON.Type,
+		Image:    cfgJSON.Image,
+		Label:    cfgJSON.Label,
+		RootPass: rootPass,
+		Booted:   &booted,
 	})
 	if err != nil {
 		m.log.Warn("账号替换: 在新账号创建实例失败",
@@ -331,6 +334,12 @@ func (m *FailoverMonitor) replace(ctx context.Context, cfg store.Failover, statu
 	if script := strings.TrimSpace(cfgJSON.Script); script != "" {
 		if err := m.srv.Store.SetInstanceScript(newID, script); err != nil {
 			m.log.Warn("账号替换: 写入开机脚本失败", "to", newID, "error", err)
+		}
+	}
+	// 保存 root 密码到替换实例，供后续重建继续继承。
+	if rootPass != "" {
+		if err := m.srv.Store.SetInstanceRootPassword(newID, rootPass); err != nil {
+			m.log.Warn("账号替换: 保存 root 密码失败", "to", newID, "error", err)
 		}
 	}
 
