@@ -9,7 +9,7 @@ import { regionLabel, typeLabel } from "../../utils/linodeLabels";
 export default function InstanceRow({
   inst,
   st,
-  rebuildTaskRunning,
+  rebuildRunning,
   hasCustomScript,
   autoRebuildEnabled,
   hasPerm,
@@ -73,8 +73,8 @@ export default function InstanceRow({
           key="rebuild"
           className="action-btn danger"
           type="button"
-          disabled={busy || rebuildTaskRunning}
-          title={rebuildTaskRunning ? "已有重建任务进行中" : ""}
+          disabled={busy || rebuildRunning}
+          title={rebuildRunning ? "该实例已有重建任务进行中" : ""}
           onClick={() => onRebuild(inst)}
         >
           重建

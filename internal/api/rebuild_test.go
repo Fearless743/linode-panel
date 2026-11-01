@@ -197,6 +197,86 @@ func TestRebuildHappyPath(t *testing.T) {
 	}
 }
 
+// TestRebuildOldInstanceNotFoundCreatesNew verifies that a 404 while reading
+// the old instance does not fail the rebuild: the replacement is created
+// directly from the panel's cached spec, skipping shutdown/delete.
+func TestRebuildOldInstanceNotFoundCreatesNew(t *testing.T) {
+	h := newRebuildHarness(t)
+	var createOpts linode.CreateOptions
+	h.api.getInstance = func(_ context.Context, id int) (linode.Instance, error) {
+		if id == 42 {
+			return linode.Instance{}, &linode.APIError{StatusCode: http.StatusNotFound, Reason: "Not found"}
+		}
+		return linode.Instance{ID: id, Status: "running"}, nil
+	}
+	h.api.shutdown = func(context.Context, int) error {
+		t.Fatal("Shutdown must be skipped when the old instance is already gone")
+		return nil
+	}
+	h.api.deleteInstance = func(context.Context, int) error {
+		t.Fatal("DeleteInstance must be skipped when the old instance is already gone")
+		return nil
+	}
+	h.api.createInstance = func(_ context.Context, opts linode.CreateOptions) (linode.Instance, error) {
+		createOpts = opts
+		return linode.Instance{ID: 99, Status: "running"}, nil
+	}
+	h.api.getIPs = func(_ context.Context, id int) (linode.InstanceIPs, error) {
+		var ips linode.InstanceIPs
+		ips.IPv4.Public = []linode.IPAddress{{Address: "203.0.113.7", Public: true}}
+		return ips, nil
+	}
+	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+		return sshrun.Result{Exit: 0}, nil
+	}
+	h.mgr.ResolveInstance = func(id int) (linode.Instance, bool) {
+		if id != 42 {
+			return linode.Instance{}, false
+		}
+		return linode.Instance{
+			ID: 42, Label: "web", Region: "us-east", Type: "g6-standard-1",
+			Image: "linode/debian12", Tags: []string{"prod"},
+		}, true
+	}
+
+	id := startRebuild(t, h.mgr, 42, "echo hi")
+	task := h.mgr.runToCompletion(t, id)
+	if task.Status != StatusSuccess {
+		t.Fatalf("status = %s, want success (err=%q log=%v)", task.Status, task.Err, task.Log)
+	}
+	if task.NewInstanceID != 99 || task.NewIP != "203.0.113.7" {
+		t.Fatalf("task = %+v", task)
+	}
+	if createOpts.Region != "us-east" || createOpts.Type != "g6-standard-1" ||
+		createOpts.Image != "linode/debian12" || createOpts.Label != "web" {
+		t.Fatalf("CreateInstance got wrong opts: %+v", createOpts)
+	}
+	if len(createOpts.Tags) != 1 || createOpts.Tags[0] != "prod" {
+		t.Fatalf("CreateInstance tags = %v", createOpts.Tags)
+	}
+}
+
+// TestRebuildOldInstanceNon404StillFails verifies only a 404 triggers the
+// cached-spec fallback; other errors still fail the task.
+func TestRebuildOldInstanceNon404StillFails(t *testing.T) {
+	h := newRebuildHarness(t)
+	h.api.getInstance = func(context.Context, int) (linode.Instance, error) {
+		return linode.Instance{}, &linode.APIError{StatusCode: http.StatusInternalServerError, Reason: "boom"}
+	}
+	h.mgr.ResolveInstance = func(int) (linode.Instance, bool) {
+		return linode.Instance{Region: "us-east", Type: "t", Image: "i"}, true
+	}
+
+	id := startRebuild(t, h.mgr, 42, "echo hi")
+	task := h.mgr.runToCompletion(t, id)
+	if task.Status != StatusFailed {
+		t.Fatalf("status = %s, want failed", task.Status)
+	}
+	if !strings.Contains(task.Err, "读取旧实例失败") {
+		t.Fatalf("Err = %q", task.Err)
+	}
+}
+
 // TestRebuildCreateFails verifies a create failure marks the task failed.
 func TestRebuildCreateFails(t *testing.T) {
 	h := newRebuildHarness(t)
@@ -280,7 +360,9 @@ func TestRebuildSSHTransportError(t *testing.T) {
 	}
 }
 
-// TestManagerConcurrency verifies the one-at-a-time limit returns ErrBusy.
+// TestManagerConcurrency verifies rebuilds are serialized per instance: a
+// second Start for the same instance returns ErrBusy, while a different
+// instance may start concurrently.
 func TestManagerConcurrency(t *testing.T) {
 	h := newRebuildHarness(t)
 	// Block the run inside the fake GetInstance so the first task stays running.
@@ -298,18 +380,29 @@ func TestManagerConcurrency(t *testing.T) {
 		t.Fatalf("first Start: %v", err)
 	}
 	<-started
-	// second Start while busy
-	if _, err := h.mgr.Start(43, "echo hi", "", "", ""); !errors.Is(err, ErrBusy) {
-		t.Fatalf("second Start err = %v, want ErrBusy", err)
+	// Second Start for the same instance while busy.
+	if _, err := h.mgr.Start(42, "echo hi", "", "", ""); !errors.Is(err, ErrBusy) {
+		t.Fatalf("same-instance Start err = %v, want ErrBusy", err)
+	}
+	// A different instance may start concurrently.
+	id2, err := h.mgr.Start(43, "echo hi", "", "", "")
+	if err != nil {
+		t.Fatalf("different-instance Start: %v", err)
 	}
 	close(release)
 	task := h.mgr.runToCompletion(t, id)
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s", task.Status)
 	}
-	// after completion a new Start must succeed
-	if _, err := h.mgr.Start(44, "echo hi", "", "", ""); err != nil {
+	task2 := h.mgr.runToCompletion(t, id2)
+	if task2.Status != StatusFailed {
+		t.Fatalf("status = %s", task2.Status)
+	}
+	// after completion a new Start on the same instance must succeed
+	if id3, err := h.mgr.Start(42, "echo hi", "", "", ""); err != nil {
 		t.Fatalf("Start after completion: %v", err)
+	} else {
+		h.mgr.runToCompletion(t, id3)
 	}
 }
 
@@ -651,12 +744,19 @@ func TestRebuildHTTPConflict(t *testing.T) {
 	if resp.TaskID == "" {
 		t.Fatalf("empty task_id")
 	}
-	// Second request while busy.
-	req2 := httptest.NewRequest(http.MethodPost, "/api/instances/43/rebuild", bytes.NewBufferString(body))
+	// Second request for the same instance while its task is running → conflict.
+	req2 := httptest.NewRequest(http.MethodPost, "/api/instances/42/rebuild", bytes.NewBufferString(body))
 	authed(req2, session)
 	rr2 := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rr2, req2)
 	wantStatus(t, rr2, http.StatusConflict)
+
+	// A different instance may rebuild concurrently.
+	req3 := httptest.NewRequest(http.MethodPost, "/api/instances/43/rebuild", bytes.NewBufferString(body))
+	authed(req3, session)
+	rr3 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr3, req3)
+	wantStatus(t, rr3, http.StatusAccepted)
 	close(release)
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -109,6 +110,62 @@ func IntParam(v any) (int, bool) {
 	return 0, false
 }
 
+// isNotFound reports whether err is a Linode API 404 (the instance is gone).
+func isNotFound(err error) bool {
+	var apiErr *linode.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+// usableFallback reports whether fallback carries enough to create a
+// replacement instance.
+func usableFallback(fallback *linode.Instance) bool {
+	return fallback != nil && fallback.Region != "" && fallback.Type != "" && fallback.Image != ""
+}
+
+// fallbackInstanceParam decodes the "old_instance" param of a rebuild command.
+// The panel's self-agent passes a linode.Instance directly; a remote agent
+// receives the JSON-decoded map form.
+func fallbackInstanceParam(v any) *linode.Instance {
+	switch t := v.(type) {
+	case linode.Instance:
+		return &t
+	case *linode.Instance:
+		return t
+	case map[string]any:
+		return &linode.Instance{
+			Region: stringParam(t["region"]),
+			Type:   stringParam(t["type"]),
+			Image:  stringParam(t["image"]),
+			Label:  stringParam(t["label"]),
+			Tags:   stringSliceParam(t["tags"]),
+		}
+	}
+	return nil
+}
+
+// stringParam coerces a JSON-decoded value into a string.
+func stringParam(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// stringSliceParam coerces a JSON-decoded array into a []string.
+func stringSliceParam(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		return t
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // ListInstances lists the instances of a single account (PAT).
 func (e *Executor) ListInstances(ctx context.Context, pat string) ([]linode.Instance, error) {
 	insts, err := e.API(pat).ListInstances(ctx)
@@ -188,7 +245,7 @@ func (e *Executor) Execute(ctx context.Context, cmd Command, report Reporter) {
 		progress := func(step string) {
 			report(false, "", map[string]any{"progress": step})
 		}
-		if newID, _, err := e.Rebuild(ctx, id, script, rootPass, pat, progress); err != nil {
+		if newID, _, err := e.Rebuild(ctx, id, script, rootPass, pat, fallbackInstanceParam(cmd.Params["old_instance"]), progress); err != nil {
 			// Even a failed rebuild may already have created the replacement
 			// instance (e.g. the boot script failed). Report its id so the
 			// panel can still make it inherit the instance's configuration.
@@ -232,9 +289,12 @@ func (e *Executor) Execute(ctx context.Context, cmd Command, report Reporter) {
 // Rebuild executes the full rebuild orchestration:
 // shutdown old → delete → create (fresh ed25519 key, booted) → wait running →
 // sshrun script → probe SSH port. progress (when non-nil) is called with a
-// Chinese label before each step. It returns the replacement instance's
+// Chinese label before each step. fallback, when non-nil, is the panel's
+// cached snapshot of the old instance; it is used to create the replacement
+// directly when the old instance no longer exists upstream (404), in which
+// case shutdown/delete are skipped. It returns the replacement instance's
 // Linode id (0 when it was never created) and its host address.
-func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat string, progress func(step string)) (int, string, error) {
+func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat string, fallback *linode.Instance, progress func(step string)) (int, string, error) {
 	api := e.API(pat)
 	step := func(n int, format string, args ...any) {
 		label := fmt.Sprintf("step %d: %s", n, fmt.Sprintf(format, args...))
@@ -248,18 +308,29 @@ func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat st
 
 	step(0, "读取旧实例 %d", id)
 	old, err := api.GetInstance(ctx, id)
+	missing := false
 	if err != nil {
-		return 0, "", fmt.Errorf("读取旧实例失败: %w", err)
+		if !isNotFound(err) || !usableFallback(fallback) {
+			return 0, "", fmt.Errorf("读取旧实例失败: %w", err)
+		}
+		old = *fallback
+		missing = true
+		step(0, "旧实例 %d 已不存在（404），使用面板缓存直接新建 (region=%s type=%s image=%s)",
+			id, old.Region, old.Type, old.Image)
 	}
 
-	step(1, "关机旧实例 %d", id)
-	if err := api.Shutdown(ctx, id); err != nil {
-		return 0, "", fmt.Errorf("关机旧实例失败: %w", err)
-	}
+	if !missing {
+		step(1, "关机旧实例 %d", id)
+		if err := api.Shutdown(ctx, id); err != nil {
+			return 0, "", fmt.Errorf("关机旧实例失败: %w", err)
+		}
 
-	step(2, "删除旧实例 %d", id)
-	if err := api.DeleteInstance(ctx, id); err != nil {
-		return 0, "", fmt.Errorf("删除旧实例失败: %w", err)
+		step(2, "删除旧实例 %d", id)
+		if err := api.DeleteInstance(ctx, id); err != nil {
+			return 0, "", fmt.Errorf("删除旧实例失败: %w", err)
+		}
+	} else {
+		step(1, "跳过旧实例 %d 的关机/删除（已不存在）", id)
 	}
 
 	privPEM, pubKey, err := sshrun.GenerateKey()

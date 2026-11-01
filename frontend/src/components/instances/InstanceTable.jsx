@@ -27,7 +27,7 @@ function groupByAccount(instances) {
 export default function InstanceTable({
   instances,
   getRowState,
-  rebuildTaskRunning,
+  rebuildRunningIds,
   customScriptIds,
   autoRebuildIds,
   hasPerm,
@@ -86,7 +86,7 @@ export default function InstanceTable({
                   key={inst.id}
                   inst={inst}
                   st={getRowState(inst.id)}
-                  rebuildTaskRunning={rebuildTaskRunning}
+                  rebuildRunning={rebuildRunningIds.has(inst.id)}
                   hasCustomScript={customScriptIds.has(inst.id)}
                   autoRebuildEnabled={autoRebuildIds.has(inst.id)}
                   hasPerm={hasPerm}

@@ -47,27 +47,43 @@ func (m *Manager) run(t *Task, pat string) {
 	}
 
 	old, err := api.GetInstance(ctx, oldID)
+	// missing means the instance is already gone upstream (404): there is
+	// nothing to shut down or delete, so the replacement is created directly
+	// from the panel's cached spec.
+	missing := false
 	if err != nil {
-		m.fail(t, fmt.Errorf("读取旧实例失败: %w", err))
-		return
+		cached, ok := m.oldInstanceFallback(oldID, err)
+		if !ok {
+			m.fail(t, fmt.Errorf("读取旧实例失败: %w", err))
+			return
+		}
+		old = cached
+		missing = true
+		m.log(t, "step 0: old instance id=%d no longer exists (404); recreating from cached spec region=%s type=%s image=%s label=%s",
+			oldID, old.Region, old.Type, old.Image, old.Label)
+	} else {
+		m.log(t, "step 0: old instance id=%d region=%s type=%s image=%s", oldID, old.Region, old.Type, old.Image)
 	}
 	oldIP := ""
 	if len(old.IPv4) > 0 {
 		oldIP = old.IPv4[0]
 	}
 	m.setOldIP(t, oldIP)
-	m.log(t, "step 0: old instance id=%d region=%s type=%s image=%s ip=%s", oldID, old.Region, old.Type, old.Image, oldIP)
 
-	m.log(t, "step 1: shutdown old instance %d", oldID)
-	if err := api.Shutdown(ctx, oldID); err != nil {
-		m.fail(t, fmt.Errorf("关机旧实例失败: %w", err))
-		return
-	}
+	if !missing {
+		m.log(t, "step 1: shutdown old instance %d", oldID)
+		if err := api.Shutdown(ctx, oldID); err != nil {
+			m.fail(t, fmt.Errorf("关机旧实例失败: %w", err))
+			return
+		}
 
-	m.log(t, "step 2: delete old instance %d", oldID)
-	if err := api.DeleteInstance(ctx, oldID); err != nil {
-		m.fail(t, fmt.Errorf("删除旧实例失败: %w", err))
-		return
+		m.log(t, "step 2: delete old instance %d", oldID)
+		if err := api.DeleteInstance(ctx, oldID); err != nil {
+			m.fail(t, fmt.Errorf("删除旧实例失败: %w", err))
+			return
+		}
+	} else {
+		m.log(t, "step 1-2: skip shutdown/delete of old instance %d (already gone)", oldID)
 	}
 
 	privPEM, pubKey, err := sshrun.GenerateKey()
@@ -155,6 +171,25 @@ func (m *Manager) run(t *Task, pat string) {
 	}
 
 	m.succeed(t, host)
+}
+
+// oldInstanceFallback resolves the spec to recreate when GetInstance reports
+// the old instance as missing upstream. Only a 404 is tolerated (the instance
+// was already deleted); other errors still fail the rebuild. The cached row
+// must carry region/type/image, otherwise no replacement can be created.
+func (m *Manager) oldInstanceFallback(id int, err error) (linode.Instance, bool) {
+	var apiErr *linode.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return linode.Instance{}, false
+	}
+	if m.ResolveInstance == nil {
+		return linode.Instance{}, false
+	}
+	cached, ok := m.ResolveInstance(id)
+	if !ok || cached.Region == "" || cached.Type == "" || cached.Image == "" {
+		return linode.Instance{}, false
+	}
+	return cached, true
 }
 
 // waitStatus polls api.GetInstance until the instance reaches want or the
@@ -270,11 +305,18 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		tokenID = strconv.Itoa(req.TokenID)
 	}
 	if s.viaAgentForRequest(user, tokenID, r.URL.Query().Get("via_agent")) {
-		cmdID, ok := s.enqueueAgentCommandForToken(w, r, tokenID, agenthub.CmdReboot, map[string]any{
+		params := map[string]any{
 			"id":            id,
 			"script":        script,
 			"root_password": rootPass,
-		})
+		}
+		// If the instance is already gone upstream, the agent cannot read its
+		// region/type/image. Carry the panel's cached spec so it can create the
+		// replacement directly instead of failing on the 404.
+		if old, ok := s.Store.CachedInstance(id); ok {
+			params["old_instance"] = old
+		}
+		cmdID, ok := s.enqueueAgentCommandForToken(w, r, tokenID, agenthub.CmdReboot, params)
 		if !ok {
 			return
 		}
@@ -289,7 +331,7 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	taskID, err := s.Tasks.Start(id, script, rootPass, pat, s.tokenLabel(user, tokenID))
 	if err != nil {
 		if errors.Is(err, ErrBusy) {
-			writeJSON(w, http.StatusConflict, errorResponse{Error: "已有重建任务进行中"})
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "该实例已有重建任务进行中"})
 			return
 		}
 		writeError(w, err)

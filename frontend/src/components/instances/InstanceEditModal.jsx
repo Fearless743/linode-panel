@@ -1,6 +1,14 @@
-// 实例「编辑」模态框：合并开机脚本与自动换 IP 两个编辑区。
-// 两个区块独立加载、独立保存；未保存的内容在切换标签页时保留。
-import { useEffect, useState } from "react";
+// 实例「编辑」模态框：合并开机脚本、root 密码与自动换 IP 三个编辑区。
+// 三个区块独立加载，但共用底部的「保存」按钮一次性提交全部改动；
+// 未修改的区块不会写入（避免把默认脚本固化成自定义脚本等副作用）。
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import {
   apiFetch,
   jsonRequest,
@@ -36,7 +44,10 @@ function fmtTime(s) {
 }
 
 // ---------- 开机脚本区块 ----------
-function ScriptSection({ inst, onChanged }) {
+const ScriptSection = forwardRef(function ScriptSection(
+  { inst, disabled, onChanged, onReady },
+  ref
+) {
   const [script, setScript] = useState("");
   const [configured, setConfigured] = useState(false);
   const [lastRun, setLastRun] = useState(null); // 创建后最近一次执行状态
@@ -44,13 +55,17 @@ function ScriptSection({ inst, onChanged }) {
   const [error, setError] = useState("");
   const [status, setStatus] = useState(null); // { msg, cls }
   const [busy, setBusy] = useState(false);
+  // 加载时的脚本内容，用于判断用户是否真的改过（未改则保存时跳过）。
+  const initialRef = useRef("");
 
   useEffect(() => {
     let alive = true;
     apiFetch("/api/instances/" + inst.id + "/script")
       .then((data) => {
         if (!alive) return;
-        setScript((data && data.script) || "");
+        const value = (data && data.script) || "";
+        initialRef.current = value;
+        setScript(value);
         setConfigured(data && data.configured === true);
         setLastRun((data && data.last_run) || null);
         setLoading(false);
@@ -59,30 +74,37 @@ function ScriptSection({ inst, onChanged }) {
         if (!alive) return;
         setError(err && err.message ? err.message : "加载失败");
         setLoading(false);
+      })
+      .finally(() => {
+        if (alive && onReady) onReady();
       });
     return () => {
       alive = false;
     };
-  }, [inst.id]);
+  }, [inst.id, onReady]);
 
+  // 统一保存入口：有改动才提交。
   async function save() {
-    if (!script.trim()) {
-      setStatus({ msg: "脚本不能为空", cls: "error" });
-      return;
-    }
-    setBusy(true);
-    setStatus({ msg: "保存中…", cls: "" });
+    setStatus(null);
+    if (loading) return { ok: false, msg: "开机脚本尚未加载完成" };
+    if (error) return { ok: false, msg: "开机脚本加载失败，无法保存" };
+    if (script === initialRef.current) return { ok: true, changed: false };
+    if (!script.trim()) return { ok: false, msg: "开机脚本不能为空" };
     try {
       await jsonRequest("/api/instances/" + inst.id + "/script", "PUT", { script });
+      initialRef.current = script;
       setConfigured(true);
-      setStatus({ msg: "已保存", cls: "ok" });
       if (onChanged) onChanged();
+      return { ok: true, changed: true, label: "开机脚本" };
     } catch (err) {
-      setStatus({ msg: "保存失败：" + (err.message || "未知错误"), cls: "error" });
-    } finally {
-      setBusy(false);
+      return {
+        ok: false,
+        msg: "开机脚本保存失败：" + (err.message || "未知错误"),
+      };
     }
   }
+
+  useImperativeHandle(ref, () => ({ save }));
 
   async function reset() {
     setBusy(true);
@@ -90,7 +112,9 @@ function ScriptSection({ inst, onChanged }) {
     try {
       await apiFetch("/api/instances/" + inst.id + "/script", { method: "DELETE" });
       const data = await apiFetch("/api/instances/" + inst.id + "/script");
-      setScript((data && data.script) || "");
+      const value = (data && data.script) || "";
+      initialRef.current = value;
+      setScript(value);
       setConfigured(false);
       setStatus({ msg: "已恢复默认脚本", cls: "ok" });
       if (onChanged) onChanged();
@@ -130,27 +154,32 @@ function ScriptSection({ inst, onChanged }) {
         placeholder={"#!/usr/bin/env bash\n# 写入重建后要执行的命令…"}
         value={script}
         onChange={(e) => setScript(e.target.value)}
-        disabled={loading || !!error}
+        disabled={loading || !!error || disabled}
       />
       <div className="boot-script-actions">
         <span className={"boot-script-status" + (status ? " " + status.cls : "")}>
           {status ? status.msg : ""}
         </span>
-        <button className="btn btn-primary" type="button" onClick={save} disabled={busy || loading}>
-          保存
-        </button>
         {configured && (
-          <button className="btn btn-ghost" type="button" onClick={reset} disabled={busy || loading}>
+          <button
+            className="btn btn-ghost"
+            type="button"
+            onClick={reset}
+            disabled={busy || disabled || loading}
+          >
             恢复默认
           </button>
         )}
       </div>
     </>
   );
-}
+});
 
 // ---------- 自动换 IP 区块 ----------
-function AutoRebuildSection({ inst, onChanged }) {
+const AutoRebuildSection = forwardRef(function AutoRebuildSection(
+  { inst, disabled, onChanged, onReady },
+  ref
+) {
   const [enabled, setEnabled] = useState(false);
   const [port, setPort] = useState("22");
   const [threshold, setThreshold] = useState("3");
@@ -160,49 +189,72 @@ function AutoRebuildSection({ inst, onChanged }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null); // { msg, cls }
   const [error, setError] = useState("");
+  // 加载时的表单值，用于判断是否真的有改动。
+  const initialRef = useRef(null);
 
   useEffect(() => {
     let alive = true;
     getAutoRebuild(inst.id)
       .then((data) => {
         if (!alive) return;
+        const portValue = data.port || 22;
+        const thresholdValue = data.threshold || 3;
+        const intervalValue = Math.round((data.interval_seconds || 300) / 60) || 5;
         setState(data);
         setEnabled(!!data.enabled);
-        setPort(String(data.port || 22));
-        setThreshold(String(data.threshold || 3));
-        setIntervalMin(String(Math.round((data.interval_seconds || 300) / 60) || 5));
+        setPort(String(portValue));
+        setThreshold(String(thresholdValue));
+        setIntervalMin(String(intervalValue));
+        initialRef.current = {
+          enabled: !!data.enabled,
+          port: portValue,
+          threshold: thresholdValue,
+          intervalMin: intervalValue,
+        };
         setLoading(false);
       })
       .catch((err) => {
         if (!alive) return;
         setError((err && err.message) || "加载失败");
         setLoading(false);
+      })
+      .finally(() => {
+        if (alive && onReady) onReady();
       });
     return () => {
       alive = false;
     };
-  }, [inst.id]);
+  }, [inst.id, onReady]);
 
   const tokenId = inst && inst.token_id != null ? inst.token_id : undefined;
 
+  // 统一保存入口：有改动才提交。
   async function save() {
+    setStatus(null);
+    if (loading) return { ok: false, msg: "自动换 IP 配置尚未加载完成" };
+    if (error) return { ok: false, msg: "自动换 IP 配置加载失败，无法保存" };
     const p = parseInt(port, 10);
     const t = parseInt(threshold, 10);
     const m = parseInt(intervalMin, 10);
     if (!(p >= 1 && p <= 65535)) {
-      setStatus({ msg: "端口必须在 1-65535 之间", cls: "error" });
-      return;
+      return { ok: false, msg: "检测端口必须在 1-65535 之间" };
     }
     if (!(t >= 1 && t <= 20)) {
-      setStatus({ msg: "连续失败次数必须在 1-20 之间", cls: "error" });
-      return;
+      return { ok: false, msg: "连续失败次数必须在 1-20 之间" };
     }
     if (!(m >= 1 && m <= 1440)) {
-      setStatus({ msg: "检测间隔必须在 1-1440 分钟之间", cls: "error" });
-      return;
+      return { ok: false, msg: "检测间隔必须在 1-1440 分钟之间" };
     }
-    setBusy(true);
-    setStatus({ msg: "保存中…", cls: "" });
+    const init = initialRef.current;
+    if (
+      init &&
+      init.enabled === enabled &&
+      init.port === p &&
+      init.threshold === t &&
+      init.intervalMin === m
+    ) {
+      return { ok: true, changed: false };
+    }
     try {
       const data = await setAutoRebuild(inst.id, {
         enabled,
@@ -212,14 +264,18 @@ function AutoRebuildSection({ inst, onChanged }) {
         token_id: tokenId,
       });
       setState(data);
-      setStatus({ msg: enabled ? "已开启自动换 IP" : "已保存（未开启）", cls: "ok" });
+      initialRef.current = { enabled: !!data.enabled, port: p, threshold: t, intervalMin: m };
       if (onChanged) onChanged();
+      return { ok: true, changed: true, label: "自动换 IP" };
     } catch (err) {
-      setStatus({ msg: "保存失败：" + ((err && err.message) || "未知错误"), cls: "error" });
-    } finally {
-      setBusy(false);
+      return {
+        ok: false,
+        msg: "自动换 IP 保存失败：" + ((err && err.message) || "未知错误"),
+      };
     }
   }
+
+  useImperativeHandle(ref, () => ({ save }));
 
   async function disable() {
     setBusy(true);
@@ -228,6 +284,13 @@ function AutoRebuildSection({ inst, onChanged }) {
       await deleteAutoRebuild(inst.id);
       setEnabled(false);
       setState(null);
+      // 配置已删除，同步基线，避免随后「保存全部」又把配置写回。
+      initialRef.current = {
+        enabled: false,
+        port: parseInt(port, 10),
+        threshold: parseInt(threshold, 10),
+        intervalMin: parseInt(intervalMin, 10),
+      };
       setStatus({ msg: "已关闭并移除配置", cls: "ok" });
       if (onChanged) onChanged();
     } catch (err) {
@@ -254,6 +317,7 @@ function AutoRebuildSection({ inst, onChanged }) {
   }
 
   const configured = state != null;
+  const actionDisabled = busy || disabled;
 
   return (
     <>
@@ -271,7 +335,7 @@ function AutoRebuildSection({ inst, onChanged }) {
                 type="checkbox"
                 checked={enabled}
                 onChange={(e) => setEnabled(e.target.checked)}
-                disabled={busy}
+                disabled={actionDisabled}
               />
               <span className="exec-option-text">
                 <span>被墙后自动删机重建换 IP</span>
@@ -288,7 +352,7 @@ function AutoRebuildSection({ inst, onChanged }) {
               max="65535"
               value={port}
               onChange={(e) => setPort(e.target.value)}
-              disabled={busy}
+              disabled={actionDisabled}
             />
           </FormField>
           <FormField label="连续失败多少次判定被墙" htmlFor="ar-threshold">
@@ -300,7 +364,7 @@ function AutoRebuildSection({ inst, onChanged }) {
               max="20"
               value={threshold}
               onChange={(e) => setThreshold(e.target.value)}
-              disabled={busy}
+              disabled={actionDisabled}
             />
           </FormField>
           <FormField label="检测间隔（分钟）" htmlFor="ar-interval">
@@ -312,7 +376,7 @@ function AutoRebuildSection({ inst, onChanged }) {
               max="1440"
               value={intervalMin}
               onChange={(e) => setIntervalMin(e.target.value)}
-              disabled={busy}
+              disabled={actionDisabled}
             />
           </FormField>
 
@@ -332,27 +396,27 @@ function AutoRebuildSection({ inst, onChanged }) {
               {status ? status.msg : ""}
             </span>
             {configured && (
-              <Button variant="ghost" onClick={checkNow} disabled={busy}>
+              <Button variant="ghost" onClick={checkNow} disabled={actionDisabled}>
                 立即检测
               </Button>
             )}
             {configured && (
-              <Button variant="danger" onClick={disable} disabled={busy}>
+              <Button variant="danger" onClick={disable} disabled={actionDisabled}>
                 关闭
               </Button>
             )}
-            <Button variant="primary" onClick={save} disabled={busy}>
-              保存
-            </Button>
           </div>
         </>
       )}
     </>
   );
-}
+});
 
 // ---------- root 密码区块 ----------
-function RootPasswordSection({ inst, onChanged }) {
+const RootPasswordSection = forwardRef(function RootPasswordSection(
+  { inst, disabled, onChanged, onReady },
+  ref
+) {
   const [configured, setConfigured] = useState(false);
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(true);
@@ -372,31 +436,36 @@ function RootPasswordSection({ inst, onChanged }) {
         if (!alive) return;
         setError(err && err.message ? err.message : "加载失败");
         setLoading(false);
+      })
+      .finally(() => {
+        if (alive && onReady) onReady();
       });
     return () => {
       alive = false;
     };
-  }, [inst.id]);
+  }, [inst.id, onReady]);
 
+  // 统一保存入口：密码是只写字段，只有填了新密码才提交。
   async function save() {
-    if (!password.trim()) {
-      setStatus({ msg: "密码不能为空", cls: "error" });
-      return;
-    }
-    setBusy(true);
-    setStatus({ msg: "保存中…", cls: "" });
+    setStatus(null);
+    if (loading) return { ok: false, msg: "root 密码状态尚未加载完成" };
+    if (error) return { ok: false, msg: "root 密码状态加载失败，无法保存" };
+    if (!password.trim()) return { ok: true, changed: false };
     try {
       await jsonRequest("/api/instances/" + inst.id + "/root-password", "PUT", { password });
       setConfigured(true);
       setPassword("");
-      setStatus({ msg: "已保存", cls: "ok" });
       if (onChanged) onChanged();
+      return { ok: true, changed: true, label: "root 密码" };
     } catch (err) {
-      setStatus({ msg: "保存失败：" + ((err && err.message) || "未知错误"), cls: "error" });
-    } finally {
-      setBusy(false);
+      return {
+        ok: false,
+        msg: "root 密码保存失败：" + ((err && err.message) || "未知错误"),
+      };
     }
   }
+
+  useImperativeHandle(ref, () => ({ save }));
 
   async function clear() {
     setBusy(true);
@@ -436,7 +505,7 @@ function RootPasswordSection({ inst, onChanged }) {
               placeholder={configured ? "输入新密码以替换已保存的密码" : "输入 root 密码"}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              disabled={busy}
+              disabled={busy || disabled}
             />
           </FormField>
           <div className="modal-actions">
@@ -444,19 +513,21 @@ function RootPasswordSection({ inst, onChanged }) {
               {status ? status.msg : ""}
             </span>
             {configured && (
-              <button className="btn btn-ghost" type="button" onClick={clear} disabled={busy}>
+              <button
+                className="btn btn-ghost"
+                type="button"
+                onClick={clear}
+                disabled={busy || disabled}
+              >
                 清除密码
               </button>
             )}
-            <button className="btn btn-primary" type="button" onClick={save} disabled={busy}>
-              保存
-            </button>
           </div>
         </>
       )}
     </>
   );
-}
+});
 
 // ---------- 合并模态框 ----------
 export default function InstanceEditModal({
@@ -472,6 +543,65 @@ export default function InstanceEditModal({
   if (canAutoRebuild) tabs.push(["auto", "自动换 IP"]);
   const showTabs = tabs.length > 1;
   const [tab, setTab] = useState(canScript ? "script" : "auto");
+
+  const scriptRef = useRef(null);
+  const passwordRef = useRef(null);
+  const autoRef = useRef(null);
+  const savingRef = useRef(false);
+
+  // 各区块是否已完成加载（加载完成才允许保存，避免提交占位值）。
+  const [ready, setReady] = useState({ script: false, password: false, auto: false });
+  const [busy, setBusy] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(null); // { msg, cls }
+
+  const markScriptReady = useCallback(
+    () => setReady((prev) => (prev.script ? prev : { ...prev, script: true })),
+    []
+  );
+  const markPasswordReady = useCallback(
+    () => setReady((prev) => (prev.password ? prev : { ...prev, password: true })),
+    []
+  );
+  const markAutoReady = useCallback(
+    () => setReady((prev) => (prev.auto ? prev : { ...prev, auto: true })),
+    []
+  );
+
+  const allReady =
+    (!canScript || (ready.script && ready.password)) && (!canAutoRebuild || ready.auto);
+
+  // 一个保存按钮提交全部改动：逐个调用区块的 save()，汇总结果。
+  const saveAll = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setBusy(true);
+    setSaveStatus({ msg: "保存中…", cls: "" });
+    const results = [];
+    for (const sectionRef of [scriptRef, passwordRef, autoRef]) {
+      if (!sectionRef.current) continue;
+      let res;
+      try {
+        res = await sectionRef.current.save();
+      } catch (err) {
+        res = { ok: false, msg: (err && err.message) || "保存失败" };
+      }
+      if (res) results.push(res);
+    }
+    const errors = results.filter((r) => !r.ok);
+    const saved = results.filter((r) => r.ok && r.changed);
+    if (errors.length > 0) {
+      setSaveStatus({ msg: errors.map((e) => e.msg).join("；"), cls: "error" });
+    } else if (saved.length > 0) {
+      setSaveStatus({
+        msg: "已保存：" + saved.map((s) => s.label).join("、"),
+        cls: "ok",
+      });
+    } else {
+      setSaveStatus({ msg: "没有需要保存的修改", cls: "" });
+    }
+    savingRef.current = false;
+    setBusy(false);
+  };
 
   return (
     <Modal title={"编辑 · " + (inst.label || "#" + inst.id)} onClose={onClose}>
@@ -490,17 +620,52 @@ export default function InstanceEditModal({
         </div>
       )}
       <div style={{ display: canScript && (tab === "script" || !showTabs) ? "block" : "none" }}>
-        {canScript && <ScriptSection inst={inst} onChanged={onScriptChanged} />}
+        {canScript && (
+          <ScriptSection
+            ref={scriptRef}
+            inst={inst}
+            disabled={busy}
+            onChanged={onScriptChanged}
+            onReady={markScriptReady}
+          />
+        )}
       </div>
       <div style={{ display: canScript && tab === "password" ? "block" : "none" }}>
-        {canScript && <RootPasswordSection inst={inst} onChanged={onScriptChanged} />}
+        {canScript && (
+          <RootPasswordSection
+            ref={passwordRef}
+            inst={inst}
+            disabled={busy}
+            onChanged={onScriptChanged}
+            onReady={markPasswordReady}
+          />
+        )}
       </div>
       <div style={{ display: canAutoRebuild && (tab === "auto" || !showTabs) ? "block" : "none" }}>
-        {canAutoRebuild && <AutoRebuildSection inst={inst} onChanged={onAutoRebuildChanged} />}
+        {canAutoRebuild && (
+          <AutoRebuildSection
+            ref={autoRef}
+            inst={inst}
+            disabled={busy}
+            onChanged={onAutoRebuildChanged}
+            onReady={markAutoReady}
+          />
+        )}
       </div>
-      <div className="boot-script-actions">
-        <button className="btn btn-ghost" type="button" onClick={onClose}>
+      <div className="modal-actions">
+        <span className={"boot-script-status" + (saveStatus ? " " + saveStatus.cls : "")}>
+          {saveStatus ? saveStatus.msg : ""}
+        </span>
+        <button className="btn btn-ghost" type="button" onClick={onClose} disabled={busy}>
           关闭
+        </button>
+        <button
+          className="btn btn-primary"
+          type="button"
+          onClick={saveAll}
+          disabled={busy || !allReady}
+        >
+          保存
         </button>
       </div>
     </Modal>

@@ -107,6 +107,7 @@ func New(api LinodeAPI, st *store.Store) *Server {
 	}
 	s.Tasks = NewManager(api)
 	s.Tasks.RepointCache = s.repointInstanceCache
+	s.Tasks.ResolveInstance = s.Store.CachedInstance
 	return s
 }
 

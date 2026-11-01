@@ -1260,6 +1260,33 @@ func (s *Store) CachedInstances(tokenID int) []linode.Instance {
 	return out
 }
 
+// CachedInstance returns the panel's cached snapshot of one Linode instance
+// (identified by its Linode id), preferring a live row over a dead anchor. It
+// is the fallback used when the instance no longer exists upstream (404): the
+// panel can still recreate it from the last known region/type/image.
+func (s *Store) CachedInstance(instanceID int) (linode.Instance, bool) {
+	if instanceID <= 0 {
+		return linode.Instance{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var in linode.Instance
+	var ipv4, tags string
+	err := s.db.QueryRow(
+		`SELECT instance_id, label, status, region, type, image, ipv4, ipv6,
+		        tags, created, updated
+		   FROM instance_cache WHERE instance_id=?
+		  ORDER BY alive DESC, id LIMIT 1`, instanceID).Scan(
+		&in.ID, &in.Label, &in.Status, &in.Region, &in.Type, &in.Image,
+		&ipv4, &in.IPv6, &tags, &in.Created, &in.Updated)
+	if err != nil {
+		return linode.Instance{}, false
+	}
+	_ = json.Unmarshal([]byte(ipv4), &in.IPv4)
+	_ = json.Unmarshal([]byte(tags), &in.Tags)
+	return in, true
+}
+
 // InstanceCacheStale reports whether a token's snapshot was marked stale by a
 // mutating action, so the list should refetch from the Linode API.
 func (s *Store) InstanceCacheStale(tokenID int) bool {

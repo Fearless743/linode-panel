@@ -29,8 +29,9 @@ set -euo pipefail
 // ErrNotFound is returned by Manager.Get for an unknown task id.
 var ErrNotFound = errors.New("task not found")
 
-// ErrBusy is returned by Manager.Start while another rebuild is running.
-var ErrBusy = errors.New("rebuild already in progress")
+// ErrBusy is returned by Manager.Start while a rebuild of the same instance is
+// still running. Rebuilds of different instances may run concurrently.
+var ErrBusy = errors.New("rebuild already in progress for this instance")
 
 // Task is the observable state of one rebuild job.
 type Task struct {
@@ -66,12 +67,13 @@ func (t *Task) snapshot() Task {
 	return out
 }
 
-// Manager serializes rebuild jobs (one at a time) and stores their history.
+// Manager serializes rebuild jobs per instance and stores their history.
+// Different instances may be rebuilt concurrently.
 type Manager struct {
 	mu      sync.Mutex
 	tasks   map[string]*Task
-	order   []string // insertion order, oldest first
-	busy    bool
+	order   []string       // insertion order, oldest first
+	busy    map[int]string // instance id → running task id
 	nextID  int
 	sshPort int
 
@@ -104,11 +106,19 @@ type Manager struct {
 	// replacement instance: the panel re-points the instance's stable cache row
 	// (and thus all per-instance configuration) at the new Linode id.
 	RepointCache func(oldID, newID int)
+
+	// ResolveInstance, when set, returns the panel's cached snapshot of an
+	// instance by its Linode id. It is consulted when the Linode API reports
+	// the old instance as missing (404) during a rebuild: the replacement is
+	// then created directly from the cached region/type/image instead of
+	// failing the task.
+	ResolveInstance func(id int) (linode.Instance, bool)
 }
 
 func NewManager(api LinodeAPI) *Manager {
 	m := &Manager{
 		tasks:        map[string]*Task{},
+		busy:         map[int]string{},
 		api:          api,
 		RunFn:        sshrun.Run,
 		PollInterval: 3 * time.Second,
@@ -132,20 +142,21 @@ func (m *Manager) SetSSHPort(port int) {
 	m.sshPort = port
 }
 
-// Start queues a rebuild job and returns its task id. Only one job may run at
-// a time; while one is in flight, Start returns ErrBusy. The pat is the
+// Start queues a rebuild job and returns its task id. Rebuilds of the same
+// instance are serialized: while one is in flight, Start returns ErrBusy.
+// Different instances may be rebuilt concurrently. The pat is the
 // Personal Access Token for the requesting user's chosen token; rootPass is the
 // instance's saved root password (empty = SSH-key-only), and tokenLabel is
 // recorded on the task for display.
 func (m *Manager) Start(instanceID int, script, rootPass, pat string, tokenLabel string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.busy {
+	if _, ok := m.busy[instanceID]; ok {
 		return "", ErrBusy
 	}
-	m.busy = true
 	m.nextID++
 	id := fmt.Sprintf("task-%d", m.nextID)
+	m.busy[instanceID] = id
 	t := &Task{
 		ID:         id,
 		InstanceID: instanceID,
@@ -202,7 +213,7 @@ func (m *Manager) succeed(t *Task, newIP string) {
 	t.Status = StatusSuccess
 	t.NewIP = newIP
 	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
-	m.busy = false
+	delete(m.busy, t.InstanceID)
 }
 
 func (m *Manager) fail(t *Task, err error) {
@@ -211,7 +222,7 @@ func (m *Manager) fail(t *Task, err error) {
 	t.Status = StatusFailed
 	t.Err = err.Error()
 	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
-	m.busy = false
+	delete(m.busy, t.InstanceID)
 }
 
 // setNewInstanceID records the instance created by a rebuild, so callers

@@ -28,7 +28,7 @@ export default function Instances() {
   const [instances, setInstances] = useState([]);
   const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [rebuildTaskRunning, setRebuildTaskRunning] = useState(false);
+  const [rebuildRunningIds, setRebuildRunningIds] = useState(() => new Set());
   const [actionModal, setActionModal] = useState(null); // { inst, action }
   const [rebuildModal, setRebuildModal] = useState(null); // inst
   const [editModal, setEditModal] = useState(null); // inst
@@ -131,7 +131,9 @@ export default function Instances() {
     try {
       const data = await listRebuildTasks();
       const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-      setRebuildTaskRunning(tasks.some((t) => t.status === "running"));
+      setRebuildRunningIds(
+        new Set(tasks.filter((t) => t.status === "running").map((t) => t.instance_id))
+      );
     } catch {
       // 忽略瞬时错误。
     }
@@ -148,8 +150,8 @@ export default function Instances() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // rebuildTaskRunning 为 true 时每 5s 轮询重建任务，全部结束后自动停止。
-  usePolling(checkRebuildTasks, 5000, rebuildTaskRunning);
+  // 有重建任务运行中时每 5s 轮询任务列表，全部结束后自动停止。
+  usePolling(checkRebuildTasks, 5000, rebuildRunningIds.size > 0);
 
   // ---------- 账号级刷新（仅该账号下的实例通过 API 获取最新） ----------
   const refreshGroup = async (group) => {
@@ -265,7 +267,11 @@ export default function Instances() {
       return;
     }
     if (!res || !res.task_id) throw new Error("未返回任务 ID");
-    setRebuildTaskRunning(true);
+    setRebuildRunningIds((prev) => {
+      const next = new Set(prev);
+      next.add(inst.id);
+      return next;
+    });
     showBanner("重建任务已提交", false);
     loadInstances();
   };
@@ -320,7 +326,7 @@ export default function Instances() {
         <InstanceTable
           instances={instances}
           getRowState={getRowState}
-          rebuildTaskRunning={rebuildTaskRunning}
+          rebuildRunningIds={rebuildRunningIds}
           customScriptIds={customScriptIds}
           autoRebuildIds={autoRebuildIds}
           hasPerm={hasPerm}

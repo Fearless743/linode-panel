@@ -286,6 +286,40 @@ func TestRebuildFullOrchestration(t *testing.T) {
 	}
 }
 
+func TestRebuildOldInstanceMissingUsesFallback(t *testing.T) {
+	code := "regcode"
+	panel := newFakePanel(code, "tok")
+	defer panel.Close()
+	dir := t.TempDir()
+	fake := newFakeLinodeAPI() // instance 7 is not seeded: GetInstance 404s
+	a := newTestAgent(t, panel, fake, filepath.Join(dir, "state.json"))
+	a.pc.token = "tok"
+
+	cmd := pollCommand{ID: 12, Type: "rebuild", Params: map[string]any{
+		"id": 7, "script": "echo boot", "pat": "pat-1",
+		"old_instance": map[string]any{
+			"region": "us-east", "type": "g6-standard-1", "image": "linode/debian12",
+			"label": "web", "tags": []any{"prod"},
+		},
+	}}
+	if err := a.execute(context.Background(), cmd); err != nil {
+		t.Fatalf("execute rebuild: %v", err)
+	}
+	res := panel.lastResult()
+	if res["ok"] != true {
+		t.Fatalf("result = %v, want ok", res)
+	}
+	seq := fake.sequence()
+	if !contains(seq, "CreateInstance") {
+		t.Fatalf("sequence %v missing CreateInstance", seq)
+	}
+	for _, unwanted := range []string{"Shutdown", "DeleteInstance"} {
+		if contains(seq, unwanted) {
+			t.Fatalf("sequence %v should not contain %s for a missing instance", seq, unwanted)
+		}
+	}
+}
+
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {

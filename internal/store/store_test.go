@@ -585,6 +585,36 @@ func TestInstanceCacheRoundtrip(t *testing.T) {
 	}
 }
 
+// TestCachedInstanceLookup verifies the single-instance lookup used as the
+// rebuild fallback when the old Linode instance is already gone (404).
+func TestCachedInstanceLookup(t *testing.T) {
+	s, _ := newTestStore(t)
+	if _, ok := s.CachedInstance(42); ok {
+		t.Fatal("CachedInstance(42) found before caching")
+	}
+	if err := s.CacheInstances(7, []linode.Instance{{
+		ID: 42, Label: "web", Region: "us-east", Type: "g6-standard-1",
+		Image: "linode/debian12", IPv4: []string{"1.2.3.4"}, Tags: []string{"prod"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.CachedInstance(42)
+	if !ok || got.Label != "web" || got.Region != "us-east" ||
+		got.Type != "g6-standard-1" || got.Image != "linode/debian12" ||
+		len(got.IPv4) != 1 || got.IPv4[0] != "1.2.3.4" ||
+		len(got.Tags) != 1 || got.Tags[0] != "prod" {
+		t.Fatalf("CachedInstance(42) = %+v, %v", got, ok)
+	}
+	// A dead anchor (instance gone from the snapshot) still resolves so a
+	// rebuild can recreate it from the last known spec.
+	if err := s.RemoveInstanceCache(7, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.CachedInstance(42); !ok || got.Region != "us-east" {
+		t.Fatalf("CachedInstance after removal = %+v, %v", got, ok)
+	}
+}
+
 func TestInstanceCacheUpsert(t *testing.T) {
 	s, _ := newTestStore(t)
 	// Populate a snapshot with two instances.
