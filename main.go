@@ -33,6 +33,7 @@ func main() {
 	apiBase := flag.String("api-base", defaultAPIPrefix(), "Linode API v4 基础地址")
 	sshPort := flag.Int("ssh-port", 22, "SSH 端口（用于生成的 ssh 命令与连通性探测）")
 	state := flag.String("state", defaultStatePath(), "SQLite 数据库路径（保存用户、PAT、实例开机脚本）")
+	secretKey := flag.String("secret-key", "", "数据库敏感字段加密主密钥（留空则读取 LINODE_PANEL_SECRET_KEY，否则使用数据库旁的 .key 文件）")
 	agentCode := flag.String("agent-code", "", "初始 agent 注册码（可选；若数据库已有注册码则优先使用）")
 	selfAgent := flag.Bool("self-agent", true, "面板自身也作为 agent：注册一个本地面板 agent，使经 agent 操作可由面板进程直接执行")
 	selfAgentName := flag.String("self-agent-name", "本地面板", "本地面板 agent 的名称（配合 --self-agent 使用；后台重命名后默认沿用持久化的名称）")
@@ -46,7 +47,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	log := logger
 
-	st, adminPass, err := store.Open(*state)
+	st, adminPass, err := store.OpenWithKey(*state, *secretKey)
 	if err != nil {
 		log.Error("打开数据库失败", "error", err)
 		os.Exit(1)

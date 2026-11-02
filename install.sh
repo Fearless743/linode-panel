@@ -250,6 +250,8 @@ else
 LINODE_API_BASE=${LINODE_API_BASE:-https://api.linode.com/v4}
 # 被墙判定使用的国内探测接口
 # AUTO_REBUILD_CHECK_API=${AUTO_REBUILD_CHECK_API:-https://api.24kplus.com/ipcheck}
+# 敏感字段（PAT/root 密码/注册码）加密主密钥。留空则在数据目录自动生成 state.db.key。
+# LINODE_PANEL_SECRET_KEY=请替换为足够长的随机字符串
 EOF
   fi
 
@@ -288,7 +290,7 @@ EOF
 已安装 linode-panel ${VERSION}
   二进制：${BIN}
   配置：  ${CONF_FILE}
-  数据：  ${DATA_DIR}/state.db
+  数据：  ${DATA_DIR}/state.db（及密钥文件 state.db.key，二者需一起备份）
   监听：  ${ADDR}
   服务：  systemctl status ${SERVICE}
   日志：  journalctl -u ${SERVICE} -f

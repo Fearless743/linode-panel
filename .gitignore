@@ -8,6 +8,7 @@ linode-panel
 # 本地数据 / 配置
 *.db
 *.db-journal
+*.db.key
 *.sqlite
 *.sqlite3
 data/

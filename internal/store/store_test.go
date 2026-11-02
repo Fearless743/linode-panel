@@ -2,7 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1111,4 +1113,146 @@ func TestDeleteUserClearsCache(t *testing.T) {
 	if got := s.CachedInstances(tok.ID); len(got) != 0 {
 		t.Fatalf("cache should be cleared after user delete: %+v", got)
 	}
+}
+
+// rawSecret reads a column straight from SQLite, bypassing decryption.
+func rawSecret(t *testing.T, s *Store, query string) string {
+	t.Helper()
+	var v string
+	if err := s.db.QueryRow(query).Scan(&v); err != nil {
+		t.Fatalf("raw query: %v", err)
+	}
+	return v
+}
+
+func TestSecretsEncryptedAtRest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.db.Close()
+
+	tok, err := s.AddToken(1, "main", "linode_pat_plaintext")
+	if err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	if err := s.SetInstanceRootPassword(42, "root-secret"); err != nil {
+		t.Fatalf("SetInstanceRootPassword: %v", err)
+	}
+	if err := s.SetRegCode("reg-code-secret"); err != nil {
+		t.Fatalf("SetRegCode: %v", err)
+	}
+
+	rawToken := rawSecret(t, s, `SELECT token FROM tokens WHERE id=`+itoa(tok.ID))
+	if !isEncryptedSecret(rawToken) || strings.Contains(rawToken, "linode_pat_plaintext") {
+		t.Fatalf("token stored in plaintext: %q", rawToken)
+	}
+	rawPass := rawSecret(t, s, `SELECT p.password FROM instance_root_passwords p
+		JOIN instance_cache c ON c.id=p.cache_id WHERE c.instance_id=42`)
+	if !isEncryptedSecret(rawPass) || strings.Contains(rawPass, "root-secret") {
+		t.Fatalf("root password stored in plaintext: %q", rawPass)
+	}
+	rawCode := rawSecret(t, s, `SELECT value FROM meta WHERE key='reg_code'`)
+	if !isEncryptedSecret(rawCode) || strings.Contains(rawCode, "reg-code-secret") {
+		t.Fatalf("registration code stored in plaintext: %q", rawCode)
+	}
+
+	// Reads still return plaintext.
+	if pat, err := s.TokenPAT(1, tok.ID); err != nil || pat != "linode_pat_plaintext" {
+		t.Fatalf("TokenPAT = %q, %v", pat, err)
+	}
+	if pass, ok := s.InstanceRootPassword(42); !ok || pass != "root-secret" {
+		t.Fatalf("root password = %q, %v", pass, ok)
+	}
+	if code := s.RegCode(); code != "reg-code-secret" {
+		t.Fatalf("RegCode = %q", code)
+	}
+
+	// The auto-generated key file must be owner-only.
+	info, err := os.Stat(path + keyFileSuffix)
+	if err != nil {
+		t.Fatalf("key file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("key file mode = %o, want 600", perm)
+	}
+
+	// Reopen with the same key file: everything decrypts.
+	s.db.Close()
+	s2, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.db.Close()
+	if pat, err := s2.TokenPAT(1, tok.ID); err != nil || pat != "linode_pat_plaintext" {
+		t.Fatalf("TokenPAT after reopen = %q, %v", pat, err)
+	}
+}
+
+func TestLegacyPlaintextSecretsMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tok, err := s.AddToken(1, "main", "old_pat")
+	if err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	// Simulate a database written by an older version.
+	if _, err := s.db.Exec(`UPDATE tokens SET token='legacy_pat_plain' WHERE id=?`, tok.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO meta(key, value) VALUES('reg_code','legacy_reg_code')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+		t.Fatal(err)
+	}
+	s.db.Close()
+
+	s2, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.db.Close()
+	raw := rawSecret(t, s2, `SELECT token FROM tokens WHERE id=`+itoa(tok.ID))
+	if !isEncryptedSecret(raw) || strings.Contains(raw, "legacy_pat_plain") {
+		t.Fatalf("legacy token not migrated: %q", raw)
+	}
+	if pat, err := s2.TokenPAT(1, tok.ID); err != nil || pat != "legacy_pat_plain" {
+		t.Fatalf("TokenPAT = %q, %v", pat, err)
+	}
+	if code := s2.RegCode(); code != "legacy_reg_code" {
+		t.Fatalf("RegCode = %q", code)
+	}
+}
+
+func TestWrongSecretKeyRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, _, err := OpenWithKey(path, "key-a")
+	if err != nil {
+		t.Fatalf("OpenWithKey: %v", err)
+	}
+	if _, err := s.AddToken(1, "main", "pat"); err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	s.db.Close()
+
+	if _, _, err := OpenWithKey(path, "key-b"); err == nil {
+		t.Fatal("opening with a different key must fail")
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
 }

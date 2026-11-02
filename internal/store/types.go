@@ -94,7 +94,7 @@ const SessionTTL = 7 * 24 * time.Hour
 type Token struct {
 	ID    int    `json:"id"`
 	Label string `json:"label"`
-	Token string `json:"token"` // stored as-is; the database must be 0600
+	Token string `json:"token"` // plaintext in memory; encrypted at rest in SQLite
 	// AgentID is the agent bound to this account (0 = unbound). When set,
 	// via-agent operations for this account are routed to that agent.
 	AgentID int `json:"agent_id"`

@@ -70,6 +70,7 @@ Token 只以**尾 4 位**形式显示（如 `****c3d9`），完整 PAT 仅在添
 | `--api-base`| 环境变量 `LINODE_API_BASE`，否则 `https://api.linode.com/v4` | Linode API v4 基础地址，一般无需修改 |
 | `--ssh-port`| `22`                                 | SSH 端口，用于生成的 `ssh` 命令与连通性探测      |
 | `--state`   | `~/.config/linode-panel/state.db`  | SQLite 数据库路径（用户、PAT、实例开机脚本与 root 密码）          |
+| `--secret-key` | 环境变量 `LINODE_PANEL_SECRET_KEY`，否则数据库旁 `<state>.key` | 敏感字段（PAT、root 密码、注册码）的加密主密钥；留空时自动生成并复用密钥文件 |
 | `--self-agent` | `true`                           | 面板自身是否作为 agent：注册一个「本地面板」agent，使经 agent 操作可由面板进程直接执行（`--self-agent=false` 关闭） |
 | `--self-agent-name` | `本地面板`               | 本地面板 agent 的名称；未指定该参数时沿用「管理后台 → Agent 管理」中重命名后的持久化名称（见上） |
 | `--auto-rebuild` | `true`                          | 是否启用「被墙后自动删机重建换 IP」后台监测（`--auto-rebuild=false` 关闭） |
@@ -85,12 +86,23 @@ go run . --addr 0.0.0.0:8787 --ssh-port 2222
 环境变量：
 
 - `LINODE_API_BASE`：可选，覆盖 Linode API 基础地址。
+- `LINODE_PANEL_SECRET_KEY`：可选，数据库敏感字段加密主密钥。未设置时面板会在数据库旁生成 `<state>.key` 密钥文件（权限 `0600`）并自动复用。
 
 > **迁移说明**：旧版本通过环境变量 `LINODE_TOKEN` 注入单个全局 Token，该变量**已移除**。现在 Token 改由用户在 Web UI 中按账号绑定，请先在「用户管理」中为各用户添加 PAT。
 
 ## 数据库
 
-SQLite 数据库（默认 `~/.config/linode-panel/state.db`，由 `--state` 指定）持久化用户、密码哈希（bcrypt）、权限组、各用户的 PAT、注册码、各实例的开机脚本与 root 密码。数据库文件权限为 `0600`（仅当前用户可读写）。请妥善保管，切勿提交到版本库或泄露给他人。root 密码为重置/重建新实例所需，当前以明文保存在该数据库中，请像保护 PAT 一样保护数据库文件。
+SQLite 数据库（默认 `~/.config/linode-panel/state.db`，由 `--state` 指定）持久化用户、密码哈希（bcrypt）、权限组、各用户的 PAT、注册码、各实例的开机脚本与 root 密码。数据库文件权限为 `0600`（仅当前用户可读写）。请妥善保管，切勿提交到版本库或泄露给他人。
+
+**敏感字段加密**：PAT、实例 root 密码与 Agent 注册码均使用 **AES-256-GCM** 加密后再写入数据库，明文密钥不落库。因此仅拿到 `state.db` 文件无法直接读出 PAT 或 root 密码。加密主密钥按以下优先级获取：
+
+1. `--secret-key` 参数；
+2. `LINODE_PANEL_SECRET_KEY` 环境变量；
+3. 数据库旁的 `<state>.key` 密钥文件（首次启动自动生成，权限 `0600`）。
+
+生产环境建议使用第 1/2 种方式，把密钥放到数据库目录之外（例如 systemd `EnvironmentFile`、Docker secret 或密码管理器）。自动生成的 `.key` 文件能防止「只泄露数据库文件」的情况，但它与数据库在同一目录，若整个数据目录一起泄露则同时失守。
+
+> **升级兼容**：旧版本数据库中的明文 PAT/root 密码/注册码会在首次启动时自动加密迁移，无需手工操作。升级后请**同时备份数据库和密钥文件**：只有 `state.db` 而没有对应密钥（或 `--secret-key`/环境变量）将无法解密，面板会拒绝启动并提示密钥不匹配。
 
 > **实例缓存**：每次成功从 Linode API 拉取实例列表后，面板会把该账号（PAT）的实例快照缓存到数据库中。**默认（进入页面、自动加载）直接读缓存、不请求 Linode API**；实例在页面中按账号分组展示，只有点击**账号分组行上的「刷新」按钮**才会重新请求 Linode API 获取**该账号下全部实例**的最新数据并更新缓存。当某次拉取失败时，用该账号上次缓存的快照回退展示，并在对应实例行提示「显示缓存数据」。开机/关机/重启/创建/重建等变更操作会把该账号的缓存标记为过期，下一次列表自动重新拉取最新状态。
 
@@ -278,7 +290,7 @@ set -euo pipefail
 
 ## 安全说明
 
-- PAT 只保存在服务端 SQLite 数据库中（`0600`），按用户隔离，**绝不会**发送到浏览器；Web UI 仅展示尾 4 位。
+- PAT 只保存在服务端 SQLite 数据库中（`0600`），并以 AES-256-GCM 加密存储，按用户隔离，**绝不会**发送到浏览器；Web UI 仅展示尾 4 位。仅泄露数据库文件不足以还原 PAT。
 - 用户密码以 bcrypt 哈希存储，状态文件不保存明文密码。
 - 创建实例执行开机脚本、删机重建时生成的 SSH 私钥只在内存中使用，结束后即丢弃，不会写入磁盘。
 - 开机脚本以 root 身份在新实例上执行，请只保存可信内容。
@@ -354,6 +366,8 @@ PANEL_PORT=8787
 TZ=Asia/Shanghai
 LINODE_API_BASE=https://api.linode.com/v4
 # AUTO_REBUILD_CHECK_API=https://api.24kplus.com/ipcheck
+# 可选：把加密密钥放在数据卷之外（推荐）。未设置时使用 /data/state.db.key。
+# LINODE_PANEL_SECRET_KEY=请替换为足够长的随机字符串
 ```
 
 ### 一键安装（Linux + systemd）

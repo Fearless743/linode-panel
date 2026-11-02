@@ -24,6 +24,7 @@ import (
 type Store struct {
 	mu       sync.Mutex
 	db       *sql.DB
+	key      []byte
 	sessions map[string]session
 }
 
@@ -37,9 +38,23 @@ type session struct {
 // schema exists. On a brand-new database it seeds the built-in groups and
 // the admin user, returning the generated admin plaintext password (empty
 // when the database already existed). The database file is chmod 0600.
+//
+// Secrets (PATs, root passwords, the agent registration code) are encrypted
+// at rest. The master key comes from LINODE_PANEL_SECRET_KEY when set,
+// otherwise from a key file next to the database (created on first use).
 func Open(path string) (*Store, string, error) {
+	return OpenWithKey(path, "")
+}
+
+// OpenWithKey is Open with an explicit master key. A non-empty key takes
+// precedence over LINODE_PANEL_SECRET_KEY and the auto-generated key file.
+func OpenWithKey(path, secretKey string) (*Store, string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, "", fmt.Errorf("创建数据库目录: %w", err)
+	}
+	key, err := resolveSecretKey(path, secretKey)
+	if err != nil {
+		return nil, "", err
 	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
@@ -52,8 +67,18 @@ func Open(path string) (*Store, string, error) {
 		db.Close()
 		return nil, "", fmt.Errorf("连接数据库 %s: %w", path, err)
 	}
-	s := &Store{db: db, sessions: make(map[string]session)}
+	s := &Store{db: db, key: key, sessions: make(map[string]session)}
 	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, "", err
+	}
+	// Encrypt secrets written in plaintext by older versions. Failure here
+	// must abort startup: continuing would silently write plaintext.
+	if err := s.encryptLegacySecrets(); err != nil {
+		db.Close()
+		return nil, "", fmt.Errorf("加密数据库中的敏感字段: %w", err)
+	}
+	if err := s.verifySecretsDecryptable(); err != nil {
 		db.Close()
 		return nil, "", err
 	}
@@ -621,6 +646,11 @@ func (s *Store) Users() []User {
 		if err := trows.Scan(&t.ID, &uid, &t.Label, &t.Token, &t.AgentID); err != nil {
 			break
 		}
+		if plain, err := s.decryptSecret(t.Token); err == nil {
+			t.Token = plain
+		} else {
+			t.Token = ""
+		}
 		if i, ok := idx[uid]; ok {
 			out[i].Tokens = append(out[i].Tokens, t)
 		}
@@ -762,7 +792,11 @@ func (s *Store) AddToken(userID int, label, token string) (Token, error) {
 	if !s.userExistsLockedByID(userID) {
 		return Token{}, fmt.Errorf("用户 %d 不存在", userID)
 	}
-	res, err := s.db.Exec(`INSERT INTO tokens(user_id, label, token, agent_id) VALUES(?,?,?,0)`, userID, label, token)
+	enc, err := s.encryptSecret(token)
+	if err != nil {
+		return Token{}, err
+	}
+	res, err := s.db.Exec(`INSERT INTO tokens(user_id, label, token, agent_id) VALUES(?,?,?,0)`, userID, label, enc)
 	if err != nil {
 		return Token{}, err
 	}
@@ -841,7 +875,11 @@ func (s *Store) TokenPAT(userID, tokenID int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("令牌 %d 不存在", tokenID)
 	}
-	return token, nil
+	plain, err := s.decryptSecret(token)
+	if err != nil {
+		return "", fmt.Errorf("令牌 %d: %w", tokenID, err)
+	}
+	return plain, nil
 }
 
 // Groups returns all permission groups.
@@ -999,7 +1037,7 @@ func (s *Store) PermsOf(userID int) []string {
 func (s *Store) RegCode() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.metaLocked("reg_code")
+	return s.metaSecretLocked("reg_code")
 }
 
 // SetRegCode persists the agent registration code. An empty code disables
@@ -1007,7 +1045,11 @@ func (s *Store) RegCode() string {
 func (s *Store) SetRegCode(code string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.setMetaLocked("reg_code", code)
+	enc, err := s.encryptSecret(code)
+	if err != nil {
+		return err
+	}
+	return s.setMetaLocked("reg_code", enc)
 }
 
 // SelfAgentName returns the persisted custom name for the panel's own
@@ -1113,7 +1155,11 @@ func (s *Store) instanceRootPasswordLocked(cacheID int) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	return password, true
+	plain, err := s.decryptSecret(password)
+	if err != nil {
+		return "", false
+	}
+	return plain, true
 }
 
 // InstanceRootPasswordConfigured reports whether a root password is saved for
@@ -1132,9 +1178,13 @@ func (s *Store) SetInstanceRootPassword(instanceID int, password string) error {
 	if err != nil {
 		return err
 	}
+	enc, err := s.encryptSecret(password)
+	if err != nil {
+		return err
+	}
 	_, err = s.db.Exec(
 		`INSERT INTO instance_root_passwords(cache_id, password) VALUES(?, ?)
-		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password`, cacheID, password)
+		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password`, cacheID, enc)
 	return err
 }
 
@@ -1784,6 +1834,11 @@ func (s *Store) tokensLocked(userID int) []Token {
 		if err := rows.Scan(&t.ID, &t.Label, &t.Token, &t.AgentID); err != nil {
 			break
 		}
+		if plain, err := s.decryptSecret(t.Token); err == nil {
+			t.Token = plain
+		} else {
+			t.Token = ""
+		}
 		out = append(out, t)
 	}
 	return out
@@ -1869,6 +1924,15 @@ func (s *Store) metaLocked(key string) string {
 		return ""
 	}
 	return v
+}
+
+// metaSecretLocked reads and decrypts one encrypted meta value.
+func (s *Store) metaSecretLocked(key string) string {
+	plain, err := s.decryptSecret(s.metaLocked(key))
+	if err != nil {
+		return ""
+	}
+	return plain
 }
 
 func (s *Store) setMetaLocked(key, value string) error {

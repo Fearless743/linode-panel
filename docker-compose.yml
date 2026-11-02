@@ -14,6 +14,7 @@
 #   TZ            时区，默认 Asia/Shanghai
 #   LINODE_API_BASE        Linode API base，默认 https://api.linode.com/v4
 #   AUTO_REBUILD_CHECK_API 被墙判定用的探测接口，留空使用程序默认值
+#   LINODE_PANEL_SECRET_KEY 敏感字段加密主密钥；留空则在 /data 下自动生成 state.db.key
 
 name: linode-panel
 
@@ -33,6 +34,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       LINODE_API_BASE: ${LINODE_API_BASE:-https://api.linode.com/v4}
       AUTO_REBUILD_CHECK_API: ${AUTO_REBUILD_CHECK_API:-}
+      LINODE_PANEL_SECRET_KEY: ${LINODE_PANEL_SECRET_KEY:-}
     # 镜像内默认已带 --addr 0.0.0.0:8787 --state /data/state.db，可按需覆盖：
     # command: ["--addr", "0.0.0.0:8787", "--state", "/data/state.db"]
     healthcheck:
