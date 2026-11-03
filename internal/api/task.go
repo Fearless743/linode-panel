@@ -102,6 +102,13 @@ type Manager struct {
 	PollInterval time.Duration
 	PollTimeout  time.Duration
 
+	// BootScriptAttempts is the total number of SSH attempts when the boot
+	// script cannot connect (sshd not listening yet), and
+	// BootScriptRetryDelay is the pause between those attempts. Non-connect
+	// errors are never retried. Defaults: 3 attempts, 1 minute apart.
+	BootScriptAttempts   int
+	BootScriptRetryDelay time.Duration
+
 	// RepointCache, when set, is called as soon as a rebuild has created the
 	// replacement instance: the panel re-points the instance's stable cache row
 	// (and thus all per-instance configuration) at the new Linode id.
@@ -117,12 +124,14 @@ type Manager struct {
 
 func NewManager(api LinodeAPI) *Manager {
 	m := &Manager{
-		tasks:        map[string]*Task{},
-		busy:         map[int]string{},
-		api:          api,
-		RunFn:        sshrun.Run,
-		PollInterval: 3 * time.Second,
-		PollTimeout:  10 * time.Minute,
+		tasks:                map[string]*Task{},
+		busy:                 map[int]string{},
+		api:                  api,
+		RunFn:                sshrun.Run,
+		PollInterval:         3 * time.Second,
+		PollTimeout:          10 * time.Minute,
+		BootScriptAttempts:   3,
+		BootScriptRetryDelay: time.Minute,
 	}
 	m.newAPI = func(pat string) LinodeAPI {
 		c := linode.New(pat)
@@ -223,6 +232,14 @@ func (m *Manager) fail(t *Task, err error) {
 	t.Err = err.Error()
 	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	delete(m.busy, t.InstanceID)
+}
+
+// Busy reports whether a rebuild task is currently running for instanceID.
+func (m *Manager) Busy(instanceID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.busy[instanceID]
+	return ok
 }
 
 // setNewInstanceID records the instance created by a rebuild, so callers

@@ -142,17 +142,26 @@ export default function Instances() {
   }, [hideBanner, showBanner, loadScriptStatus, loadAutoRebuildStatus, resetRowStates, bump]);
 
   // 重建任务运行中时轮询任务列表，以更新重建按钮可用状态。
+  const prevRebuildRunningRef = useRef(new Set());
   const checkRebuildTasks = useCallback(async () => {
     try {
       const data = await listRebuildTasks();
       const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-      setRebuildRunningIds(
-        new Set(tasks.filter((t) => t.status === "running").map((t) => t.instance_id))
+      const running = new Set(
+        tasks.filter((t) => t.status === "running").map((t) => t.instance_id)
       );
+      // 重建结束后实例 id 已变化（缓存行被重新指向新实例）：重载列表，
+      // 让新行和各实例配置（自动换 IP 等）立即按新 id 显示。
+      const finished = [...prevRebuildRunningRef.current].some(
+        (id) => !running.has(id)
+      );
+      prevRebuildRunningRef.current = running;
+      setRebuildRunningIds(running);
+      if (finished) await loadInstances();
     } catch {
       // 忽略瞬时错误。
     }
-  }, []);
+  }, [loadInstances]);
 
   // 初次加载 + 检查是否有重建任务运行中。
   useEffect(() => {

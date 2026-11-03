@@ -155,6 +155,45 @@ func TestMonitorTriggersRebuildWhenBlocked(t *testing.T) {
 	}
 }
 
+// TestMonitorSkipsWhileRebuildRunning verifies the monitor does not treat the
+// rebuilt instance's 404 (between delete and cache re-point) as an out-of-band
+// deletion that drops the auto-rebuild configuration.
+func TestMonitorSkipsWhileRebuildRunning(t *testing.T) {
+	h := newMonitorHarness(t, "1.2.3.4")
+	if err := h.srv.Store.SetAutoRebuild(store.AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 1, Enabled: true,
+		Port: 22, Threshold: 1, IntervalSec: 60,
+	}); err != nil {
+		t.Fatalf("SetAutoRebuild: %v", err)
+	}
+	// Simulate an in-flight rebuild for instance 42.
+	h.mgr.mu.Lock()
+	h.mgr.busy[42] = "task-x"
+	h.mgr.mu.Unlock()
+	// Force the next tick to be due.
+	_ = h.srv.Store.UpdateAutoRebuildState(42, 0, "blocked", "d", "2000-01-01T00:00:00Z", "", "")
+
+	m := &AutoRebuildMonitor{
+		srv: h.srv, checkAPI: "x", client: &http.Client{}, log: slog.New(slog.DiscardHandler),
+	}
+	probed := false
+	m.checkFn = func(context.Context, string, int) blockCheckResult {
+		probed = true
+		return blockCheckResult{blocked: true}
+	}
+	m.tickOnce(context.Background())
+	if probed {
+		t.Fatal("probe should be skipped while a rebuild is running")
+	}
+	cfg, ok := h.srv.Store.AutoRebuild(42)
+	if !ok {
+		t.Fatal("auto-rebuild config was dropped during rebuild")
+	}
+	if cfg.LastStatus != "rebuilding" {
+		t.Fatalf("LastStatus = %q, want rebuilding", cfg.LastStatus)
+	}
+}
+
 // TestMonitorSkipsNonRunning verifies a stopped instance is not mistaken for
 // blocked.
 func TestMonitorSkipsNonRunning(t *testing.T) {

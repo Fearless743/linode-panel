@@ -190,6 +190,14 @@ func (m *AutoRebuildMonitor) now() string { return time.Now().UTC().Format(time.
 // triggers a rebuild.
 func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRebuild) {
 	id := cfg.InstanceID
+	// A rebuild is replacing this instance. Between the old instance's delete
+	// and the cache row's re-point, GetInstance would return 404; that must not
+	// be mistaken for an out-of-band deletion that drops the configuration.
+	if m.srv.Tasks != nil && m.srv.Tasks.Busy(id) {
+		_ = m.srv.Store.UpdateAutoRebuildState(id, cfg.FailCount, "rebuilding",
+			"重建任务进行中，跳过检测", m.now(), "", "")
+		return
+	}
 	pat, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
 	if err != nil {
 		m.log.Warn("自动换IP: 取 PAT 失败", "instance_id", id, "error", err)

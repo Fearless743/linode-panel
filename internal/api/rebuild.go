@@ -140,13 +140,7 @@ func (m *Manager) run(t *Task, pat string) {
 	m.mu.Lock()
 	sshPort := m.sshPort
 	m.mu.Unlock()
-	res, runErr := m.RunFn(ctx, sshrun.Options{
-		Host:               host,
-		Port:               sshPort,
-		PrivateKey:         privPEM,
-		InsecureSkipVerify: true,
-		Timeout:            5 * time.Minute,
-	}, t.Script)
+	res, runErr := m.runBootScript(t, ctx, host, sshPort, privPEM, t.Script)
 	if runErr != nil {
 		m.fail(t, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
 		return
@@ -171,6 +165,46 @@ func (m *Manager) run(t *Task, pat string) {
 	}
 
 	m.succeed(t, host)
+}
+
+// runBootScript runs the boot script over SSH, retrying connection failures
+// (dial or handshake: the instance is up but sshd is not listening yet) up to
+// m.BootScriptAttempts times with m.BootScriptRetryDelay between attempts.
+// Errors after the session started are returned immediately: a partially
+// applied script may not be safe to re-run.
+func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port int, privPEM []byte, script string) (sshrun.Result, error) {
+	attempts := m.BootScriptAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := m.BootScriptRetryDelay
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		res, err := m.RunFn(ctx, sshrun.Options{
+			Host:               host,
+			Port:               port,
+			PrivateKey:         privPEM,
+			InsecureSkipVerify: true,
+			Timeout:            5 * time.Minute,
+		}, script)
+		if err == nil {
+			return res, nil
+		}
+		if !isSSHConnectError(err) {
+			return res, err
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		m.log(t, "step 5: SSH 连接失败（%v），%s 后重试（第 %d/%d 次）", err, delay, attempt+1, attempts)
+		select {
+		case <-ctx.Done():
+			return res, lastErr
+		case <-time.After(delay):
+		}
+	}
+	return sshrun.Result{}, fmt.Errorf("SSH 连接失败（已尝试 %d 次）: %w", attempts, lastErr)
 }
 
 // oldInstanceFallback resolves the spec to recreate when GetInstance reports

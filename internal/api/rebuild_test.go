@@ -360,6 +360,56 @@ func TestRebuildSSHTransportError(t *testing.T) {
 	}
 }
 
+// TestRebuildSSHConnectErrorRetriesThenSucceeds verifies a connect failure
+// (sshd not listening yet) is retried and the task still succeeds.
+func TestRebuildSSHConnectErrorRetriesThenSucceeds(t *testing.T) {
+	h := newStatefulHarness(t)
+	h.mgr.BootScriptAttempts = 3
+	h.mgr.BootScriptRetryDelay = 0
+	attempts := 0
+	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
+		attempts++
+		if attempts < 3 {
+			return sshrun.Result{}, errors.New("sshrun: dial 203.0.113.7:22: connect: connection refused")
+		}
+		return sshrun.Result{Exit: 0}, nil
+	}
+
+	id := startRebuild(t, h.mgr, 42, "echo hi")
+	task := h.mgr.runToCompletion(t, id)
+	if task.Status != StatusSuccess {
+		t.Fatalf("status = %s, want success (err=%q log=%v)", task.Status, task.Err, task.Log)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+// TestRebuildSSHConnectErrorExhaustsRetries verifies connect failures stop
+// after BootScriptAttempts attempts and fail the task.
+func TestRebuildSSHConnectErrorExhaustsRetries(t *testing.T) {
+	h := newStatefulHarness(t)
+	h.mgr.BootScriptAttempts = 3
+	h.mgr.BootScriptRetryDelay = 0
+	attempts := 0
+	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
+		attempts++
+		return sshrun.Result{}, errors.New("sshrun: dial 203.0.113.7:22: connect: connection refused")
+	}
+
+	id := startRebuild(t, h.mgr, 42, "echo hi")
+	task := h.mgr.runToCompletion(t, id)
+	if task.Status != StatusFailed {
+		t.Fatalf("status = %s, want failed", task.Status)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if !strings.Contains(task.Err, "SSH 执行开机脚本失败") || !strings.Contains(task.Err, "connection refused") {
+		t.Fatalf("Err = %q", task.Err)
+	}
+}
+
 // TestManagerConcurrency verifies rebuilds are serialized per instance: a
 // second Start for the same instance returns ErrBusy, while a different
 // instance may start concurrently.
