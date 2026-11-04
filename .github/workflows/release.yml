@@ -8,20 +8,56 @@ permissions:
   contents: write
 
 jobs:
+  web:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build web assets
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          # Dockerfile 用 COPY --from=web /src/web ./web；
+          # release 二进制用 go:embed web，同样需要这份产物。
+          path: web/
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: ${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: ubuntu-latest
+    needs: web
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goos: linux, goarch: amd64 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: windows, goarch: amd64 }
+          # linux/arm64 用原生 ARM runner，可直接运行 smoke test；
+          # 其余纯交叉编译，用 ubuntu-latest 即可。
+          - { goos: linux, goarch: amd64, runs-on: ubuntu-latest }
+          - { goos: linux, goarch: arm64, runs-on: ubuntu-24.04-arm }
+          - { goos: darwin, goarch: amd64, runs-on: ubuntu-latest }
+          - { goos: darwin, goarch: arm64, runs-on: ubuntu-latest }
+          - { goos: windows, goarch: amd64, runs-on: ubuntu-latest }
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: web
 
       - uses: actions/setup-go@v5
         with:
@@ -33,6 +69,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
+          CGO_ENABLED: 0
         run: |
           set -euo pipefail
           version="${VERSION#v}"
@@ -40,8 +77,8 @@ jobs:
           if [ "$GOOS" = "windows" ]; then suffix=".exe"; fi
           stage="dist/linode-panel_${version}_${GOOS}_${GOARCH}"
           mkdir -p "$stage"
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$stage/linode-panel${suffix}" .
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$stage/linode-panel-agent${suffix}" ./cmd/agent
+          go build -trimpath -ldflags "-s -w" -o "$stage/linode-panel${suffix}" .
+          go build -trimpath -ldflags "-s -w" -o "$stage/linode-panel-agent${suffix}" ./cmd/agent
           cp README.md "$stage/"
           if [ "$GOOS" = "windows" ]; then
             (cd "$stage" && zip -q -r "../linode-panel_${version}_${GOOS}_${GOARCH}.zip" .)
@@ -51,6 +88,16 @@ jobs:
             rm -rf "$stage"
           fi
           ls -lh dist
+
+      - name: Smoke test (linux only)
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          bin=$(ls dist/*.tar.gz | head -1)
+          tmp=$(mktemp -d)
+          tar -xzf "$bin" -C "$tmp"
+          "$tmp/linode-panel" --help >/dev/null
+          "$tmp/linode-panel-agent" --help >/dev/null 2>&1 || true
 
       - uses: actions/upload-artifact@v4
         with:
