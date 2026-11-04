@@ -80,6 +80,10 @@ type Server struct {
 	// StartDualMonitor is called).
 	dualMonitor *DualMonitor
 
+	// cacheMonitor is the running instance-cache refresher (nil until
+	// StartInstanceCacheMonitor is called).
+	cacheMonitor *InstanceCacheMonitor
+
 	// NotifyHTTP is the HTTP client used for Telegram delivery (nil = default
 	// 15s timeout). NotifySend overrides delivery in tests.
 	NotifyHTTP *http.Client

@@ -44,6 +44,8 @@ func main() {
 	failoverTick := flag.Duration("failover-tick", time.Minute, "账号组自动替换监听的轮询间隔（每个实例仍按自身配置的检测间隔检查）")
 	dualEnabled := flag.Bool("dual", true, "启用双机轮询替换监测（被墙时切换到备用机并重建）")
 	dualTick := flag.Duration("dual-tick", time.Minute, "双机轮询监听的轮询间隔（每个账号仍按自身配置的检测间隔探测）")
+	cacheEnabled := flag.Bool("instance-cache", true, "启用实例缓存后台刷新（每轮拉取所有账号实例并更新列表缓存）")
+	cacheTick := flag.Duration("instance-cache-tick", time.Minute, "实例缓存后台刷新的轮询间隔")
 	tgBotToken := flag.String("tg-bot-token", defaultTGBotToken(), "Telegram Bot Token（为空则用数据库配置，环境变量 TG_BOT_TOKEN）")
 	tgChatID := flag.String("tg-chat-id", defaultTGChatID(), "Telegram Chat ID（为空则用数据库配置，环境变量 TG_CHAT_ID）")
 	flag.Parse()
@@ -117,6 +119,12 @@ func main() {
 	if *dualEnabled {
 		apiSrv.StartDualMonitor(rootCtx, *dualTick)
 		log.Info("双机轮询监测已启动", "tick", dualTick.String())
+	}
+
+	// 实例缓存后台刷新：每轮拉取所有账号实例并更新列表缓存。
+	if *cacheEnabled {
+		apiSrv.StartInstanceCacheMonitor(rootCtx, *cacheTick)
+		log.Info("实例缓存刷新已启动", "tick", cacheTick.String())
 	}
 
 	if *selfAgent {
