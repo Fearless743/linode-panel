@@ -259,13 +259,7 @@ func (s *Server) ensureStandbyForAPI(ctx context.Context, pat string, tokenID, u
 	if rootPass == "" {
 		return 0, errDualNoPass
 	}
-	label := strings.TrimSpace(spec.Label)
-	if label == "" {
-		label = "dual"
-	}
-	if !strings.HasSuffix(label, "-备") {
-		label += "-备"
-	}
+	label := dualStandbyLabel(strings.TrimSpace(spec.Label))
 	booted := false
 	newInst, err := s.clientFor(pat).CreateInstance(ctx, linode.CreateOptions{
 		Region: spec.Region, Type: spec.Type, Image: spec.Image,
@@ -291,6 +285,41 @@ var (
 	errDualNoSpec   = errMsg("模板配置缺失，无法创建备用机")
 	errDualNoPass   = errMsg("未保存 root 密码，无法创建备用机")
 )
+
+// dualStandbyLabel 由模板名派生备用机名：Linode label 仅允许字母/数字/
+// 下划线/横线/点号，因此后缀用 ASCII "-standby"，并把非法字符替换为 "-"。
+func dualStandbyLabel(base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "dual"
+	}
+	// 已有备用后缀则直接清洗返回，避免重复追加。
+	if strings.HasSuffix(base, "-standby") {
+		return sanitizeLinodeLabel(base)
+	}
+	return sanitizeLinodeLabel(base + "-standby")
+}
+
+// sanitizeLinodeLabel 把非法字符替换为 "-"，并截断到 64 字符。
+func sanitizeLinodeLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	out = strings.Trim(out, "-._")
+	if out == "" {
+		return "dual-standby"
+	}
+	return out
+}
 
 type errMsg string
 

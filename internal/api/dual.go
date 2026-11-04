@@ -222,7 +222,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	// 2. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
 	standbyID := cfg.StandbyInstanceID
 	specRegion, specType, specImage := active.Region, active.Type, active.Image
-	standbyLabel := strings.TrimSpace(active.Label) + "-备"
+	standbyLabel := dualStandbyLabel(active.Label)
 	if row, ok := m.srv.Store.CachedInstance(standbyID); ok && row.Region != "" {
 		specRegion, specType, specImage = row.Region, row.Type, row.Image
 		if row.Label != "" {

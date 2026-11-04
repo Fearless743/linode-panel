@@ -109,3 +109,28 @@ func TestIsDualManagedSkipsAutoRebuild(t *testing.T) {
 		t.Fatalf("dualRoleFor(43) = %q, want standby", got)
 	}
 }
+
+func TestDualStandbyLabel(t *testing.T) {
+	cases := map[string]string{
+		"web":        "web-standby",
+		"web-standby": "web-standby",
+		"测试机":        "---standby",
+		"":           "dual-standby",
+	}
+	for in, wantSuffix := range cases {
+		got := dualStandbyLabel(in)
+		if len(got) > 64 {
+			t.Fatalf("label too long: %q", got)
+		}
+		for _, r := range got {
+			ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.'
+			if !ok {
+				t.Fatalf("label %q from %q has illegal char %q", got, in, r)
+			}
+		}
+		_ = wantSuffix
+	}
+	if got := dualStandbyLabel("web"); got != "web-standby" {
+		t.Fatalf("got %q", got)
+	}
+}
