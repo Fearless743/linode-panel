@@ -18,6 +18,7 @@ const Users = lazy(() => import("./pages/Users"));
 const Agents = lazy(() => import("./pages/Agents"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const AccountGroups = lazy(() => import("./pages/AccountGroups"));
+const Notify = lazy(() => import("./pages/Notify"));
 
 // 路由路径 → 页面名（用于 document.title）。
 const PAGE_TITLES = {
@@ -28,6 +29,7 @@ const PAGE_TITLES = {
   "/tasks": "重建任务",
   "/users": "用户管理",
   "/agents": "Agent",
+  "/notify": "通知设置",
 };
 
 // 路由守卫：根据当前路径更新页面标题。
@@ -63,6 +65,7 @@ export default function App() {
               <Route path="/agents" element={<Agents />} />
               <Route path="/accounts" element={<Accounts />} />
               <Route path="/account-groups" element={<AccountGroups />} />
+              <Route path="/notify" element={<Notify />} />
             </Route>
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -196,14 +196,21 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 
 // rotate 执行一次轮换：关 A → 保证 B 干净 → B 开机并执行脚本 → 交换角色 →
 // 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
+// 成功后 TG 通知新 IP 与距上次被墙间隔。
 func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
 	m.log.Info("双机轮询: 达到阈值，开始轮换", "token_id", cfg.TokenID, "active", active.ID, "standby", cfg.StandbyInstanceID)
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount+1, "rotating", "rebuilding", "被墙，开始轮换", m.now())
 	api := m.srv.clientFor(pat)
+	label := m.srv.dualAccountLabel(cfg)
+	oldIP := ""
+	if len(active.IPv4) > 0 {
+		oldIP = active.IPv4[0]
+	}
 
 	rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
 	if rootPass == "" {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "未保存 root 密码，无法执行开机脚本", m.now())
+		m.notifyDualFailed(label, "未保存 root 密码")
 		return
 	}
 
@@ -225,6 +232,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	cleanStandby, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, active)
 	if err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机准备失败: "+err.Error(), m.now())
+		m.notifyDualFailed(label, "备用机准备失败: "+err.Error())
 		return
 	}
 	standbyID = cleanStandby
@@ -234,6 +242,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		// 已在运行的实例 Boot 会报错，忽略已运行情况：查询确认。
 		if inst, gerr := api.GetInstance(ctx, standbyID); gerr != nil || inst.Status == "offline" {
 			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机开机失败: "+err.Error(), m.now())
+			m.notifyDualFailed(label, "备用机开机失败: "+err.Error())
 			return
 		}
 	}
@@ -242,6 +251,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	cancel()
 	if err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "等待备用机运行失败: "+err.Error(), m.now())
+		m.notifyDualFailed(label, "等待备用机运行失败: "+err.Error())
 		return
 	}
 
@@ -249,6 +259,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	ips, err := api.GetInstanceIPs(ctx, standbyID)
 	if err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "获取备用机 IP 失败: "+err.Error(), m.now())
+		m.notifyDualFailed(label, "获取备用机 IP 失败: "+err.Error())
 		return
 	}
 	host := ips.PublicIPv4()
@@ -257,6 +268,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	if host == "" {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机没有公网 IP", m.now())
+		m.notifyDualFailed(label, "备用机没有公网 IP")
 		return
 	}
 	script := strings.TrimSpace(cfg.Script)
@@ -265,6 +277,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
+		m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
 		return
 	}
 
@@ -274,6 +287,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "ok", fmt.Sprintf("已轮换到实例 #%d，原使用中 #%d 进入重建", standbyID, active.ID), m.now())
 	m.log.Info("双机轮询: 已轮换", "new_active", standbyID, "old_active", active.ID)
+	m.notifyDualRotated(cfg.TokenID, label, oldIP, host, standbyID)
 
 	// 6. 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
 	go m.rebuildStandbyLoop(cfg, pat, active.ID, rootPass)

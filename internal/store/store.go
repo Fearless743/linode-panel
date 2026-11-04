@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS account_dual (
 	last_status         TEXT NOT NULL DEFAULT '',
 	last_detail         TEXT NOT NULL DEFAULT '',
 	last_check_at       TEXT NOT NULL DEFAULT '',
+	last_blocked_at     TEXT NOT NULL DEFAULT '',
 	script              TEXT NOT NULL DEFAULT '',
 	root_password       TEXT NOT NULL DEFAULT '',
 	updated_at          TEXT NOT NULL DEFAULT ''
@@ -242,6 +243,10 @@ CREATE TABLE IF NOT EXISTS account_dual (
 	// 关联后，删机重建只需更新缓存行的 instance_id，配置自动跟随新实例。
 	if err := s.ensureInstanceConfigCacheIDs(); err != nil {
 		return fmt.Errorf("迁移实例配置表: %w", err)
+	}
+	// 双机表补 last_blocked_at 列（记录每次被墙时间，用于通知间隔）。
+	if err := s.ensureDualBlockedAtColumn(); err != nil {
+		return fmt.Errorf("迁移 account_dual 表: %w", err)
 	}
 	return nil
 }
@@ -274,6 +279,19 @@ func (s *Store) ensureAccountGroupInstanceConfigColumn() error {
 		return nil
 	}
 	_, err = s.db.Exec(`ALTER TABLE account_groups ADD COLUMN instance_config TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+// ensureDualBlockedAtColumn adds last_blocked_at to account_dual for old DBs.
+func (s *Store) ensureDualBlockedAtColumn() error {
+	has, err := s.columnExists("account_dual", "last_blocked_at")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE account_dual ADD COLUMN last_blocked_at TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 

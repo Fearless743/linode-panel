@@ -294,13 +294,14 @@ func (m *AutoRebuildMonitor) triggerRebuild(ctx context.Context, cfg store.AutoR
 	m.log.Info("自动换IP: 已触发重建", "instance_id", id, "ip", ip, "task_id", taskID)
 	_ = m.srv.Store.UpdateAutoRebuildState(id, 0, "rebuilding",
 		"被墙，已触发重建换 IP（"+ip+"）", m.now(), m.now(), taskID)
-	go m.awaitRebuild(cfg, taskID)
+	go m.awaitRebuild(cfg, taskID, ip)
 }
 
 // awaitRebuild polls the rebuild task until it finishes. Configuration is
 // keyed by the instance's stable cache id, so it follows the replacement
 // instance automatically; only the monitor state needs to be updated.
-func (m *AutoRebuildMonitor) awaitRebuild(cfg store.AutoRebuild, taskID string) {
+// 成功时 TG 通知旧 IP → 新 IP 与距上次被墙间隔。
+func (m *AutoRebuildMonitor) awaitRebuild(cfg store.AutoRebuild, taskID, oldIP string) {
 	for {
 		t, err := m.srv.Tasks.Get(taskID)
 		if err != nil {
@@ -325,6 +326,16 @@ func (m *AutoRebuildMonitor) awaitRebuild(cfg store.AutoRebuild, taskID string) 
 		}
 		_ = m.srv.Store.UpdateAutoRebuildStateByCache(cfg.CacheID, 0, "idle",
 			"重建完成，等待下一轮检测", m.now(), "", "")
+		// TG 通知新 IP 与距上次被墙间隔（prev 取触发前的快照）。
+		newID := t.NewInstanceID
+		if newID <= 0 {
+			newID = cfg.InstanceID
+		}
+		label := ""
+		if cached, ok := m.srv.Store.CachedInstance(newID); ok && cached.Label != "" {
+			label = cached.Label
+		}
+		m.notifyAutoRebuilt(label, newID, oldIP, t.NewIP, cfg.LastBlockedAt)
 		return
 	}
 }

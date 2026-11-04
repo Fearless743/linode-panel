@@ -44,6 +44,8 @@ func main() {
 	failoverTick := flag.Duration("failover-tick", time.Minute, "账号组自动替换监听的轮询间隔（每个实例仍按自身配置的检测间隔检查）")
 	dualEnabled := flag.Bool("dual", true, "启用双机轮询替换监测（被墙时切换到备用机并重建）")
 	dualTick := flag.Duration("dual-tick", time.Minute, "双机轮询监听的轮询间隔（每个账号仍按自身配置的检测间隔探测）")
+	tgBotToken := flag.String("tg-bot-token", defaultTGBotToken(), "Telegram Bot Token（为空则用数据库配置，环境变量 TG_BOT_TOKEN）")
+	tgChatID := flag.String("tg-chat-id", defaultTGChatID(), "Telegram Chat ID（为空则用数据库配置，环境变量 TG_CHAT_ID）")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -62,6 +64,25 @@ func main() {
 	if *agentCode != "" && st.RegCode() == "" {
 		if err := st.SetRegCode(*agentCode); err != nil {
 			log.Error("设置注册码失败", "error", err)
+			os.Exit(1)
+		}
+	}
+	// TG 通知凭证：命令行/环境变量优先种子数据库（两者齐全时自动开启）。
+	if *tgBotToken != "" || *tgChatID != "" {
+		cur := st.GetNotifyConfig()
+		token := cur.HasToken
+		chat := cur.ChatID
+		newChat := chat
+		if *tgChatID != "" {
+			newChat = *tgChatID
+		}
+		newToken := ""
+		if *tgBotToken != "" {
+			newToken = *tgBotToken
+		}
+		enable := cur.Enabled || (newChat != "" && (token || newToken != ""))
+		if err := st.SetNotifyConfig(enable, newChat, newToken); err != nil {
+			log.Error("设置 TG 通知失败", "error", err)
 			os.Exit(1)
 		}
 	}
@@ -198,6 +219,14 @@ func defaultAutoRebuildCheckAPI() string {
 		return v
 	}
 	return api.DefaultBlockCheckAPI
+}
+
+func defaultTGBotToken() string {
+	return strings.TrimSpace(os.Getenv("TG_BOT_TOKEN"))
+}
+
+func defaultTGChatID() string {
+	return strings.TrimSpace(os.Getenv("TG_CHAT_ID"))
 }
 
 // defaultStatePath returns the default SQLite database location under the

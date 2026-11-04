@@ -423,3 +423,18 @@ export function checkDual(tokenId) {
     method: "POST",
   });
 }
+
+// ---------- TG 通知全局配置（管理员） ----------
+// 返回 { enabled, chat_id, has_token }
+export function getNotify() {
+  return apiFetch("/api/notify");
+}
+
+// payload: { enabled, chat_id, bot_token? }（bot_token 留空表示不改）
+export function setNotify(payload) {
+  return jsonRequest("/api/notify", "PUT", payload);
+}
+
+export function testNotify() {
+  return apiFetch("/api/notify/test", { method: "POST" });
+}

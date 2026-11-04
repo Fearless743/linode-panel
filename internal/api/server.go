@@ -80,6 +80,11 @@ type Server struct {
 	// StartDualMonitor is called).
 	dualMonitor *DualMonitor
 
+	// NotifyHTTP is the HTTP client used for Telegram delivery (nil = default
+	// 15s timeout). NotifySend overrides delivery in tests.
+	NotifyHTTP *http.Client
+	NotifySend func(ctx context.Context, text string) error
+
 	// BootScriptRun executes the create-time boot script over SSH. Injectable
 	// for tests; nil means sshrun.Run.
 	BootScriptRun func(context.Context, sshrun.Options, string) (sshrun.Result, error)
@@ -248,6 +253,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/agents/{id}/name", s.requireAuth(store.PermAdmin, s.handleRenameAgent))
 	mux.HandleFunc("GET /api/agent/commands", s.requireAuth(store.PermAdmin, s.handleAgentCommands))
 	mux.HandleFunc("POST /api/agents/regcode", s.requireAuth(store.PermAdmin, s.handleSetRegCode))
+	// TG 通知全局配置（管理员）。
+	mux.HandleFunc("GET /api/notify", s.requireAuth(store.PermAdmin, s.handleGetNotify))
+	mux.HandleFunc("PUT /api/notify", s.requireAuth(store.PermAdmin, s.handlePutNotify))
+	mux.HandleFunc("POST /api/notify/test", s.requireAuth(store.PermAdmin, s.handleTestNotify))
 	return mux
 }
 

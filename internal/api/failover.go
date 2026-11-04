@@ -396,3 +396,16 @@ func (m *FailoverMonitor) candidateLabel(userID, tokenID int) string {
 	}
 	return strconv.Itoa(tokenID)
 }
+
+// dualAccountLabel 返回双机账号的显示名（Token label 或 #id）。
+func (s *Server) dualAccountLabel(cfg store.DualConfig) string {
+	for _, t := range s.Store.TokensOf(cfg.UserID) {
+		if t.ID == cfg.TokenID {
+			if t.Label != "" {
+				return t.Label + " (#" + strconv.Itoa(t.ID) + ")"
+			}
+			return "#" + strconv.Itoa(t.ID)
+		}
+	}
+	return "#" + strconv.Itoa(cfg.TokenID)
+}

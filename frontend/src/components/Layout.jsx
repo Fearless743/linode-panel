@@ -14,6 +14,7 @@ function Sidebar() {
     { to: "/tasks", label: "重建任务", perm: "rebuild" },
     { to: "/users", label: "用户管理", perm: "admin" },
     { to: "/agents", label: "Agent", perm: "admin" },
+    { to: "/notify", label: "通知设置", perm: "admin" },
   ];
 
   return (
