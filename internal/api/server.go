@@ -76,6 +76,10 @@ type Server struct {
 	// StartAutoRebuildMonitor is called). Handlers use it for on-demand checks.
 	monitor *AutoRebuildMonitor
 
+	// dualMonitor is the running dual polling monitor (nil until
+	// StartDualMonitor is called).
+	dualMonitor *DualMonitor
+
 	// BootScriptRun executes the create-time boot script over SSH. Injectable
 	// for tests; nil means sshrun.Run.
 	BootScriptRun func(context.Context, sshrun.Options, string) (sshrun.Result, error)
@@ -187,6 +191,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/account/failover", s.requireAuth("", s.handleListFailover))
 	mux.HandleFunc("PUT /api/account/failover/{iid}", s.requireAuth("", s.handlePutFailover))
 	mux.HandleFunc("DELETE /api/account/failover/{iid}", s.requireAuth("", s.handleDeleteFailover))
+
+	// 双机轮询替换：一个账号一对 A/B，被墙时轮换。
+	mux.HandleFunc("GET /api/account/dual", s.requireAuth("", s.handleListDual))
+	mux.HandleFunc("PUT /api/account/dual/{tid}", s.requireAuth("", s.handlePutDual))
+	mux.HandleFunc("DELETE /api/account/dual/{tid}", s.requireAuth("", s.handleDeleteDual))
+	mux.HandleFunc("POST /api/account/dual/{tid}/check", s.requireAuth("", s.handleCheckDual))
 
 	// View permission.
 	mux.HandleFunc("GET /api/instances", s.requireAuth(store.PermView, s.handleListInstances))
@@ -388,7 +398,24 @@ func (s *Server) instanceJSONFor(in linode.Instance, tok store.Token, fetchErr s
 		TokenLabel: tok.Label,
 		FetchError: fetchErr,
 		Missing:    missing,
+		DualRole:   s.dualRoleFor(in.ID),
 	}
+}
+
+// dualRoleFor returns "active" (使用中) / "standby" (备用) / "" for an instance.
+func (s *Server) dualRoleFor(instanceID int) string {
+	for _, d := range s.Store.DualConfigs() {
+		if !d.Enabled {
+			continue
+		}
+		if d.ActiveInstanceID == instanceID {
+			return "active"
+		}
+		if d.StandbyInstanceID == instanceID {
+			return "standby"
+		}
+	}
+	return ""
 }
 
 // handleInstanceRefresh re-fetches one instance from the Linode API, updates
@@ -432,6 +459,7 @@ func (s *Server) handleInstanceRefresh(w http.ResponseWriter, r *http.Request) {
 		Created:    inst.Created,
 		TokenID:    s.tokenIDFor(user, tokenID),
 		TokenLabel: s.tokenLabel(user, tokenID),
+		DualRole:   s.dualRoleFor(inst.ID),
 	})
 }
 
@@ -686,6 +714,8 @@ type instanceJSON struct {
 	// Missing marks an instance that no longer exists upstream. It stays in
 	// the list as unavailable so the user can migrate it to another account.
 	Missing bool `json:"missing,omitempty"`
+	// DualRole marks the dual-polling role: "" | "active" (使用中) | "standby" (备用).
+	DualRole string `json:"dual_role,omitempty"`
 }
 
 type statusResponse struct {

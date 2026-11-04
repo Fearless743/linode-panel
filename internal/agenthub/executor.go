@@ -26,8 +26,8 @@ type LinodeAPI interface {
 	DeleteInstance(ctx context.Context, id int) error
 }
 
-// RunFn runs the boot script over SSH.
-type RunFn func(ctx context.Context, host string, port int, privPEM []byte, script string) error
+// RunFn runs the boot script over SSH with the root password.
+type RunFn func(ctx context.Context, host string, port int, password string, script string) error
 
 // ProbeFn verifies the instance's SSH port is reachable.
 type ProbeFn func(ctx context.Context, host string, port int) error
@@ -64,11 +64,11 @@ func NewExecutor() *Executor {
 }
 
 // DefaultRunFn wraps sshrun.Run with the Executor's signature.
-func DefaultRunFn(ctx context.Context, host string, port int, privPEM []byte, script string) error {
+func DefaultRunFn(ctx context.Context, host string, port int, password string, script string) error {
 	res, err := sshrun.Run(ctx, sshrun.Options{
 		Host:               host,
 		Port:               port,
-		PrivateKey:         privPEM,
+		Password:           password,
 		InsecureSkipVerify: true,
 		Timeout:            5 * time.Minute,
 	}, script)
@@ -287,13 +287,13 @@ func (e *Executor) Execute(ctx context.Context, cmd Command, report Reporter) {
 }
 
 // Rebuild executes the full rebuild orchestration:
-// shutdown old → delete → create (fresh ed25519 key, booted) → wait running →
-// sshrun script → probe SSH port. progress (when non-nil) is called with a
-// Chinese label before each step. fallback, when non-nil, is the panel's
-// cached snapshot of the old instance; it is used to create the replacement
-// directly when the old instance no longer exists upstream (404), in which
-// case shutdown/delete are skipped. It returns the replacement instance's
-// Linode id (0 when it was never created) and its host address.
+// shutdown old → delete → create (root password, booted) → wait running →
+// sshrun script (root password) → probe SSH port. progress (when non-nil) is
+// called with a Chinese label before each step. fallback, when non-nil, is the
+// panel's cached snapshot of the old instance; it is used to create the
+// replacement directly when the old instance no longer exists upstream (404),
+// in which case shutdown/delete are skipped. It returns the replacement
+// instance's Linode id (0 when it was never created) and its host address.
 func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat string, fallback *linode.Instance, progress func(step string)) (int, string, error) {
 	api := e.API(pat)
 	step := func(n int, format string, args ...any) {
@@ -333,21 +333,16 @@ func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat st
 		step(1, "跳过旧实例 %d 的关机/删除（已不存在）", id)
 	}
 
-	privPEM, pubKey, err := sshrun.GenerateKey()
-	if err != nil {
-		return 0, "", fmt.Errorf("生成 SSH 密钥失败: %w", err)
-	}
 	booted := true
 	step(3, "创建新实例 (region=%s type=%s image=%s)", old.Region, old.Type, old.Image)
 	newInst, err := api.CreateInstance(ctx, linode.CreateOptions{
-		Region:         old.Region,
-		Type:           old.Type,
-		Image:          old.Image,
-		Label:          old.Label,
-		Tags:           old.Tags,
-		RootPass:       rootPass,
-		AuthorizedKeys: []string{pubKey},
-		Booted:         &booted,
+		Region:   old.Region,
+		Type:     old.Type,
+		Image:    old.Image,
+		Label:    old.Label,
+		Tags:     old.Tags,
+		RootPass: rootPass,
+		Booted:   &booted,
 	})
 	if err != nil {
 		return 0, "", fmt.Errorf("创建新实例失败: %w", err)
@@ -376,7 +371,7 @@ func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat st
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	if err := e.Run(runCtx, host, e.SSHPort, privPEM, script); err != nil {
+	if err := e.Run(runCtx, host, e.SSHPort, rootPass, script); err != nil {
 		return newID, host, fmt.Errorf("SSH 执行开机脚本失败: %w", err)
 	}
 

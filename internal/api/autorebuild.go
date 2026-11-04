@@ -190,6 +190,10 @@ func (m *AutoRebuildMonitor) now() string { return time.Now().UTC().Format(time.
 // triggers a rebuild.
 func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRebuild) {
 	id := cfg.InstanceID
+	// 双机轮询接管的实例跳过，避免重复删机。
+	if m.srv.isDualManaged(id) {
+		return
+	}
 	// A rebuild is replacing this instance. Between the old instance's delete
 	// and the cache row's re-point, GetInstance would return 404; that must not
 	// be mistaken for an out-of-band deletion that drops the configuration.

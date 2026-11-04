@@ -108,6 +108,10 @@ func (m *FailoverMonitor) now() string { return time.Now().UTC().Format(time.RFC
 //   - HealthError：检测本身失败，不累计（保持原有语义）。
 func (m *FailoverMonitor) check(ctx context.Context, cfg store.Failover) {
 	id := cfg.InstanceID
+	// 双机轮询接管的实例跳过，避免重复删机。
+	if m.srv.isDualManaged(id) {
+		return
+	}
 	pat, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
 	if err != nil {
 		m.log.Warn("账号替换: 取账号凭证失败", "instance_id", id, "token_id", cfg.TokenID, "error", err)

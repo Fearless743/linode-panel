@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
 	"linode-panel/internal/store"
 )
 
@@ -97,7 +96,7 @@ func (s *Server) handleMigrateInstance(w http.ResponseWriter, r *http.Request) {
 		label = spec.Label
 	}
 
-	// 已保存的开机脚本随实例迁移：创建时写入一次性公钥，后台在实例启动后执行。
+	// 已保存的开机脚本随实例迁移：创建后在实例启动后通过 root 密码执行。
 	script := ""
 	if v, ok := s.Store.InstanceScriptForCacheID(row.CacheID); ok {
 		script = strings.TrimSpace(v)
@@ -109,16 +108,6 @@ func (s *Server) handleMigrateInstance(w http.ResponseWriter, r *http.Request) {
 		Label:    label,
 		RootPass: rootPass,
 		Tags:     spec.Tags,
-	}
-	var bootScriptKey []byte
-	if script != "" {
-		privPEM, pubKey, kerr := sshrun.GenerateKey()
-		if kerr != nil {
-			slog.Warn("生成开机脚本 SSH 密钥失败（继续迁移，脚本不会执行）", "err", kerr)
-		} else {
-			bootScriptKey = privPEM
-			opts.AuthorizedKeys = []string{pubKey}
-		}
 	}
 
 	inst, err := s.clientFor(targetPAT).CreateInstance(r.Context(), opts)
@@ -146,8 +135,8 @@ func (s *Server) handleMigrateInstance(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("迁移实例: 保存 root 密码失败（继续）", "instance_id", inst.ID, "error", err)
 		}
 	}
-	if script != "" && bootScriptKey != nil {
-		s.startBootScript(inst.ID, targetPAT, bootScriptKey, script)
+	if script != "" {
+		s.startBootScript(inst.ID, targetPAT, rootPass, script)
 	}
 
 	targetTok := store.Token{ID: req.TargetTokenID, Label: s.tokenLabel(user, strconv.Itoa(req.TargetTokenID))}

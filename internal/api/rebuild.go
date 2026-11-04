@@ -30,10 +30,11 @@ const rebuildPollTimeout = 10 * time.Minute
 //  0. read the old instance (region/type/image for the rebuild)
 //  1. shutdown the old instance
 //  2. delete the old instance
-//  3. create a fresh instance (same region/type/image, booted) with a
-//     fresh one-off SSH key
+//  3. create a fresh instance (same region/type/image, booted) with the
+//     saved root password
 //  4. poll until the new instance is running (3s interval, 10m cap)
-//  5. run the boot script over SSH (5m timeout)
+//  5. run the boot script over SSH with the root password (5m timeout,
+//     skipped when SkipBootScript is set)
 //  6. probe the SSH port; task succeeds only when the probe connects
 func (m *Manager) run(t *Task, pat string) {
 	ctx := context.Background()
@@ -86,21 +87,15 @@ func (m *Manager) run(t *Task, pat string) {
 		m.log(t, "step 1-2: skip shutdown/delete of old instance %d (already gone)", oldID)
 	}
 
-	privPEM, pubKey, err := sshrun.GenerateKey()
-	if err != nil {
-		m.fail(t, fmt.Errorf("生成 SSH 密钥失败: %w", err))
-		return
-	}
 	booted := true
 	createOpts := linode.CreateOptions{
-		Region:         old.Region,
-		Type:           old.Type,
-		Image:          old.Image,
-		Label:          old.Label,
-		Tags:           old.Tags,
-		RootPass:       t.rootPass,
-		AuthorizedKeys: []string{pubKey},
-		Booted:         &booted,
+		Region:   old.Region,
+		Type:     old.Type,
+		Image:    old.Image,
+		Label:    old.Label,
+		Tags:     old.Tags,
+		RootPass: t.rootPass,
+		Booted:   &booted,
 	}
 	m.log(t, "step 3: create new instance (region=%s type=%s image=%s label=%s)", old.Region, old.Type, old.Image, old.Label)
 	newInst, err := api.CreateInstance(ctx, createOpts)
@@ -140,22 +135,26 @@ func (m *Manager) run(t *Task, pat string) {
 	m.mu.Lock()
 	sshPort := m.sshPort
 	m.mu.Unlock()
-	res, runErr := m.runBootScript(t, ctx, host, sshPort, privPEM, t.Script)
-	if runErr != nil {
-		m.fail(t, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
-		return
-	}
-	m.log(t, "  ssh exit=%d", res.Exit)
-	if res.Exit != 0 {
-		detail := res.Stderr
-		if detail == "" {
-			detail = res.Stdout
+	if t.SkipBootScript {
+		m.log(t, "step 5: skip boot script (dual standby rebuild)")
+	} else {
+		res, runErr := m.runBootScript(t, ctx, host, sshPort, t.rootPass, t.Script)
+		if runErr != nil {
+			m.fail(t, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
+			return
 		}
-		m.fail(t, fmt.Errorf("开机脚本退出码 %d: %s", res.Exit, detail))
-		return
-	}
-	if res.Stderr != "" {
-		m.log(t, "  stderr: %s", res.Stderr)
+		m.log(t, "  ssh exit=%d", res.Exit)
+		if res.Exit != 0 {
+			detail := res.Stderr
+			if detail == "" {
+				detail = res.Stdout
+			}
+			m.fail(t, fmt.Errorf("开机脚本退出码 %d: %s", res.Exit, detail))
+			return
+		}
+		if res.Stderr != "" {
+			m.log(t, "  stderr: %s", res.Stderr)
+		}
 	}
 	m.log(t, "step 6: probe SSH port on %s", host)
 
@@ -167,12 +166,13 @@ func (m *Manager) run(t *Task, pat string) {
 	m.succeed(t, host)
 }
 
-// runBootScript runs the boot script over SSH, retrying connection failures
-// (dial or handshake: the instance is up but sshd is not listening yet) up to
-// m.BootScriptAttempts times with m.BootScriptRetryDelay between attempts.
+// runBootScript runs the boot script over SSH with the root password,
+// retrying connection failures (dial or handshake: the instance is up but
+// sshd is not listening yet) up to m.BootScriptAttempts times with
+// m.BootScriptRetryDelay between attempts.
 // Errors after the session started are returned immediately: a partially
 // applied script may not be safe to re-run.
-func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port int, privPEM []byte, script string) (sshrun.Result, error) {
+func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port int, password string, script string) (sshrun.Result, error) {
 	attempts := m.BootScriptAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -183,7 +183,7 @@ func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port 
 		res, err := m.RunFn(ctx, sshrun.Options{
 			Host:               host,
 			Port:               port,
-			PrivateKey:         privPEM,
+			Password:           password,
 			InsecureSkipVerify: true,
 			Timeout:            5 * time.Minute,
 		}, script)

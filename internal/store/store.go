@@ -204,6 +204,24 @@ CREATE TABLE IF NOT EXISTS account_options_cache (
 	types      TEXT NOT NULL,
 	images     TEXT NOT NULL,
 	fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_dual (
+	token_id            INTEGER PRIMARY KEY,
+	user_id             INTEGER NOT NULL DEFAULT 0,
+	enabled             INTEGER NOT NULL DEFAULT 0,
+	port                INTEGER NOT NULL DEFAULT 22,
+	threshold           INTEGER NOT NULL DEFAULT 3,
+	interval_sec        INTEGER NOT NULL DEFAULT 300,
+	active_instance_id  INTEGER NOT NULL DEFAULT 0,
+	standby_instance_id INTEGER NOT NULL DEFAULT 0,
+	state               TEXT NOT NULL DEFAULT 'idle',
+	fail_count          INTEGER NOT NULL DEFAULT 0,
+	last_status         TEXT NOT NULL DEFAULT '',
+	last_detail         TEXT NOT NULL DEFAULT '',
+	last_check_at       TEXT NOT NULL DEFAULT '',
+	script              TEXT NOT NULL DEFAULT '',
+	root_password       TEXT NOT NULL DEFAULT '',
+	updated_at          TEXT NOT NULL DEFAULT ''
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("初始化表结构: %w", err)

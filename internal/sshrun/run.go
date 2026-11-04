@@ -50,14 +50,13 @@ func Run(ctx context.Context, opts Options, script string) (Result, error) {
 	if opts.Host == "" {
 		return Result{}, errors.New("sshrun: host is required")
 	}
-
-	signer, err := ssh.ParsePrivateKey(opts.PrivateKey)
-	if err != nil {
-		return Result{}, fmt.Errorf("sshrun: parse private key: %w", err)
+	if opts.Password == "" {
+		return Result{}, errors.New("sshrun: password is required")
 	}
+
 	cfg := &ssh.ClientConfig{
 		User: user,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth: []ssh.AuthMethod{ssh.Password(opts.Password)},
 		// Freshly provisioned hosts present unknown host keys. The panel is
 		// not a long-lived trust store, so host keys are only trusted when
 		// the caller opts in to InsecureSkipVerify; otherwise reject all.

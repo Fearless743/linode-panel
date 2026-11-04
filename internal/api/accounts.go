@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
 	"linode-panel/internal/store"
 )
 
@@ -314,11 +313,9 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	booted := true
-	// 可选开机脚本：创建后由后台协程在实例上通过 SSH 执行，同时保存为
-	// 该实例配置（之后重建也会执行）。执行需要一次性密钥，所以创建时把
-	// 对应公钥写入 authorized_keys；生成失败时仍继续创建，只是不执行脚本。
+	// 可选开机脚本：创建后由后台协程在实例上通过 root 密码 SSH 执行，同时
+	// 保存为该实例配置（之后重建也会执行）。
 	script := strings.TrimSpace(req.Script)
-	var bootScriptKey []byte
 	createOpts := linode.CreateOptions{
 		Region:   req.Region,
 		Type:     req.Type,
@@ -326,15 +323,6 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		Label:    req.Label,
 		RootPass: req.RootPass,
 		Booted:   &booted,
-	}
-	if script != "" {
-		privPEM, pubKey, kerr := sshrun.GenerateKey()
-		if kerr != nil {
-			slog.Warn("生成开机脚本 SSH 密钥失败（继续创建，脚本不会执行）", "err", kerr)
-		} else {
-			bootScriptKey = privPEM
-			createOpts.AuthorizedKeys = []string{pubKey}
-		}
 	}
 	inst, err := s.clientFor(pat).CreateInstance(r.Context(), createOpts)
 	if err != nil {
@@ -356,10 +344,8 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		if err := s.Store.SetInstanceScript(inst.ID, script); err != nil {
 			slog.Warn("保存开机脚本失败（实例已创建，继续）", "instance_id", inst.ID, "err", err)
 		}
-		// 后台执行：创建请求立即返回，脚本在实例启动后通过 SSH 运行。
-		if bootScriptKey != nil {
-			s.startBootScript(inst.ID, pat, bootScriptKey, script)
-		}
+		// 后台执行：创建请求立即返回，脚本在实例启动后通过 root 密码 SSH 运行。
+		s.startBootScript(inst.ID, pat, req.RootPass, script)
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"instance": instanceJSON{

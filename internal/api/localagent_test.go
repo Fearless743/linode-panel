@@ -330,7 +330,7 @@ func TestSelfAgentExecutesRebuild(t *testing.T) {
 	srv.newAgentExec = func() *agenthub.Executor {
 		return &agenthub.Executor{
 			SSHPort: 22,
-			Run:     func(context.Context, string, int, []byte, string) error { return nil },
+			Run:     func(context.Context, string, int, string, string) error { return nil },
 			Probe:   func(context.Context, string, int) error { return nil },
 			NewAPI:  func(string) agenthub.LinodeAPI { return fake },
 		}

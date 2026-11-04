@@ -48,8 +48,14 @@ type Task struct {
 	EndedAt    string   `json:"ended_at"`
 
 	// rootPass is the instance's saved root password, used for the replacement
-	// instance. It is deliberately unexported so it never appears in task JSON.
+	// instance and for the SSH boot-script run. It is deliberately unexported
+	// so it never appears in task JSON.
 	rootPass string
+
+	// SkipBootScript skips the SSH boot-script step (dual standby rebuilds):
+	// the replacement is created without running any script, and success is
+	// decided by the SSH port probe alone.
+	SkipBootScript bool `json:"skip_boot_script,omitempty"`
 
 	// NewInstanceID is the id of the instance created by the rebuild, set as
 	// soon as it exists (InstanceID keeps the old, since-deleted id). 0 when
@@ -155,9 +161,15 @@ func (m *Manager) SetSSHPort(port int) {
 // instance are serialized: while one is in flight, Start returns ErrBusy.
 // Different instances may be rebuilt concurrently. The pat is the
 // Personal Access Token for the requesting user's chosen token; rootPass is the
-// instance's saved root password (empty = SSH-key-only), and tokenLabel is
-// recorded on the task for display.
+// instance's saved root password (required for the SSH boot-script run), and
+// tokenLabel is recorded on the task for display.
 func (m *Manager) Start(instanceID int, script, rootPass, pat string, tokenLabel string) (string, error) {
+	return m.StartWithOptions(instanceID, script, rootPass, pat, tokenLabel, false)
+}
+
+// StartWithOptions is Start plus the SkipBootScript flag used by dual standby
+// rebuilds (replacement created without running any script).
+func (m *Manager) StartWithOptions(instanceID int, script, rootPass, pat string, tokenLabel string, skipBootScript bool) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.busy[instanceID]; ok {
@@ -167,14 +179,15 @@ func (m *Manager) Start(instanceID int, script, rootPass, pat string, tokenLabel
 	id := fmt.Sprintf("task-%d", m.nextID)
 	m.busy[instanceID] = id
 	t := &Task{
-		ID:         id,
-		InstanceID: instanceID,
-		Status:     StatusRunning,
-		Script:     script,
-		TokenLabel: tokenLabel,
-		StartedAt:  time.Now().UTC().Format(time.RFC3339),
-		Log:        []string{},
-		rootPass:   rootPass,
+		ID:             id,
+		InstanceID:     instanceID,
+		Status:         StatusRunning,
+		Script:         script,
+		TokenLabel:     tokenLabel,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339),
+		Log:            []string{},
+		rootPass:       rootPass,
+		SkipBootScript: skipBootScript,
 	}
 	m.tasks[id] = t
 	m.order = append(m.order, id)

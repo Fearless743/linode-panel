@@ -123,7 +123,7 @@ func (m *Manager) runToCompletion(t *testing.T, id string) Task {
 // startRebuild starts a rebuild against the fake API and returns the task id.
 func startRebuild(t *testing.T, mgr *Manager, id int, script string) string {
 	t.Helper()
-	taskID, err := mgr.Start(id, script, "", "", "")
+	taskID, err := mgr.Start(id, script, "Secret123!", "", "")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -141,9 +141,6 @@ func TestRebuildHappyPath(t *testing.T) {
 		if opts.Booted == nil || !*opts.Booted {
 			t.Fatalf("CreateInstance Booted not true: %+v", opts)
 		}
-		if len(opts.AuthorizedKeys) != 1 || !strings.HasPrefix(opts.AuthorizedKeys[0], "ssh-ed25519 ") {
-			t.Fatalf("CreateInstance AuthorizedKeys not generated: %+v", opts)
-		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		id := 99
@@ -157,8 +154,8 @@ func TestRebuildHappyPath(t *testing.T) {
 		if opts.Host != "203.0.113.7" || opts.Port != 22 || opts.User != "" {
 			t.Fatalf("RunFn got wrong opts: %+v", opts)
 		}
-		if len(opts.PrivateKey) == 0 || !opts.InsecureSkipVerify {
-			t.Fatalf("RunFn opts missing key/skip-verify: %+v", opts)
+		if opts.Password == "" || !opts.InsecureSkipVerify {
+			t.Fatalf("RunFn opts missing password/skip-verify: %+v", opts)
 		}
 		if script != "echo hi" {
 			t.Fatalf("RunFn got wrong script: %q", script)

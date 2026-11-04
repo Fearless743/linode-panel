@@ -68,9 +68,9 @@ func createScriptMock(t *testing.T, createBody *map[string]any, mu *sync.Mutex) 
 }
 
 // TestCreateInstanceRunsBootScript verifies that a create request with a
-// non-empty script (a) passes an authorized key to the Linode API, (b) returns
-// before the instance has booted, and (c) runs the script over SSH once the
-// instance is running, exposing the result via GET /api/instances/{id}/script.
+// non-empty script returns before the instance has booted and runs the script
+// over SSH with the root password once the instance is running, exposing the
+// result via GET /api/instances/{id}/script.
 func TestCreateInstanceRunsBootScript(t *testing.T) {
 	var (
 		mu         sync.Mutex
@@ -102,17 +102,7 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	wantStatus(t, rr, http.StatusCreated)
 
-	// The instance is created with the one-off public key so the background
-	// runner can log in as root over SSH.
-	mu.Lock()
-	keys, _ := createBody["authorized_keys"].([]any)
-	mu.Unlock()
-	if len(keys) != 1 {
-		t.Fatalf("authorized_keys = %v, want one key (body=%v)", createBody["authorized_keys"], createBody)
-	}
-	if keys[0] == "" {
-		t.Fatalf("authorized_keys[0] is empty")
-	}
+	_ = createBody
 
 	select {
 	case call := <-calls:
@@ -122,8 +112,8 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 		if call.script != script {
 			t.Fatalf("ssh script = %q, want %q", call.script, script)
 		}
-		if len(call.opts.PrivateKey) == 0 {
-			t.Fatal("ssh private key is empty")
+		if call.opts.Password != "Secret123!" {
+			t.Fatal("ssh password not passed through")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("boot script was not executed over SSH")
@@ -162,7 +152,7 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 }
 
 // TestCreateInstanceWithoutScriptSkipsBootScript verifies that an empty script
-// neither starts the runner nor writes authorized_keys.
+// does not start the runner.
 func TestCreateInstanceWithoutScriptSkipsBootScript(t *testing.T) {
 	var (
 		mu         sync.Mutex
@@ -188,12 +178,6 @@ func TestCreateInstanceWithoutScriptSkipsBootScript(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	wantStatus(t, rr, http.StatusCreated)
 
-	mu.Lock()
-	_, hasKeys := createBody["authorized_keys"]
-	mu.Unlock()
-	if hasKeys {
-		t.Fatalf("authorized_keys present for a request without a script: %v", createBody)
-	}
 	select {
 	case <-ran:
 		t.Fatal("boot script ran for a request without a script")

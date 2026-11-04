@@ -5,7 +5,6 @@
 // Contract (frozen):
 //
 //	func Run(ctx context.Context, opts Options, script string) (Result, error)
-//	func GenerateKey() (privatePEM []byte, authorizedKey string, err error)
 //
 // Run semantics: the script is piped to the remote shell's stdin
 // ("bash -s"), avoiding argv length/quoting limits. Run returns a nil error
@@ -20,7 +19,7 @@ type Options struct {
 	Host               string        // IP or hostname (required)
 	Port               int           // 0 → 22
 	User               string        // "" → root
-	PrivateKey         []byte        // PEM private key (ed25519 or RSA)
+	Password           string        // root password for password auth
 	InsecureSkipVerify bool          // accept unknown host keys (freshly provisioned hosts)
 	Timeout            time.Duration // overall dial+exec deadline; 0 → 5m
 }

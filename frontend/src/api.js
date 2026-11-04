@@ -395,3 +395,31 @@ export function deleteInstanceFailover(instanceId) {
     method: "DELETE",
   });
 }
+
+// ---------- 双机轮询替换（账号维度，一对 A/B） ----------
+// 返回 { dual: [{ token_id, user_id, enabled, port, threshold, interval_seconds,
+//   active_instance_id, standby_instance_id, state, fail_count, last_status,
+//   last_detail, last_check_at, script, has_root_password, updated_at }] }
+export function listDual() {
+  return apiFetch("/api/account/dual");
+}
+
+// 保存账号的双机配置；启用时需要 template_instance_id（模板机作为 A）。
+// payload: { enabled, template_instance_id?, port, threshold, interval_seconds, script?, root_password? }
+// 返回 { dual }，失败时可能附带 warning（B 创建失败但配置已保存）。
+export function setDual(tokenId, payload) {
+  return jsonRequest("/api/account/dual/" + encodeURIComponent(tokenId), "PUT", payload);
+}
+
+export function deleteDual(tokenId) {
+  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId), {
+    method: "DELETE",
+  });
+}
+
+// 立即探测一次并返回最新状态。
+export function checkDual(tokenId) {
+  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId) + "/check", {
+    method: "POST",
+  });
+}

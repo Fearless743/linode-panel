@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, listAccountAgents, updateAccountToken } from "../api";
+import { apiFetch, listAccountAgents, updateAccountToken, listDual, listInstances } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
+import DualModal from "../components/accounts/DualModal";
 import EditFormModal from "../components/ui/EditFormModal";
 import AccountHealthCell from "../components/accounts/AccountHealthCell";
 
@@ -16,6 +17,35 @@ export default function Accounts() {
   // 弹窗状态。
   const [addTokenOpen, setAddTokenOpen] = useState(false);
   const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
+  const [dualToken, setDualToken] = useState(null); // 双机轮询设置弹窗的账号
+  const [dualList, setDualList] = useState([]);
+  const [allInstances, setAllInstances] = useState([]);
+
+  const loadDual = useCallback(async () => {
+    try {
+      const data = await listDual();
+      setDualList(Array.isArray(data.dual) ? data.dual : []);
+    } catch {
+      setDualList([]);
+    }
+  }, []);
+
+  const loadAllInstances = useCallback(async () => {
+    try {
+      const data = await listInstances();
+      setAllInstances(Array.isArray(data.instances) ? data.instances : []);
+    } catch {
+      setAllInstances([]);
+    }
+  }, []);
+
+  function dualOf(tokenId) {
+    return dualList.find((d) => d.token_id === tokenId) || null;
+  }
+
+  function instancesOf(tokenId) {
+    return allInstances.filter((i) => i.token_id === tokenId && !i.missing);
+  }
 
   const loadTokens = useCallback(async () => {
     try {
@@ -30,7 +60,9 @@ export default function Accounts() {
 
   useEffect(() => {
     loadTokens();
-  }, [loadTokens]);
+    loadDual();
+    loadAllInstances();
+  }, [loadTokens, loadDual, loadAllInstances]);
 
   // 加载可用 Agent 列表，用于账号绑定下拉框。
   useEffect(() => {
@@ -156,17 +188,34 @@ export default function Accounts() {
                 <th>名称</th>
                 <th>Token</th>
                 <th>余额 / 状态</th>
+                <th>双机轮询</th>
                 <th>执行 Agent</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody>
-              {tokens.map((t) => (
+              {tokens.map((t) => {
+                const d = dualOf(t.id);
+                return (
                 <tr key={t.id}>
                   <td>{t.label || "（未命名）"}</td>
                   <td>{t.masked || ""}</td>
                   <td>
                     <AccountHealthCell token={t} />
+                  </td>
+                  <td>
+                    {d && d.enabled ? (
+                      <span title={`使用中 #${d.active_instance_id} · 备用 #${d.standby_instance_id || "—"} · ${d.last_status || d.state || ""}`}>
+                        开启（A #{d.active_instance_id}{d.standby_instance_id ? ` / 备 #${d.standby_instance_id}` : ""}）
+                      </span>
+                    ) : (
+                      <span className="agent-unbound">关闭</span>
+                    )}
+                    <div className="actions" style={{ marginTop: 4 }}>
+                      <button className="action-btn" type="button" onClick={() => setDualToken(t)}>
+                        双机设置
+                      </button>
+                    </div>
                   </td>
                   <td>
                     {boundAgentLabel(t) ? (
@@ -186,7 +235,8 @@ export default function Accounts() {
                     </div>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -220,6 +270,19 @@ export default function Accounts() {
           busyLabel="保存中…"
           onSubmit={(values) => handleEditSubmit(editToken, values)}
           onClose={() => setEditToken(null)}
+        />
+      )}
+
+      {dualToken && (
+        <DualModal
+          token={dualToken}
+          dual={dualOf(dualToken.id)}
+          instances={instancesOf(dualToken.id)}
+          onClose={() => setDualToken(null)}
+          onSaved={() => {
+            loadDual();
+            loadAllInstances();
+          }}
         />
       )}
     </section>

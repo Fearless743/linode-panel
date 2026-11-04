@@ -152,6 +152,16 @@ export default function InstanceRow({
           <div className="instance-name">
             {inst.label || "（未命名）"}
             <span className="instance-id">#{inst.id}</span>
+            {inst.dual_role === "active" && (
+              <span className="tag" title="双机轮询正在使用的实例" style={{ marginLeft: 6, background: "#1677ff", color: "#fff", border: "none" }}>
+                使用中
+              </span>
+            )}
+            {inst.dual_role === "standby" && (
+              <span className="tag" title="双机轮询备用实例（关机待命）" style={{ marginLeft: 6 }}>
+                备用
+              </span>
+            )}
           </div>
           {tags.length > 0 && (
             <div className="tags">

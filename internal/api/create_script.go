@@ -71,22 +71,21 @@ func (s *Server) sshRunner() func(context.Context, sshrun.Options, string) (sshr
 
 // startBootScript launches the background execution of a freshly created
 // instance's boot script. It returns immediately; progress is recorded in
-// bootScriptRuns.
-func (s *Server) startBootScript(instanceID int, pat string, privPEM []byte, script string) {
+// bootScriptRuns. Auth is by root password over SSH.
+func (s *Server) startBootScript(instanceID int, pat string, password string, script string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.updateBootScriptRun(instanceID, func(st *scriptRunState) {
 		*st = scriptRunState{State: ScriptRunPending, StartedAt: now}
 	})
-	go s.runBootScript(instanceID, pat, privPEM, script)
+	go s.runBootScript(instanceID, pat, password, script)
 }
 
-// runBootScript waits for the instance to boot, then runs its script over SSH.
+// runBootScript waits for the instance to boot, then runs its script over SSH
+// with the root password.
 //
-// The instance is created with a one-off ed25519 public key in
-// authorized_keys, so root login by key works before any password is used.
 // Connection failures are retried until bootScriptSSHTimeout because sshd may
 // not be listening the moment the instance reports "running".
-func (s *Server) runBootScript(instanceID int, pat string, privPEM []byte, script string) {
+func (s *Server) runBootScript(instanceID int, pat string, password string, script string) {
 	api := s.clientFor(pat)
 
 	bootCtx, cancelBoot := context.WithTimeout(context.Background(), bootScriptBootTimeout)
@@ -123,7 +122,7 @@ func (s *Server) runBootScript(instanceID int, pat string, privPEM []byte, scrip
 		res, runErr := run(sshCtx, sshrun.Options{
 			Host:               host,
 			Port:               s.sshPort(),
-			PrivateKey:         privPEM,
+			Password:           password,
 			InsecureSkipVerify: true,
 			Timeout:            bootScriptRunTimeout,
 		}, script)
