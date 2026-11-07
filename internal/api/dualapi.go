@@ -278,7 +278,8 @@ func (s *Server) handleCheckDual(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "双机轮询监控未启用"})
 		return
 	}
-	s.dualMonitor.check(r.Context(), cfg)
+	// check 可能含建备机（耗时），用后台上下文，避免 HTTP 请求超时把轮换/补备掐断。
+	s.dualMonitor.check(context.Background(), cfg)
 	out, _ := s.Store.DualConfigOf(tid)
 	writeJSON(w, http.StatusOK, map[string]any{"dual": out})
 }

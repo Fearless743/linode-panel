@@ -354,6 +354,7 @@ export function deleteDual(tokenId) {
 export function checkDual(tokenId) {
   return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId) + "/check", {
     method: "POST",
+    timeout: 120000,
   });
 }
 
