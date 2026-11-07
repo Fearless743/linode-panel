@@ -305,8 +305,8 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
                   className="modal-input"
                   value={dualTemplate}
                   onChange={(e) => setDualTemplate(e.target.value)}
-                  disabled={busy || (dual && dual.active_instance_id > 0)}
-                  title={dual && dual.active_instance_id > 0 ? "已确定 A，模板不可更改" : ""}
+                  disabled={busy}
+                  title="可重新选择：切换后旧主成为备用机并触发重建（若已被删则新建）"
                 >
                   <option value="">选择该账号下的实例…</option>
                   {list.map((i) => (
@@ -319,6 +319,11 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
                   <p className="boot-script-hint">
                     使用中：#{dual.active_instance_id}
                     {dual.standby_instance_id > 0 ? ` · 备用：#${dual.standby_instance_id}` : " · 备用机创建中…"}
+                  </p>
+                )}
+                {list.length === 0 && (
+                  <p className="boot-script-hint">
+                    该账号下暂无可用实例，请先到实例页创建一台后再回来选择作为使用中。双机实例被删后仅记录了指针，上游已无实例时必须先有新实例才能重绑。
                   </p>
                 )}
               </div>

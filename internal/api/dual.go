@@ -616,7 +616,7 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 		// 但这里 active 本身已失，按缓存重建 standby 再开机扶正。
 		newID, cerr := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, linode.Instance{})
 		if cerr != nil {
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用且重建失败: "+err.Error()+" / "+cerr.Error(), m.now())
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用且重建失败: "+err.Error()+" / "+cerr.Error()+"（双机实例均已在上游删除且缓存无规格，请先在实例页创建新实例，再回到账号配置重新选择模板）", m.now())
 			return
 		}
 		inst, err = api.GetInstance(ctx, newID)
