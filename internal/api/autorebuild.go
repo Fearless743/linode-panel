@@ -381,6 +381,11 @@ func (s *Server) handlePutAutoRebuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, _ := UserFrom(r.Context())
+	// 双机托管实例的被墙处理归双机轮换负责，自动换 IP 不可再启用，避免双重删机。
+	if req.Enabled && s.isDualManaged(id) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "该实例由双机轮询接管，不能开启自动换IP"})
+		return
+	}
 
 	if req.Port == 0 {
 		req.Port = s.sshPort()

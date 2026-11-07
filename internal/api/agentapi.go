@@ -133,6 +133,11 @@ func (s *Server) completeAgentCommand(cmd agenthub.Command, result agenthub.Resu
 				slog.Warn("agent 删除实例后清理缓存失败", "token_id", tid, "instance_id", id, "error", err)
 			}
 		}
+		if idOK {
+			if err := s.Store.ClearDualInstance(id); err != nil {
+				slog.Warn("agent 删除实例后清理双机指针失败", "instance_id", id, "error", err)
+			}
+		}
 	}
 	s.Hub.CompleteCommand(cmd.ID, result)
 }

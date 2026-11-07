@@ -70,6 +70,8 @@ func (s *Server) handleMigrateAccount(w http.ResponseWriter, r *http.Request) {
 	rows := s.Store.CachedInstanceRows(req.SourceTokenID)
 	resp := accountMigrateResponse{Results: []accountMigrateResult{}}
 	ctx := r.Context()
+	// 旧实例 ID → 新机器 ID，双机 A/B 指针迁移用。
+	idMap := map[int]int{}
 
 	for _, row := range rows {
 		spec := row.Instance
@@ -133,20 +135,39 @@ func (s *Server) handleMigrateAccount(w http.ResponseWriter, r *http.Request) {
 		res.OK = true
 		resp.Results = append(resp.Results, res)
 		resp.Migrated++
+		if spec.ID > 0 && newInst.ID > 0 {
+			idMap[spec.ID] = newInst.ID
+		}
 	}
 
-	// 账号级双机配置：源有、目标无时复制（实例指向清空，用户重新启用）。
+	// 账号级双机配置：源有、目标无时复制，并按 idMap 重绑 A/B；
+	// 目标已有双机对时，仅在对应角色为空处补指针。
 	if d, ok := s.Store.DualConfigOf(req.SourceTokenID); ok {
 		if _, ok2 := s.Store.DualConfigOf(req.TargetTokenID); !ok2 {
 			nd := d
 			nd.TokenID = req.TargetTokenID
 			nd.UserID = user.ID
-			nd.ActiveInstanceID = 0
-			nd.StandbyInstanceID = 0
+			nd.ActiveInstanceID = idMap[d.ActiveInstanceID]
+			nd.StandbyInstanceID = idMap[d.StandbyInstanceID]
 			nd.State = "idle"
 			nd.FailCount = 0
+			nd.LastCheckAt = ""
+			nd.LastDetail = ""
 			rp, _ := s.Store.DualRootPassword(req.SourceTokenID)
 			_ = s.Store.SetDualConfig(nd, rp)
+		} else {
+			dst, _ := s.Store.DualConfigOf(req.TargetTokenID)
+			nActive, nStandby := dst.ActiveInstanceID, dst.StandbyInstanceID
+			if nActive == 0 && d.ActiveInstanceID > 0 {
+				nActive = idMap[d.ActiveInstanceID]
+			}
+			if nStandby == 0 && d.StandbyInstanceID > 0 {
+				nStandby = idMap[d.StandbyInstanceID]
+			}
+			if nActive != dst.ActiveInstanceID || nStandby != dst.StandbyInstanceID {
+				_ = s.Store.UpdateDualInstances(req.TargetTokenID, nActive, nStandby)
+			}
+			_ = s.Store.UpdateDualState(req.TargetTokenID, 0, "idle", "idle", "账号迁移后双机指针已重绑", "")
 		}
 	}
 	// Agent 绑定：目标未绑定时继承源。

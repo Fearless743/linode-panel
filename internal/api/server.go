@@ -553,6 +553,12 @@ func (s *Server) powerAction(w http.ResponseWriter, r *http.Request, action stri
 	if !ok {
 		return
 	}
+	// 双机备用机应保持关机待命：禁止经面板手动开机/重启备用机，避免与使用中机器同时运行。
+	// 备用机开机仅在双机内部轮换/扶正时由面板直发 Linode API 执行。
+	if (action == agenthub.ActionBoot || action == agenthub.ActionReboot) && s.dualRoleFor(id) == "standby" {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "备用机由双机轮询接管并应保持关机待命，禁止手动开机/重启（请使用双机立即替换）"})
+		return
+	}
 	user, _ := UserFrom(r.Context())
 	// 执行通道：显式 ?via_agent=1/0 优先；否则跟随账号绑定的 Agent
 	// （已绑定则经该 Agent，未绑定则面板直发）。
@@ -611,12 +617,26 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 双机托管实例不可通过删机删除：先关闭双机轮询。
+	// 唯一例外是已在上游消失的记录（purge），此路径会同步清掉双机指针。
+	dualManaged := s.isDualManaged(id)
+	missingPurge := sourceTID > 0 && func() bool {
+		row, found := s.Store.InstanceCacheRow(sourceTID, id)
+		return found && !row.Alive
+	}()
+	if dualManaged && !missingPurge {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "该实例由双机轮询接管，请先关闭双机轮询"})
+		return
+	}
 	// A missing instance cannot be deleted upstream (it is already gone), so
 	// only purge the panel record instead of failing with a 404.
 	if sourceTID > 0 {
 		if row, found := s.Store.InstanceCacheRow(sourceTID, id); found && !row.Alive {
 			if err := s.Store.DeleteInstanceCache(sourceTID, id); err != nil {
 				slog.Warn("purge missing instance cache failed", "token_id", sourceTID, "instance_id", id, "error", err)
+			}
+			if err := s.Store.ClearDualInstance(id); err != nil {
+				slog.Warn("clear dual pointer after purge failed", "instance_id", id, "error", err)
 			}
 			writeJSON(w, http.StatusOK, okResponse{OK: true})
 			return
@@ -646,6 +666,9 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		if err := s.Store.DeleteInstanceCache(sourceTID, id); err != nil {
 			slog.Warn("delete instance cache failed", "token_id", sourceTID, "instance_id", id, "error", err)
 		}
+	}
+	if err := s.Store.ClearDualInstance(id); err != nil {
+		slog.Warn("clear dual pointer after delete failed", "instance_id", id, "error", err)
 	}
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }

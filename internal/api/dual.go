@@ -108,6 +108,23 @@ func (m *DualMonitor) due(cfg store.DualConfig) bool {
 
 func (m *DualMonitor) now() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// dualPort 双机链路探测与脚本 SSH 端口：未配置时默认 22。
+// 双机的检测、备用机探测与开机脚本共用同一个端口，避免检测与执行用不同端口。
+func dualPort(cfg store.DualConfig) int {
+	if cfg.Port > 0 {
+		return cfg.Port
+	}
+	return DefaultDualPort
+}
+
+// freshActiveID 读回最新的 active（快照可能已过期，避免轮换后仍用旧值覆盖）。
+func (m *DualMonitor) freshActiveID(tokenID int, fallback int) int {
+	if d, ok := m.srv.Store.DualConfigOf(tokenID); ok && d.ActiveInstanceID > 0 {
+		return d.ActiveInstanceID
+	}
+	return fallback
+}
+
 // isDualManaged 报告实例是否被任一已启用的双机配置接管（用于隔离自动换 IP /
 // 避免重复删机）。
 func (s *Server) isDualManaged(instanceID int) bool {
@@ -128,6 +145,11 @@ func (s *Server) isDualManaged(instanceID int) bool {
 func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 	if cfg.ActiveInstanceID <= 0 {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "未配置使用中实例", m.now())
+		return
+	}
+	// 轮换/重建进行中不重复进入，避免与正在执行的 rotate/rebuildStandbyLoop 竞态。
+	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
+		m.log.Info("双机轮询: 轮换/重建进行中，跳过检测", "token_id", cfg.TokenID)
 		return
 	}
 	if m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID))) {
@@ -154,13 +176,17 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		return
 	}
 	if active.Status != "running" {
-		// 未运行则尝试开机，不计入被墙。
-		if err := api.Boot(ctx, active.ID); err != nil {
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例未运行（"+active.Status+"），尝试开机失败: "+err.Error(), m.now())
-			return
-		}
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例未运行（"+active.Status+"），已尝试开机", m.now())
+		// 未运行不自动开机：手动关机是用户意图，监视器不覆盖（与自动换 IP 的跳过语义一致）。
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例未运行（"+active.Status+"），跳过检测", m.now())
 		return
+	}
+	// 稳态自愈：active 运行时 standby 预期为 offline；若带外被开机（Linode 控制台手动开机等），
+	// 关掉备用机，避免两台同时运行。轮换/重建中已在顶部返回，不会误关正在探测的备用机。
+	if cfg.StandbyInstanceID > 0 && cfg.StandbyInstanceID != active.ID {
+		if st, err := api.GetInstance(ctx, cfg.StandbyInstanceID); err == nil && st.Status == "running" {
+			m.log.Warn("双机轮询: 备用机未关机（带外开机），已关机避免双运行", "standby", cfg.StandbyInstanceID)
+			_ = api.Shutdown(ctx, cfg.StandbyInstanceID)
+		}
 	}
 	ip := ""
 	if len(active.IPv4) > 0 {
@@ -170,7 +196,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例没有公网 IPv4，跳过检测", m.now())
 		return
 	}
-	res := m.checkFn(ctx, ip, cfg.Port)
+	res := m.checkFn(ctx, ip, dualPort(cfg))
 	switch {
 	case res.err != nil:
 		m.log.Warn("双机轮询: 检测出错（不计入失败）", "active", active.ID, "ip", ip, "error", res.err)
@@ -215,9 +241,14 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
-	// 1. 关 A（尽力而为）。
+	// 1. 关 A，并等待其离线再动 B，避免 Shutdown 异步期间两台同时运行。
 	if err := api.Shutdown(ctx, active.ID); err != nil {
 		m.log.Warn("双机轮询: 关闭使用中实例失败（继续）", "active", active.ID, "error", err)
+	}
+	if err := m.waitOffline(ctx, api, active.ID); err != nil {
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "关闭使用中实例超时，取消轮换避免双机同时运行: "+err.Error(), m.now())
+		m.notifyDualFailed(label, "旧使用中实例未及时关机，取消轮换")
+		return
 	}
 
 	// 2. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
@@ -276,7 +307,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	if script == "" {
 		script = DefaultBootScript
 	}
-	if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
+	if err := m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script); err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
 		m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
 		return
@@ -298,10 +329,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 // 若被墙则删机重建（不执行脚本）直到干净或达上限。返回干净的 standby 实例 id。
 func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConfig, pat string, standbyID int, region, typ, image, label, rootPass string, active linode.Instance) (int, error) {
 	api := m.srv.clientFor(pat)
-	sshPort := m.srv.sshPort()
-	if sshPort == 0 {
-		sshPort = 22
-	}
+	sshPort := dualPort(cfg)
 	id := standbyID
 	// 缺失则创建。
 	if id > 0 {
@@ -335,7 +363,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		if err := m.srv.Store.UpsertInstanceCache(cfg.TokenID, newInst); err != nil {
 			m.log.Warn("双机轮询: 更新实例缓存失败", "error", err)
 		}
-		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, cfg.ActiveInstanceID, id)
+		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), id)
 	}
 	// 探测 SSH 是否被墙；被墙则重建直到干净。
 	for i := 0; i < MaxStandbyRebuilds; i++ {
@@ -370,6 +398,8 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			return 0, err
 		}
 	}
+	// 重建不等同于关机：失败时把最后的 standby 关掉，避免与 active 双运行残留。
+	_ = api.Shutdown(ctx, id)
 	return 0, fmt.Errorf("备用机连续 %d 次重建仍被墙，停止以避免费用失控", MaxStandbyRebuilds)
 }
 
@@ -407,7 +437,7 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	_ = m.srv.waitForInstanceStatus(waitCtx, api, newInst.ID, "running")
 	cancel()
-	if err := m.srv.Store.UpdateDualInstances(cfg.TokenID, cfg.ActiveInstanceID, newInst.ID); err != nil {
+	if err := m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), newInst.ID); err != nil {
 		m.log.Warn("双机轮询: 更新备用机指向失败", "error", err)
 	}
 	return newInst.ID, nil
@@ -415,13 +445,16 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 
 // rebuildStandbyLoop 把旧 active（现 standby）删机重建（不执行脚本），循环直到
 // SSH 端口国内可达，然后关机待命。
+// 探测用重建必须开机，但该循环退出时无论以何种路径都关掉 standby，避免与 active 双运行残留。
 func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, standbyID int, rootPass string) {
-	sshPort := m.srv.sshPort()
-	if sshPort == 0 {
-		sshPort = 22
-	}
+	sshPort := dualPort(cfg)
 	api := m.srv.clientFor(pat)
 	id := standbyID
+	defer func() {
+		if id > 0 {
+			_ = api.Shutdown(context.Background(), id)
+		}
+	}()
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		// 用重建任务执行删机重建（跳过脚本），任务日志可在任务页查看。
 		taskID, err := m.srv.Tasks.StartWithOptions(id, "", rootPass, pat, "双机备用重建", true)
@@ -442,7 +475,11 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			return
 		}
 		id = newID
-		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.currentActive(cfg.TokenID, id), id)
+		// 任务完成时 Repoint 已把 standby 更新到 newID；这里只补新鲜 active，
+		// 不能在读不到 active 时回退到 standby，否则会把 active 写成 standby。
+		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok && fresh.ActiveInstanceID > 0 && fresh.ActiveInstanceID != id {
+			_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, fresh.ActiveInstanceID, id)
+		}
 		// 探测新 IP 的 SSH 是否被墙。
 		inst, err := api.GetInstance(context.Background(), id)
 		if err != nil {
@@ -475,18 +512,37 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", fmt.Sprintf("备用机连续 %d 次重建仍被墙，已停止", MaxStandbyRebuilds), m.now())
 }
 
-// currentActive 读取最新的 active id（轮换后可能已变化）；回退用 cfg 的值。
-func (m *DualMonitor) currentActive(tokenID, fallbackStandby int) int {
-	if d, ok := m.srv.Store.DualConfigOf(tokenID); ok && d.ActiveInstanceID > 0 && d.ActiveInstanceID != fallbackStandby {
+// currentActive 读取最新的 active id（轮换后可能已变化）；读不到时返回 0，
+// 调用方应跳过写入，避免把 standby 误写为 active。
+func (m *DualMonitor) currentActive(tokenID, _ int) int {
+	if d, ok := m.srv.Store.DualConfigOf(tokenID); ok && d.ActiveInstanceID > 0 {
 		return d.ActiveInstanceID
 	}
-	// 兜底：DualConfigs 里找。
-	for _, d := range m.srv.Store.DualConfigs() {
-		if d.TokenID == tokenID && d.ActiveInstanceID > 0 {
-			return d.ActiveInstanceID
+	return 0
+}
+
+// waitOffline 等待实例进入 offline；已是离线/未知状态直接通过，
+// 避免对 fake 等未知状态无限等待。
+func (m *DualMonitor) waitOffline(ctx context.Context, api *linode.Client, id int) error {
+	inst, err := api.GetInstance(ctx, id)
+	if err != nil {
+		var apiErr *linode.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return nil
 		}
+		return err
 	}
-	return fallbackStandby
+	switch inst.Status {
+	case "offline", "":
+		return nil
+	case "running", "shutting_down", "booting", "rebooting":
+		// 继续等待
+	default:
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	return m.srv.waitForInstanceStatus(waitCtx, api, id, "offline")
 }
 
 func (m *DualMonitor) awaitTaskNewID(taskID string) int {
@@ -535,15 +591,28 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 			host = ips.SLAACv6()
 		}
 		if host != "" && rootPass != "" {
-			_ = m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script)
+			_ = m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script)
 		}
 	}
-	_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, inst.ID, cfg.ActiveInstanceID)
+	// 扶正后 standby 指向已不存在的旧 active 无法再重建；置 0，下次轮换时重建。
+	_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, inst.ID, 0)
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", fmt.Sprintf("使用中实例丢失，已扶正备用机 #%d", inst.ID), m.now())
 }
 
 // ForceRotate 立即执行一次轮换（不等被墙阈值）。
 func (m *DualMonitor) ForceRotate(ctx context.Context, cfg store.DualConfig) {
+	// 重新读取最新配置，轮换/重建进行中不再并发启动第二次轮换。
+	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+		cfg = fresh
+	}
+	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
+		m.log.Info("双机轮询: 轮换/重建进行中，忽略重复触发", "token_id", cfg.TokenID)
+		return
+	}
+	if m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID))) {
+		m.log.Info("双机轮询: 重建任务进行中，忽略重复触发", "token_id", cfg.TokenID)
+		return
+	}
 	pat, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
 	if err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "取账号凭证失败: "+err.Error(), m.now())

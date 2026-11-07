@@ -50,6 +50,8 @@ func scanDualConfig(sc interface{ Scan(...any) error }) (DualConfig, string, err
 }
 
 // SetDualConfig upsert 账号的双机配置（状态字段保留，只更新设置项与脚本）。
+// 已存在行时也同步更新 A/B 指针：handlePutDual 传入的指针即期望值，
+// 允许换主/换备与迁移后重绑；不传指针的调用方应先读旧值再传入（现有调用点均如此）。
 func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,6 +78,8 @@ func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 		 ON CONFLICT(token_id) DO UPDATE SET
 		   user_id=excluded.user_id, enabled=excluded.enabled, port=excluded.port,
 		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
+		   active_instance_id=excluded.active_instance_id,
+		   standby_instance_id=excluded.standby_instance_id,
 		   script=excluded.script, root_password=excluded.root_password,
 		   updated_at=excluded.updated_at`,
 		d.TokenID, d.UserID, enabled, d.Port, d.Threshold, d.IntervalSec,
@@ -191,4 +195,91 @@ func (s *Store) DeleteDualConfig(tokenID int) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM account_dual WHERE token_id=?`, tokenID)
 	return err
+}
+
+// DualInstanceRole 返回实例在某账号双机对中的角色："active"/"standby"/""。
+func (s *Store) DualInstanceRole(tokenID, instanceID int) string {
+	if d, ok := s.DualConfigOf(tokenID); ok {
+		if d.ActiveInstanceID == instanceID && instanceID > 0 {
+			return "active"
+		}
+		if d.StandbyInstanceID == instanceID && instanceID > 0 {
+			return "standby"
+		}
+	}
+	return ""
+}
+
+// ClearDualInstance 清空所有双机配置中指向 instanceID 的指针（实例被删后调用）。
+func (s *Store) ClearDualInstance(instanceID int) error {
+	if instanceID <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(`UPDATE account_dual SET active_instance_id=0 WHERE active_instance_id=?`, instanceID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE account_dual SET standby_instance_id=0 WHERE standby_instance_id=?`, instanceID)
+	return err
+}
+
+// ReassignDualInstance 把 source 账号双机对中指向 oldID 的角色指针清空，
+// 并在 target 账号已有双机对且对应角色为空时指向 newID（单实例跨账号迁移用）。
+// target 无双机对时仅清空源指针。无匹配时无操作。
+func (s *Store) ReassignDualInstance(sourceTokenID, targetTokenID, oldID, newID int) error {
+	if sourceTokenID <= 0 || oldID <= 0 || newID <= 0 || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	read := func(tokenID int) (DualConfig, bool) {
+		row := s.db.QueryRow(`SELECT `+dualCols+` FROM account_dual WHERE token_id=?`, tokenID)
+		d, _, err := scanDualConfig(row)
+		return d, err == nil
+	}
+	src, ok := read(sourceTokenID)
+	if !ok {
+		return nil
+	}
+	role := ""
+	if src.ActiveInstanceID == oldID {
+		src.ActiveInstanceID = 0
+		role = "active"
+	} else if src.StandbyInstanceID == oldID {
+		src.StandbyInstanceID = 0
+		role = "standby"
+	} else {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`UPDATE account_dual SET active_instance_id=?, standby_instance_id=?, updated_at=? WHERE token_id=?`,
+		src.ActiveInstanceID, src.StandbyInstanceID,
+		time.Now().UTC().Format(time.RFC3339), sourceTokenID); err != nil {
+		return err
+	}
+	if targetTokenID <= 0 || targetTokenID == sourceTokenID {
+		return nil
+	}
+	dst, ok := read(targetTokenID)
+	if !ok {
+		return nil
+	}
+	updated := false
+	if role == "active" && dst.ActiveInstanceID == 0 {
+		dst.ActiveInstanceID = newID
+		updated = true
+	}
+	if role == "standby" && dst.StandbyInstanceID == 0 {
+		dst.StandbyInstanceID = newID
+		updated = true
+	}
+	if updated {
+		_, err := s.db.Exec(
+			`UPDATE account_dual SET active_instance_id=?, standby_instance_id=?, updated_at=? WHERE token_id=?`,
+			dst.ActiveInstanceID, dst.StandbyInstanceID,
+			time.Now().UTC().Format(time.RFC3339), targetTokenID)
+		return err
+	}
+	return nil
 }

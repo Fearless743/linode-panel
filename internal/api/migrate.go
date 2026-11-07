@@ -129,6 +129,11 @@ func (s *Server) handleMigrateInstance(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "实例已创建，但迁移面板记录失败: " + err.Error()})
 		return
 	}
+	// 双机指针跟随迁移：源账号清掉旧 ID，目标账号已有双机对且角色为空时指向新机器。
+	if err := s.Store.ReassignDualInstance(sourceID, req.TargetTokenID, id, inst.ID); err != nil {
+		slog.Warn("迁移实例双机指针失败", "from_token", sourceID, "to_token", req.TargetTokenID,
+			"old_instance_id", id, "new_instance_id", inst.ID, "error", err)
+	}
 	// 显式提供的密码写回配置；未提供时已保存的密码随稳定缓存 id 自动保留。
 	if strings.TrimSpace(req.RootPassword) != "" {
 		if err := s.Store.SetInstanceRootPassword(inst.ID, req.RootPassword); err != nil {

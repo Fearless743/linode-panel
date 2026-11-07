@@ -301,6 +301,11 @@ func (s *Server) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 双机托管实例走双机轮换/重建，单机重建会跑错脚本并破坏备用机待命状态。
+	if s.isDualManaged(id) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "该实例由双机轮询接管，请使用双机轮换或先关闭双机轮询"})
+		return
+	}
 	var req rebuildRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请求体无效"})

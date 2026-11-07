@@ -103,21 +103,28 @@ func (s *Server) handlePutDual(w http.ResponseWriter, r *http.Request) {
 	rootPass := req.RootPassword
 
 	if req.Enabled {
-		// 确定模板/active。
+		// 确定模板/active：显式传模板时切换 active。
+		// 模板等于当前 standby 则交换 A/B；模板是无关机器则旧 active 降为 standby。
 		templateID := req.TemplateInstanceID
-		if activeID <= 0 {
-			if templateID <= 0 {
-				writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请先选择该账号下的模板实例"})
-				return
-			}
-			// 校验模板属于该账号（缓存优先，API 兜底）。
+		if templateID > 0 {
 			spec, ok := s.resolveTemplateSpec(r.Context(), pat, tid, templateID)
 			if !ok {
 				writeJSON(w, http.StatusBadRequest, errorResponse{Error: "模板实例不存在或不属于该账号"})
 				return
 			}
 			_ = spec
-			activeID = templateID
+			if templateID != activeID {
+				if templateID == standbyID {
+					activeID, standbyID = standbyID, activeID
+				} else {
+					// 旧 standby 成为游离机，不再属于双机对。
+					standbyID = activeID
+					activeID = templateID
+				}
+			}
+		} else if activeID <= 0 {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "请先选择该账号下的模板实例"})
+			return
 		}
 		// 脚本与密码：显式提供优先，否则继承模板/已有配置。
 		if strings.TrimSpace(script) == "" {
@@ -320,7 +327,11 @@ func (s *Server) ensureStandbyForAPI(ctx context.Context, pat string, tokenID, u
 	if err := s.Store.UpsertInstanceCache(tokenID, newInst); err != nil {
 		// 缓存失败不阻塞。
 	}
-	_ = s.Store.UpdateDualInstances(tokenID, activeID, newInst.ID)
+	preservedActive := activeID
+	if fresh, ok := s.Store.DualConfigOf(tokenID); ok && fresh.ActiveInstanceID > 0 {
+		preservedActive = fresh.ActiveInstanceID
+	}
+	_ = s.Store.UpdateDualInstances(tokenID, preservedActive, newInst.ID)
 	_ = s.Store.UpdateDualState(tokenID, 0, "idle", "idle",
 		"备用机 #"+strconv.Itoa(newInst.ID)+" 已创建，关机待命", time.Now().UTC().Format(time.RFC3339))
 	return newInst.ID, nil
