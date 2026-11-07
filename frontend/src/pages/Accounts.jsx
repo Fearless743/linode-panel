@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { apiFetch, listAccountAgents, updateAccountToken, listDual, listInstances } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
 import DualModal from "../components/accounts/DualModal";
+import AccountConfigModal from "../components/accounts/AccountConfigModal";
 import AccountMigrateModal from "../components/accounts/AccountMigrateModal";
 import EditFormModal from "../components/ui/EditFormModal";
 import AccountHealthCell from "../components/accounts/AccountHealthCell";
@@ -19,6 +20,7 @@ export default function Accounts() {
   const [addTokenOpen, setAddTokenOpen] = useState(false);
   const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
   const [dualToken, setDualToken] = useState(null); // 双机轮询设置弹窗的账号
+  const [configToken, setConfigToken] = useState(null); // 账号级配置弹窗的账号
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [dualList, setDualList] = useState([]);
   const [allInstances, setAllInstances] = useState([]);
@@ -222,6 +224,9 @@ export default function Accounts() {
                       <span className="agent-unbound">关闭</span>
                     )}
                     <div className="actions" style={{ marginTop: 4 }}>
+                      <button className="action-btn" type="button" onClick={() => setConfigToken(t)}>
+                        账号配置
+                      </button>
                       <button className="action-btn" type="button" onClick={() => setDualToken(t)}>
                         双机设置
                       </button>
@@ -280,6 +285,17 @@ export default function Accounts() {
           busyLabel="保存中…"
           onSubmit={(values) => handleEditSubmit(editToken, values)}
           onClose={() => setEditToken(null)}
+        />
+      )}
+
+      {configToken && (
+        <AccountConfigModal
+          token={configToken}
+          onClose={() => setConfigToken(null)}
+          onSaved={() => {
+            loadDual();
+            loadAllInstances();
+          }}
         />
       )}
 

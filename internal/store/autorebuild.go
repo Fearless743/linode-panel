@@ -2,16 +2,11 @@ package store
 
 import "time"
 
-// AutoRebuild is the per-instance "被墙后自动删机重建换 IP" setting plus the
-// latest monitor state for that instance.
-//
-// Settings (Enabled/Port/Threshold/IntervalSec/UserID/TokenID) are written by
-// the Web UI; the state fields (FailCount/LastStatus/...) are maintained by the
-// background monitor so the UI can show what happened.
-//
-// Configuration is keyed by the instance's stable cache id (CacheID), not by
-// the volatile Linode instance id, so a delete+recreate rebuild inherits it
-// automatically: only instance_cache.instance_id changes.
+// AutoRebuild is the per-instance "被墙后自动删机重建换 IP" view.
+// Settings (Enabled/Port/Threshold/IntervalSec/UserID/TokenID) come from the
+// account-level config; runtime state (FailCount/LastStatus/...) is per instance
+// (keyed by the stable cache id) so each instance in the same account keeps its
+// own probe counters.
 type AutoRebuild struct {
 	CacheID int `json:"-"`
 	// InstanceID is the current Linode instance id, resolved from the cache
@@ -36,63 +31,67 @@ type AutoRebuild struct {
 	UpdatedAt     string `json:"updated_at"`
 }
 
-// autoRebuildCols reads one configuration joined with its cache row so the
-// caller sees the current Linode instance id.
-const autoRebuildCols = `a.cache_id, c.instance_id, a.user_id, a.token_id, a.enabled,
-	a.port, a.threshold, a.interval_sec, a.fail_count, a.last_status,
-	a.last_detail, a.last_check_at, a.last_blocked_at, a.last_task_id, a.updated_at`
-
-const autoRebuildFrom = ` FROM instance_config a JOIN instance_cache c ON c.id = a.cache_id`
-
-// scanAutoRebuild reads one row in autoRebuildCols order.
-func scanAutoRebuild(sc interface{ Scan(...any) error }) (AutoRebuild, error) {
-	var (
-		a       AutoRebuild
-		enabled int
-	)
-	if err := sc.Scan(
-		&a.CacheID, &a.InstanceID, &a.UserID, &a.TokenID, &enabled, &a.Port,
-		&a.Threshold, &a.IntervalSec, &a.FailCount, &a.LastStatus, &a.LastDetail,
-		&a.LastCheckAt, &a.LastBlockedAt, &a.LastTaskID, &a.UpdatedAt,
-	); err != nil {
-		return AutoRebuild{}, err
-	}
-	a.Enabled = enabled != 0
-	return a, nil
+func scanState(dc interface{ Scan(...any) error }, a *AutoRebuild) {
+	_ = dc.Scan(&a.FailCount, &a.LastStatus, &a.LastDetail, &a.LastCheckAt, &a.LastBlockedAt, &a.LastTaskID, &a.UpdatedAt)
 }
 
-// SetAutoRebuild upserts an instance's auto-rebuild settings. Monitor state
-// (fail count, last check, ...) is preserved across edits; only a brand-new
-// row starts with the schema defaults.
+// ensureStateRow guarantees the per-instance runtime row exists.
+func (s *Store) ensureStateRowLocked(cacheID int) {
+	_, _ = s.db.Exec(`INSERT INTO instance_config(cache_id, updated_at) VALUES(?, '')
+		ON CONFLICT(cache_id) DO NOTHING`, cacheID)
+}
+
+func (s *Store) readStateLocked(cacheID int, a *AutoRebuild) {
+	row := s.db.QueryRow(`SELECT fail_count, last_status, last_detail, last_check_at,
+		last_blocked_at, last_task_id, updated_at FROM instance_config WHERE cache_id=?`, cacheID)
+	_ = row.Scan(&a.FailCount, &a.LastStatus, &a.LastDetail, &a.LastCheckAt, &a.LastBlockedAt, &a.LastTaskID, &a.UpdatedAt)
+}
+
+// SetAutoRebuild upserts the account-level auto-rebuild settings for the
+// instance's token. Runtime state is preserved.
 func (s *Store) SetAutoRebuild(a AutoRebuild) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tokenID := a.TokenID
+	if tokenID <= 0 {
+		tok, ok, err := s.tokenForInstanceLocked(a.InstanceID, false)
+		if err != nil {
+			return err
+		}
+		if ok {
+			tokenID = tok
+		}
+	}
+	if tokenID > 0 {
+		if err := s.ensureAccountRowLocked(tokenID, a.UserID); err != nil {
+			return err
+		}
+		en := 0
+		if a.Enabled {
+			en = 1
+		}
+		if _, err := s.db.Exec(`UPDATE account_config
+			SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, has_auto=1, user_id=?, updated_at=?
+			WHERE token_id=?`,
+			en, a.Port, a.Threshold, a.IntervalSec, a.UserID,
+			time.Now().UTC().Format(time.RFC3339), tokenID); err != nil {
+			return err
+		}
+	}
+	// Ensure the per-instance state row exists so UpdateState works.
 	cacheID, _, err := s.cacheIDForInstanceLocked(a.InstanceID, true)
 	if err != nil {
 		return err
 	}
-	enabled := 0
-	if a.Enabled {
-		enabled = 1
+	// anchor 占位行带 token 0 时，修正为声明的账号，使 AutoRebuild 能找回账号配置。
+	if tokenID > 0 {
+		_, _ = s.db.Exec(`UPDATE instance_cache SET token_id=? WHERE id=? AND token_id=0`, tokenID, cacheID)
 	}
-	_, err = s.db.Exec(
-		`INSERT INTO instance_config
-		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
-		    updated_at, has_auto_rebuild)
-		 VALUES(?,?,?,?,?,?,?, ?,1)
-		 ON CONFLICT(cache_id) DO UPDATE SET
-		   user_id=excluded.user_id, token_id=excluded.token_id,
-		   enabled=excluded.enabled, port=excluded.port,
-		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
-		   updated_at=excluded.updated_at, has_auto_rebuild=1`,
-		cacheID, a.UserID, a.TokenID, enabled, a.Port, a.Threshold,
-		a.IntervalSec, time.Now().UTC().Format(time.RFC3339),
-	)
-	return err
+	s.ensureStateRowLocked(cacheID)
+	return nil
 }
 
-// AutoRebuild returns one instance's auto-rebuild config (ok=false when the
-// instance has never been configured).
+// AutoRebuild returns one instance's auto-rebuild view (account settings + own state).
 func (s *Store) AutoRebuild(instanceID int) (AutoRebuild, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,53 +99,79 @@ func (s *Store) AutoRebuild(instanceID int) (AutoRebuild, bool) {
 	if err != nil || !ok {
 		return AutoRebuild{}, false
 	}
-	row := s.db.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=? AND a.has_auto_rebuild=1`, cacheID)
-	a, err := scanAutoRebuild(row)
-	if err != nil {
+	var tokenID int
+	if err := s.db.QueryRow(`SELECT token_id FROM instance_cache WHERE id=?`, cacheID).Scan(&tokenID); err != nil {
 		return AutoRebuild{}, false
 	}
+	var hasAuto int
+	if err := s.db.QueryRow(`SELECT has_auto FROM account_config WHERE token_id=?`, tokenID).Scan(&hasAuto); err != nil {
+		return AutoRebuild{}, false
+	}
+	if hasAuto == 0 {
+		return AutoRebuild{}, false
+	}
+	c, _, ok := s.accountConfigLocked(tokenID)
+	if !ok {
+		return AutoRebuild{}, false
+	}
+	a := AutoRebuild{
+		CacheID: cacheID, InstanceID: instanceID, UserID: c.UserID, TokenID: tokenID,
+		Enabled: c.Enabled, Port: c.Port, Threshold: c.Threshold, IntervalSec: c.IntervalSec,
+		UpdatedAt: c.UpdatedAt,
+	}
+	s.readStateLocked(cacheID, &a)
+	// readStateLocked would overwrite UpdatedAt with state row's stale value; restore account time.
+	a.UpdatedAt = c.UpdatedAt
 	return a, true
 }
 
-// AutoRebuilds returns every configured instance, ordered by the current
-// Linode instance id.
+// AutoRebuilds returns every instance whose account has auto-rebuild config,
+// ordered by current instance id. Runtime state is per instance.
 func (s *Store) AutoRebuilds() []AutoRebuild {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT ` + autoRebuildCols + autoRebuildFrom + ` WHERE a.has_auto_rebuild=1 ORDER BY c.instance_id`)
+	rows, err := s.db.Query(`SELECT c.id, c.instance_id, c.token_id, a.user_id,
+		a.auto_enabled, a.auto_port, a.auto_threshold, a.auto_interval, a.updated_at
+		FROM instance_cache c JOIN account_config a ON a.token_id=c.token_id
+		WHERE a.has_auto=1
+		ORDER BY c.instance_id, c.id`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
 	var out []AutoRebuild
 	for rows.Next() {
-		a, err := scanAutoRebuild(rows)
-		if err != nil {
-			break
+		var a AutoRebuild
+		var en int
+		if err := rows.Scan(&a.CacheID, &a.InstanceID, &a.TokenID, &a.UserID, &en, &a.Port, &a.Threshold, &a.IntervalSec, &a.UpdatedAt); err != nil {
+			continue
 		}
+		a.Enabled = en != 0
 		out = append(out, a)
+	}
+	_ = rows.Close()
+	for i := range out {
+		acctUpdated := out[i].UpdatedAt
+		s.readStateLocked(out[i].CacheID, &out[i])
+		out[i].UpdatedAt = acctUpdated
 	}
 	return out
 }
 
-// DeleteAutoRebuild removes an instance's auto-rebuild config.
+// DeleteAutoRebuild disables the account-level auto-rebuild (affects all
+// instances of the account).
 func (s *Store) DeleteAutoRebuild(instanceID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	tokenID, ok, err := s.tokenForInstanceLocked(instanceID, false)
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE instance_config SET has_auto_rebuild=0, user_id=0, token_id=0, enabled=0, port=22, threshold=3, interval_sec=300, fail_count=0, last_status='', last_detail='', last_check_at='', last_blocked_at='', last_task_id='', updated_at='' WHERE cache_id=?`, cacheID)
-	if err == nil {
-		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
-	}
+	_, err = s.db.Exec(`UPDATE account_config SET auto_enabled=0, has_auto=0, updated_at=? WHERE token_id=?`,
+		time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
 // UpdateAutoRebuildState records the latest monitor result for an instance.
-// Empty strings leave the corresponding column unchanged (e.g. taskID on a
-// plain check).
 func (s *Store) UpdateAutoRebuildState(instanceID, failCount int, status, detail, checkAt, blockedAt, taskID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,8 +183,7 @@ func (s *Store) UpdateAutoRebuildState(instanceID, failCount int, status, detail
 }
 
 // UpdateAutoRebuildStateByCache records the latest monitor result using the
-// stable cache id. Unlike the instance-id variant this keeps working after a
-// rebuild replaced the instance id; the monitor uses it to finish a rebuild.
+// stable cache id.
 func (s *Store) UpdateAutoRebuildStateByCache(cacheID, failCount int, status, detail, checkAt, blockedAt, taskID string) error {
 	if cacheID <= 0 {
 		return nil
@@ -170,6 +194,7 @@ func (s *Store) UpdateAutoRebuildStateByCache(cacheID, failCount int, status, de
 }
 
 func (s *Store) updateAutoRebuildStateLocked(cacheID, failCount int, status, detail, checkAt, blockedAt, taskID string) error {
+	s.ensureStateRowLocked(cacheID)
 	_, err := s.db.Exec(
 		`UPDATE instance_config SET
 		   fail_count=?,
@@ -179,7 +204,7 @@ func (s *Store) updateAutoRebuildStateLocked(cacheID, failCount int, status, det
 		   last_blocked_at=CASE WHEN ?='' THEN last_blocked_at ELSE ? END,
 		   last_task_id=CASE WHEN ?='' THEN last_task_id ELSE ? END,
 		   updated_at=?
-		 WHERE cache_id=? AND has_auto_rebuild=1`,
+		   WHERE cache_id=?`,
 		failCount,
 		status, status,
 		detail, detail,
@@ -192,59 +217,52 @@ func (s *Store) updateAutoRebuildStateLocked(cacheID, failCount int, status, det
 	return err
 }
 
-// MoveAutoRebuild re-points an instance's auto-rebuild config to a new
-// instance id. Delete+recreate rebuilds no longer need this (the stable cache
-// id already follows the instance); it is kept for explicit moves and tests.
-// The monitor state is reset — the new instance starts clean.
+// MoveAutoRebuild moves the per-instance state to a new id and copies the
+// account-level settings to the target token (if different). After the move
+// the old id no longer resolves as configured.
 func (s *Store) MoveAutoRebuild(fromID, toID int) error {
 	if fromID == toID {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	from, ok, err := s.cacheIDForInstanceLocked(fromID, false)
-	if err != nil || !ok {
-		return err
-	}
-	to, _, err := s.cacheIDForInstanceLocked(toID, true)
+	// ensure target cache row exists for nid
+	dstCacheID, _, err := s.cacheIDForInstanceLocked(toID, true)
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	srcTok, _, _ := s.tokenForInstanceLocked(fromID, false)
+	dstTok, _, _ := s.tokenForInstanceLocked(toID, false)
+	// anchor 占位行带 token 0：跟随源账号，使新实例能读到同一套账号配置
+	if dstTok == 0 && srcTok > 0 {
+		_, _ = s.db.Exec(`UPDATE instance_cache SET token_id=? WHERE id=? AND token_id=0`, srcTok, dstCacheID)
+		dstTok = srcTok
 	}
-	defer tx.Rollback()
-	row := tx.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=? AND a.has_auto_rebuild=1`, from)
-	a, err := scanAutoRebuild(row)
-	if err != nil {
-		// Nothing to move (config already removed).
-		return nil
+	// copy account settings across tokens
+	if srcTok > 0 && srcTok != dstTok {
+		c, _, ok := s.accountConfigLocked(srcTok)
+		if ok {
+			if err := s.ensureAccountRowLocked(dstTok, c.UserID); err != nil {
+				return err
+			}
+			en := 0
+			if c.Enabled {
+				en = 1
+			}
+			_, _ = s.db.Exec(`UPDATE account_config
+				SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, has_auto=1, updated_at=?
+				WHERE token_id=?`, en, c.Port, c.Threshold, c.IntervalSec,
+				time.Now().UTC().Format(time.RFC3339), dstTok)
+		}
 	}
-	if _, err := tx.Exec(`UPDATE instance_config SET has_auto_rebuild=0, user_id=0, token_id=0, enabled=0, port=22, threshold=3, interval_sec=300, fail_count=0, last_status='', last_detail='', last_check_at='', last_blocked_at='', last_task_id='', updated_at='' WHERE cache_id=?`, from); err != nil {
-		return err
+	// reset destination state, drop source state + cache rows so old id reads as unconfigured
+	_, _ = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=?`, dstCacheID)
+	s.ensureStateRowLocked(dstCacheID)
+	// Remove source instance's cache + state
+	fromCacheID, _, _ := s.cacheIDForInstanceLocked(fromID, false)
+	if fromCacheID > 0 {
+		_, _ = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=?`, fromCacheID)
+		_, _ = s.db.Exec(`DELETE FROM instance_cache WHERE id=?`, fromCacheID)
 	}
-	enabled := 0
-	if a.Enabled {
-		enabled = 1
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO instance_config
-		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
-		    updated_at, has_auto_rebuild)
-		 VALUES(?,?,?,?,?,?,?, ?,1)
-		 ON CONFLICT(cache_id) DO UPDATE SET
-		   user_id=excluded.user_id, token_id=excluded.token_id,
-		   enabled=excluded.enabled, port=excluded.port,
-		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
-		   updated_at=excluded.updated_at, has_auto_rebuild=1`,
-		to, a.UserID, a.TokenID, enabled, a.Port, a.Threshold, a.IntervalSec,
-		time.Now().UTC().Format(time.RFC3339),
-	); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, from); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }

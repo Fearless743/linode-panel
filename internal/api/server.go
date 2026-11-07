@@ -189,6 +189,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/account/options", s.requireAuth(store.PermPower, s.handleAccountOptions))
 	mux.HandleFunc("POST /api/account/instances", s.requireAuth(store.PermPower, s.handleCreateInstance))
 
+	// 账号级配置（script/root/auto-rebuild），单实例入口仅为别名。
+	mux.HandleFunc("GET /api/account/config/{tid}", s.requireAuth("", s.handleGetAccountConfig))
+	mux.HandleFunc("PUT /api/account/config/{tid}", s.requireAuth("", s.handlePutAccountConfig))
+
 	// 账号迁移：把一个账号的全部实例与面板配置迁移到另一个账号。
 	mux.HandleFunc("POST /api/account/migrate", s.requireAuth("", s.handleMigrateAccount))
 

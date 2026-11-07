@@ -1117,8 +1117,8 @@ func TestSecretsEncryptedAtRest(t *testing.T) {
 	if !isEncryptedSecret(rawToken) || strings.Contains(rawToken, "linode_pat_plaintext") {
 		t.Fatalf("token stored in plaintext: %q", rawToken)
 	}
-	rawPass := rawSecret(t, s, `SELECT password FROM instance_config
-		WHERE cache_id=(SELECT id FROM instance_cache WHERE instance_id=42 LIMIT 1)`)
+	rawPass := rawSecret(t, s, `SELECT root_password FROM account_config
+		WHERE token_id=(SELECT token_id FROM instance_cache WHERE instance_id=42 LIMIT 1)`)
 	if !isEncryptedSecret(rawPass) || strings.Contains(rawPass, "root-secret") {
 		t.Fatalf("root password stored in plaintext: %q", rawPass)
 	}

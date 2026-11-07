@@ -216,6 +216,10 @@ CREATE TABLE IF NOT EXISTS account_dual (
 	if err := s.ensureDualBlockedAtColumn(); err != nil {
 		return fmt.Errorf("迁移 account_dual 表: %w", err)
 	}
+	// 账号级配置表：把原单实例 script/password/auto-rebuild 搬到账号级。
+	if err := s.ensureAccountConfigTable(); err != nil {
+		return fmt.Errorf("迁移账号级配置: %w", err)
+	}
 	return nil
 }
 
@@ -1164,11 +1168,15 @@ func (s *Store) SetSelfAgentName(name string) error {
 func (s *Store) InstanceScript(instanceID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	tokenID, ok, err := s.tokenForInstanceLocked(instanceID, false)
 	if err != nil || !ok {
 		return "", false
 	}
-	return s.instanceScriptLocked(cacheID)
+	c, _, ok := s.accountConfigLocked(tokenID)
+	if !ok || !c.HasScript {
+		return "", false
+	}
+	return c.Script, true
 }
 
 // InstanceScriptForCacheID is InstanceScript addressed by the stable cache id,
@@ -1177,80 +1185,98 @@ func (s *Store) InstanceScript(instanceID int) (string, bool) {
 func (s *Store) InstanceScriptForCacheID(cacheID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.instanceScriptLocked(cacheID)
+	var tokenID int
+	if err := s.db.QueryRow(`SELECT token_id FROM instance_cache WHERE id=?`, cacheID).Scan(&tokenID); err != nil {
+		return "", false
+	}
+	c, _, ok := s.accountConfigLocked(tokenID)
+	if !ok || !c.HasScript {
+		return "", false
+	}
+	return c.Script, true
 }
 
 func (s *Store) instanceScriptLocked(cacheID int) (string, bool) {
-	var script string
-	var has int
-	err := s.db.QueryRow(`SELECT has_script, script FROM instance_config WHERE cache_id=?`, cacheID).Scan(&has, &script)
-	if err != nil || has == 0 {
-		return "", false
-	}
-	return script, true
+	return s.instanceScriptForCacheIDLocked(cacheID)
 }
 
-// SetInstanceScript persists the script configured for an instance.
+func (s *Store) instanceScriptForCacheIDLocked(cacheID int) (string, bool) {
+	var tokenID int
+	if err := s.db.QueryRow(`SELECT token_id FROM instance_cache WHERE id=?`, cacheID).Scan(&tokenID); err != nil {
+		return "", false
+	}
+	c, _, ok := s.accountConfigLocked(tokenID)
+	if !ok || !c.HasScript {
+		return "", false
+	}
+	return c.Script, true
+}
+
+// SetInstanceScript now writes the account-level script (同账号共用)。
 func (s *Store) SetInstanceScript(instanceID int, script string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, _, err := s.cacheIDForInstanceLocked(instanceID, true)
+	tokenID, _, err := s.tokenForInstanceLocked(instanceID, true)
 	if err != nil {
+		return err
+	}
+	if err := s.ensureAccountRowLocked(tokenID, 0); err != nil {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO instance_config(cache_id, script, has_script) VALUES(?, ?, 1)
-		 ON CONFLICT(cache_id) DO UPDATE SET script=excluded.script, has_script=1`, cacheID, script)
+		`UPDATE account_config SET script=?, has_script=1, updated_at=? WHERE token_id=?`,
+		script, time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
-// DeleteInstanceScript removes the instance's script configuration, so the
-// instance falls back to the built-in default template.
+// DeleteInstanceScript clears the account-level script.
 func (s *Store) DeleteInstanceScript(instanceID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	tokenID, ok, err := s.tokenForInstanceLocked(instanceID, false)
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE instance_config SET has_script=0, script='' WHERE cache_id=?`, cacheID)
-	if err == nil {
-		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
-	}
+	_, err = s.db.Exec(`UPDATE account_config SET script='', has_script=0, updated_at=? WHERE token_id=?`,
+		time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
-// InstanceRootPassword returns the root password saved for an instance. The
-// password is stored against the instance's stable cache id, so a rebuild
-// inherits it automatically.
+// InstanceRootPassword returns the account-level root password for the
+// instance's account (同账号共用)。
 func (s *Store) InstanceRootPassword(instanceID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	tokenID, ok, err := s.tokenForInstanceLocked(instanceID, false)
 	if err != nil || !ok {
 		return "", false
 	}
-	return s.instanceRootPasswordLocked(cacheID)
+	_, plain, ok := s.accountConfigLocked(tokenID)
+	if !ok || plain == "" {
+		return "", false
+	}
+	return plain, true
 }
 
 // InstanceRootPasswordForCacheID is InstanceRootPassword addressed by the
-// stable cache id (unambiguous across tokens' snapshots).
+// stable cache id.
 func (s *Store) InstanceRootPasswordForCacheID(cacheID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.instanceRootPasswordLocked(cacheID)
+	return s.instanceRootPasswordForCacheIDLocked(cacheID)
 }
 
 func (s *Store) instanceRootPasswordLocked(cacheID int) (string, bool) {
-	var password string
-	var has int
-	err := s.db.QueryRow(
-		`SELECT has_password, password FROM instance_config WHERE cache_id=?`, cacheID).Scan(&has, &password)
-	if err != nil || has == 0 {
+	return s.instanceRootPasswordForCacheIDLocked(cacheID)
+}
+
+func (s *Store) instanceRootPasswordForCacheIDLocked(cacheID int) (string, bool) {
+	var tokenID int
+	if err := s.db.QueryRow(`SELECT token_id FROM instance_cache WHERE id=?`, cacheID).Scan(&tokenID); err != nil {
 		return "", false
 	}
-	plain, err := s.decryptSecret(password)
-	if err != nil {
+	_, plain, ok := s.accountConfigLocked(tokenID)
+	if !ok || plain == "" {
 		return "", false
 	}
 	return plain, true
@@ -1263,13 +1289,15 @@ func (s *Store) InstanceRootPasswordConfigured(instanceID int) bool {
 	return ok
 }
 
-// SetInstanceRootPassword persists the root password used when (re)creating an
-// instance.
+// SetInstanceRootPassword now writes the account-level root password.
 func (s *Store) SetInstanceRootPassword(instanceID int, password string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, _, err := s.cacheIDForInstanceLocked(instanceID, true)
+	tokenID, _, err := s.tokenForInstanceLocked(instanceID, true)
 	if err != nil {
+		return err
+	}
+	if err := s.ensureAccountRowLocked(tokenID, 0); err != nil {
 		return err
 	}
 	enc, err := s.encryptSecret(password)
@@ -1277,35 +1305,33 @@ func (s *Store) SetInstanceRootPassword(instanceID int, password string) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO instance_config(cache_id, password, has_password) VALUES(?, ?, 1)
-		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password, has_password=1`, cacheID, enc)
+		`UPDATE account_config SET root_password=?, has_password=1, updated_at=? WHERE token_id=?`,
+		enc, time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
-// DeleteInstanceRootPassword removes the saved root password.
+// DeleteInstanceRootPassword clears the account-level root password.
 func (s *Store) DeleteInstanceRootPassword(instanceID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cacheID, ok, err := s.cacheIDForInstanceLocked(instanceID, false)
+	tokenID, ok, err := s.tokenForInstanceLocked(instanceID, false)
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE instance_config SET has_password=0, password='' WHERE cache_id=?`, cacheID)
-	if err == nil {
-		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
-	}
+	_, err = s.db.Exec(`UPDATE account_config SET root_password='', has_password=0, updated_at=? WHERE token_id=?`,
+		time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
 // InstanceScriptIDs returns the current Linode instance ids that have a custom
-// script configured.
+// script configured (account-level script, expanded to all cached instances).
 func (s *Store) InstanceScriptIDs() []int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
 		`SELECT DISTINCT c.instance_id
-		   FROM instance_config s JOIN instance_cache c ON c.id = s.cache_id
-		  WHERE s.has_script=1
+		   FROM instance_cache c JOIN account_config a ON a.token_id = c.token_id
+		  WHERE a.has_script=1
 		  ORDER BY c.instance_id`)
 	if err != nil {
 		return nil
@@ -1612,6 +1638,49 @@ func (s *Store) MigrateInstanceCache(cacheID, targetTokenID int, inst linode.Ins
 	// (e.g. the account was refreshed mid-migration). Fold its configuration
 	// into the migrating row, letting the migrated row's config win, then drop
 	// the duplicate.
+	var srcToken int
+	_ = tx.QueryRow(`SELECT token_id FROM instance_cache WHERE id=?`, cacheID).Scan(&srcToken)
+	// Account-level config follows the instance: copy source account's
+	// script/password/auto settings to the target account.
+	if srcToken > 0 && srcToken != targetTokenID {
+		var script string
+		var hasS, hasP, en int
+		var encPass string
+		var port, th, iv, uid int
+		row := tx.QueryRow(`SELECT user_id, script, has_script, root_password, has_password,
+			auto_enabled, auto_port, auto_threshold, auto_interval
+			FROM account_config WHERE token_id=?`, srcToken)
+		if err := row.Scan(&uid, &script, &hasS, &encPass, &hasP, &en, &port, &th, &iv); err == nil {
+			if port <= 0 {
+				port = 22
+			}
+			if th <= 0 {
+				th = 3
+			}
+			if iv <= 0 {
+				iv = 300
+			}
+			now := time.Now().UTC().Format(time.RFC3339)
+			hasA := 1
+			// 若源账号从未配置自动换 IP，则搬过去也记为未配置，保持语义。
+			if err := tx.QueryRow(`SELECT has_auto FROM account_config WHERE token_id=?`, srcToken).Scan(&hasA); err != nil {
+				hasA = 1
+			}
+			if _, err := tx.Exec(`INSERT INTO account_config
+				(token_id, user_id, script, has_script, root_password, has_password,
+				 auto_enabled, auto_port, auto_threshold, auto_interval, updated_at, has_auto)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(token_id) DO UPDATE SET user_id=excluded.user_id,
+					script=excluded.script, has_script=excluded.has_script,
+					root_password=excluded.root_password, has_password=excluded.has_password,
+					auto_enabled=excluded.auto_enabled, auto_port=excluded.auto_port,
+					auto_threshold=excluded.auto_threshold, auto_interval=excluded.auto_interval,
+					updated_at=excluded.updated_at, has_auto=excluded.has_auto`,
+				targetTokenID, uid, script, hasS, encPass, hasP, en, port, th, iv, now, hasA); err != nil {
+				return err
+			}
+		}
+	}
 	var dupID int
 	err = tx.QueryRow(
 		`SELECT id FROM instance_cache WHERE token_id=? AND instance_id=?`,

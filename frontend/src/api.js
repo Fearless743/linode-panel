@@ -213,6 +213,14 @@ export function listAutoRebuild() {
   return apiFetch("/api/auto-rebuild");
 }
 
+// ---------- 账号级配置（实例仅为缓存，改动影响同账号全部实例） ----------
+export function getAccountConfig(tokenId) {
+  return apiFetch("/api/account/config/" + encodeURIComponent(tokenId));
+}
+export function setAccountConfig(tokenId, payload) {
+  return jsonRequest("/api/account/config/" + encodeURIComponent(tokenId), "PUT", payload);
+}
+
 // ---------- 用户 / Token ----------
 export function listUsers() {
   return apiFetch("/api/users");
