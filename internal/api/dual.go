@@ -307,6 +307,9 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		if _, err := api.GetInstance(ctx, id); err != nil {
 			var apiErr *linode.APIError
 			if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+				if derr := m.srv.Store.DeleteInstanceCache(cfg.TokenID, id); derr != nil {
+					_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, id)
+				}
 				id = 0
 			} else {
 				return 0, fmt.Errorf("读取备用机失败: %w", err)
@@ -383,6 +386,9 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 	}
 	_ = api.Shutdown(ctx, oldID)
 	_ = api.DeleteInstance(ctx, oldID)
+	if derr := m.srv.Store.DeleteInstanceCache(cfg.TokenID, oldID); derr != nil {
+		_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, oldID)
+	}
 	booted := true
 	newInst, err := api.CreateInstance(ctx, linode.CreateOptions{
 		Region: old.Region, Type: old.Type, Image: old.Image, Label: old.Label,
@@ -502,6 +508,8 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "使用中实例已不存在且无备用机", m.now())
 		return
 	}
+	// 旧 active 已消失：保留缓存行（标为不可用）供迁移/清理，避免静默丢失配置。
+	_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, cfg.ActiveInstanceID)
 	api := m.srv.clientFor(pat)
 	inst, err := api.GetInstance(ctx, cfg.StandbyInstanceID)
 	if err != nil {

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -287,6 +288,13 @@ func (s *Server) ensureStandbyForAPI(ctx context.Context, pat string, tokenID, u
 	if cfg.StandbyInstanceID > 0 {
 		if _, err := s.clientFor(pat).GetInstance(ctx, cfg.StandbyInstanceID); err == nil {
 			return cfg.StandbyInstanceID, nil
+		} else {
+			var apiErr *linode.APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+				if derr := s.Store.DeleteInstanceCache(tokenID, cfg.StandbyInstanceID); derr != nil {
+					_ = s.Store.MarkInstanceMissing(tokenID, cfg.StandbyInstanceID)
+				}
+			}
 		}
 	}
 	spec, ok := s.resolveTemplateSpec(ctx, pat, tokenID, activeID)
