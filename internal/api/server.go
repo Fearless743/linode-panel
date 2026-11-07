@@ -407,14 +407,24 @@ func (s *Server) instanceJSONFor(in linode.Instance, tok store.Token, fetchErr s
 		TokenLabel: tok.Label,
 		FetchError: fetchErr,
 		Missing:    missing,
-		DualRole:   s.dualRoleFor(in.ID),
+		DualRole:   s.dualRoleForToken(tok.ID, in.ID),
 	}
 }
 
 // dualRoleFor returns "active" (使用中) / "standby" (备用) / "" for an instance.
 func (s *Server) dualRoleFor(instanceID int) string {
+	return s.dualRoleForToken(0, instanceID)
+}
+
+// dualRoleForToken is token-scoped: only rows matching the instance's own
+// token can be tagged active/standby. Global matching caused an unavailable
+// cached row under another token (or an anchor) to still be labeled 主.
+func (s *Server) dualRoleForToken(tokenID, instanceID int) string {
 	for _, d := range s.Store.DualConfigs() {
 		if !d.Enabled {
+			continue
+		}
+		if tokenID > 0 && d.TokenID != tokenID {
 			continue
 		}
 		if d.ActiveInstanceID == instanceID {
@@ -468,7 +478,7 @@ func (s *Server) handleInstanceRefresh(w http.ResponseWriter, r *http.Request) {
 		Created:    inst.Created,
 		TokenID:    s.tokenIDFor(user, tokenID),
 		TokenLabel: s.tokenLabel(user, tokenID),
-		DualRole:   s.dualRoleFor(inst.ID),
+		DualRole:   s.dualRoleForToken(s.tokenIDFor(user, tokenID), inst.ID),
 	})
 }
 
