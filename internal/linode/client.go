@@ -1,6 +1,7 @@
 package linode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -63,6 +64,15 @@ func (c *Client) Shutdown(ctx context.Context, id int) error {
 // Reboot restarts an instance.
 func (c *Client) Reboot(ctx context.Context, id int) error {
 	return c.do(ctx, http.MethodPost, "/linode/instances/"+strconv.Itoa(id)+"/reboot", nil, nil)
+}
+
+// UpdateLabel renames an instance (PUT /v4/linode/instances/{id}).
+func (c *Client) UpdateLabel(ctx context.Context, id int, label string) error {
+	body, err := json.Marshal(map[string]string{"label": label})
+	if err != nil {
+		return fmt.Errorf("linode api: %w", err)
+	}
+	return c.do(ctx, http.MethodPut, "/linode/instances/"+strconv.Itoa(id), bytes.NewReader(body), nil)
 }
 
 // GetInstanceIPs returns the IPv4/IPv6 addresses of an instance.

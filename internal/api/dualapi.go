@@ -356,14 +356,15 @@ var (
 
 // dualStandbyLabel 由模板名派生备用机名：Linode label 仅允许字母/数字/
 // 下划线/横线/点号，因此后缀用 ASCII "-standby"，并把非法字符替换为 "-"。
+// 主→备 后主会去掉 -standby 前缀（见 renameActiveLabel），因此这里始终追加，避免新备与新主同名成“都是主”。
 func dualStandbyLabel(base string) string {
 	base = strings.TrimSpace(base)
 	if base == "" {
 		base = "dual"
 	}
-	// 已有备用后缀则直接清洗返回，避免重复追加。
+	// 已有备用后缀：先剥掉再加，保持根名稳定，避免每次轮换名字无限变长。
 	if strings.HasSuffix(base, "-standby") {
-		return sanitizeLinodeLabel(base)
+		base = strings.TrimSuffix(base, "-standby")
 	}
 	return sanitizeLinodeLabel(base + "-standby")
 }

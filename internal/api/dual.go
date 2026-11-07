@@ -319,6 +319,8 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 
 	// 5. 交换角色：B 成为 active，旧 A 成为 standby（随后重建）。
+	// 把新主的标签还原为根名（去掉 -standby），使新备机命名不与新主撞名——否则两台会同名“都是主”。
+	m.renameActiveLabel(ctx, api, standbyID, standbyLabel)
 	if err := m.srv.Store.UpdateDualInstances(cfg.TokenID, standbyID, active.ID); err != nil {
 		m.log.Warn("双机轮询: 更新角色失败", "error", err)
 	}
@@ -539,6 +541,21 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", fmt.Sprintf("备用机连续 %d 次重建仍被墙，已停止", MaxStandbyRebuilds), m.now())
 }
 
+// renameActiveLabel 把新主的标签还原为根名（去掉 -standby 后缀），使下次建备机不会与主同名。
+func (m *DualMonitor) renameActiveLabel(ctx context.Context, api *linode.Client, id int, curLabel string) {
+	if curLabel == "" || !strings.HasSuffix(strings.TrimSpace(curLabel), "-standby") {
+		return
+	}
+	newLabel := strings.TrimSuffix(strings.TrimSpace(curLabel), "-standby")
+	if newLabel == "" {
+		newLabel = "dual"
+	}
+	newLabel = sanitizeLinodeLabel(newLabel)
+	if err := api.UpdateLabel(ctx, id, newLabel); err != nil {
+		m.log.Warn("双机轮询: 新主改名失败（继续）", "id", id, "error", err)
+	}
+}
+
 // currentActive 读取最新的 active id（轮换后可能已变化）；读不到时返回 0，
 // 调用方应跳过写入，避免把 standby 误写为 active。
 func (m *DualMonitor) currentActive(tokenID, _ int) int {
@@ -656,6 +673,7 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 			_ = m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script)
 		}
 	}
+	m.renameActiveLabel(ctx, api, inst.ID, inst.Label)
 	// 扶正后 standby 指向已不存在的旧 active 无法再重建；置 0，下次轮换时重建。
 	_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, inst.ID, 0)
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", fmt.Sprintf("使用中实例丢失，已扶正备用机 #%d", inst.ID), m.now())
