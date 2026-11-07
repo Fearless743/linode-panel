@@ -609,6 +609,16 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 				specLabel = row.Label
 			}
 		}
+		if specRegion == "" {
+			// 指针指向的实例缓存都无规格时，兜底该账号缓存里任意一条带规格的行。
+			for _, r := range m.srv.Store.CachedInstanceRows(cfg.TokenID) {
+				if r.Instance.Region != "" {
+					specRegion, specType, specImage = r.Instance.Region, r.Instance.Type, r.Instance.Image
+					specLabel = r.Instance.Label
+					break
+				}
+			}
+		}
 		rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
 		standbyLabel := dualStandbyLabel(specLabel)
 		standbyID := cfg.StandbyInstanceID

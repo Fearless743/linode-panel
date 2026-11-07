@@ -107,6 +107,8 @@ func (s *Store) ensureAccountConfigTable() error {
 			}
 		}
 	}
+	// 清理孤儿账号配置：已删除 token 的配置行不再有归属。
+	_, _ = s.db.Exec(`DELETE FROM account_config WHERE token_id NOT IN (SELECT id FROM tokens) AND token_id!=0`)
 	// Merge old Dual (account_dual) into account_config single place.
 	_ = s.mergeDualIntoAccountConfig()
 	// 已迁移则不再重复（以 token 行存在与否判断）

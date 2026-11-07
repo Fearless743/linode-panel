@@ -1539,7 +1539,7 @@ func (s *Store) CachedInstance(instanceID int) (linode.Instance, bool) {
 		`SELECT instance_id, label, status, region, type, image, ipv4, ipv6,
 		        tags, created, updated
 		   FROM instance_cache WHERE instance_id=?
-		  ORDER BY alive DESC, id LIMIT 1`, instanceID).Scan(
+		  ORDER BY (region!='') DESC, alive DESC, id LIMIT 1`, instanceID).Scan(
 		&in.ID, &in.Label, &in.Status, &in.Region, &in.Type, &in.Image,
 		&ipv4, &in.IPv6, &tags, &in.Created, &in.Updated)
 	if err != nil {
