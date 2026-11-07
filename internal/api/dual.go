@@ -194,6 +194,14 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 			_ = api.Shutdown(ctx, cfg.StandbyInstanceID)
 		}
 	}
+	// 缺备补备：active 健康但 standby 缺失时直接建一台关机备用机，不要等下次轮换。
+	if cfg.StandbyInstanceID <= 0 {
+		m.ensureNeutralStandby(ctx, cfg, pat, active)
+		// 补备完成后继续本轮检测；刷新 cfg
+		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+			cfg = fresh
+		}
+	}
 	ip := ""
 	if len(active.IPv4) > 0 {
 		ip = active.IPv4[0]
@@ -553,6 +561,29 @@ func (m *DualMonitor) renameActiveLabel(ctx context.Context, api *linode.Client,
 	newLabel = sanitizeLinodeLabel(newLabel)
 	if err := api.UpdateLabel(ctx, id, newLabel); err != nil {
 		m.log.Warn("双机轮询: 新主改名失败（继续）", "id", id, "error", err)
+	}
+}
+
+// ensureNeutralStandby 在缺备时按使用中实例规格建一台关机备用机（不执行脚本）。
+func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
+	rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
+	if rootPass == "" {
+		m.log.Warn("双机轮询: 缺备但无 root 密码，跳过补备", "token_id", cfg.TokenID)
+		return
+	}
+	label := dualStandbyLabel(active.Label)
+	specRegion, specType, specImage := active.Region, active.Type, active.Image
+	if row, ok := m.srv.Store.CachedInstance(cfg.StandbyInstanceID); ok && row.Region != "" {
+		specRegion, specType, specImage = row.Region, row.Type, row.Image
+		if row.Label != "" {
+			label = row.Label
+		}
+	}
+	// 有 standby 指针但上游为 404 也视为缺备，ensureCleanStandby 内部处理缺失。
+	standbyID := cfg.StandbyInstanceID
+	if _, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, label, rootPass, active); err != nil {
+		m.log.Warn("双机轮询: 补备失败", "token_id", cfg.TokenID, "error", err)
+		return
 	}
 }
 
