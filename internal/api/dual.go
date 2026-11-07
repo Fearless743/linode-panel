@@ -481,11 +481,12 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 	}()
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		// 用重建任务执行删机重建（跳过脚本），任务日志可在任务页查看。
+		// 被墙或失败都不退出：继续重建，直到拿到没被墙的实例待命（上限防费用失控）。
 		taskID, err := m.srv.Tasks.StartWithOptions(id, "", rootPass, pat, "双机备用重建", true)
 		if err != nil {
-			m.log.Warn("双机轮询: 备用重建启动失败", "id", id, "error", err)
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用重建启动失败: "+err.Error(), m.now())
-			return
+			m.log.Warn("双机轮询: 备用重建启动失败，重试", "id", id, "error", err, "attempt", i+1)
+			time.Sleep(5 * time.Second)
+			continue
 		}
 		newID := m.awaitTaskNewID(taskID)
 		if newID <= 0 {
@@ -494,9 +495,11 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			}
 		}
 		if newID <= 0 {
-			// 任务失败且未产生新实例：下一轮重试（计数清零避免误判）。
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用重建失败，等待下一轮", m.now())
-			return
+			// 任务失败且未产生新实例：继续下一轮重建，直到干净或达上限。
+			m.log.Warn("双机轮询: 备用重建失败，继续下一轮", "id", id, "attempt", i+1)
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用重建失败，继续重建直到未被墙", m.now())
+			// newID 失败优先沿用当前 id 重试（其缓存 spec 仍在），避免 standby 指针悬空。
+			continue
 		}
 		id = newID
 		// 任务完成时 Repoint 已把 standby 更新到 newID；这里只补新鲜 active，
@@ -504,11 +507,11 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok && fresh.ActiveInstanceID > 0 && fresh.ActiveInstanceID != id {
 			_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, fresh.ActiveInstanceID, id)
 		}
-		// 探测新 IP 的 SSH 是否被墙。
+		// 探测新 IP 的 SSH 是否被墙：失败/被墙都不退出，继续重建直到干净。
 		inst, err := api.GetInstance(context.Background(), id)
 		if err != nil {
-			m.log.Warn("双机轮询: 读取重建后备用机失败", "id", id, "error", err)
-			return
+			m.log.Warn("双机轮询: 读取重建后备用机失败，重建", "id", id, "error", err, "attempt", i+1)
+			continue
 		}
 		ip := ""
 		if len(inst.IPv4) > 0 {
@@ -519,9 +522,9 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		}
 		res := m.checkFn(context.Background(), ip, sshPort)
 		if res.err != nil {
-			m.log.Warn("双机轮询: 备用机探测出错", "id", id, "error", res.err)
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机探测出错: "+res.err.Error(), m.now())
-			return
+			m.log.Warn("双机轮询: 备用机探测出错，重建", "id", id, "error", res.err, "attempt", i+1)
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机探测出错，重建: "+res.err.Error(), m.now())
+			continue
 		}
 		if res.blocked {
 			m.log.Info("双机轮询: 重建后仍被墙，继续重建", "id", id, "ip", ip, "attempt", i+1)
