@@ -28,13 +28,10 @@ export default function InstanceTable({
   instances,
   getRowState,
   rebuildRunningIds,
-  customScriptIds,
-  autoRebuildIds,
   hasPerm,
   agentNameForToken,
   onAction,
   onRebuild,
-  onEdit,
   onMigrate,
   onRefreshGroup,
   onDelete,
@@ -88,12 +85,9 @@ export default function InstanceTable({
                   inst={inst}
                   st={getRowState(inst.id)}
                   rebuildRunning={rebuildRunningIds.has(inst.id)}
-                  hasCustomScript={customScriptIds.has(inst.id)}
-                  autoRebuildEnabled={autoRebuildIds.has(inst.id)}
                   hasPerm={hasPerm}
                   onAction={onAction}
                   onRebuild={onRebuild}
-                  onEdit={onEdit}
                   onMigrate={onMigrate}
                   onDelete={onDelete}
                 />

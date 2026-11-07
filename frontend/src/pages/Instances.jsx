@@ -19,7 +19,6 @@ import InstanceTable from "../components/instances/InstanceTable";
 import ActionModal from "../components/instances/ActionModal";
 import RebuildModal from "../components/instances/RebuildModal";
 import CreateInstanceModal from "../components/instances/CreateInstanceModal";
-import InstanceEditModal from "../components/instances/InstanceEditModal";
 import MigrateInstanceModal from "../components/instances/MigrateInstanceModal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 
@@ -33,12 +32,8 @@ export default function Instances() {
   const [rebuildRunningIds, setRebuildRunningIds] = useState(() => new Set());
   const [actionModal, setActionModal] = useState(null); // { inst, action }
   const [rebuildModal, setRebuildModal] = useState(null); // inst
-  const [editModal, setEditModal] = useState(null); // inst
   const [migrateModal, setMigrateModal] = useState(null); // inst
   const [deleteModal, setDeleteModal] = useState(null); // inst
-  const [customScriptIds, setCustomScriptIds] = useState(() => new Set());
-  // 已开启「被墙后自动换 IP」的实例 id 集合（用于行内标记）。
-  const [autoRebuildIds, setAutoRebuildIds] = useState(() => new Set());
   const [tokens, setTokens] = useState([]); // 已绑定账号（PAT），用于创建实例
   const [createOpen, setCreateOpen] = useState(false); // 创建实例模态框
   // 正在按账号批量刷新中的分组 key（token_id，0 表示未绑定账号）。
@@ -77,29 +72,6 @@ export default function Instances() {
       onInstanceMissing: markInstanceMissing,
     });
 
-  // 哪些实例配置了自定义脚本（用于在行内标记）。
-  const loadScriptStatus = useCallback(async () => {
-    if (!hasPerm("script")) return;
-    try {
-      const data = await apiFetch("/api/instance-scripts");
-      setCustomScriptIds(new Set(Array.isArray(data.configured) ? data.configured : []));
-    } catch {
-      // 标记加载失败可忽略：脚本按钮仍可点击。
-    }
-  }, [hasPerm]);
-
-  // 哪些实例开启了「被墙后自动换 IP」（用于行内标记）。
-  const loadAutoRebuildStatus = useCallback(async () => {
-    if (!hasPerm("rebuild")) return;
-    try {
-      const data = await apiFetch("/api/auto-rebuild");
-      const items = Array.isArray(data.auto_rebuild) ? data.auto_rebuild : [];
-      setAutoRebuildIds(new Set(items.filter((i) => i.enabled).map((i) => i.instance_id)));
-    } catch {
-      // 标记加载失败可忽略：自动换 IP 按钮仍可点击。
-    }
-  }, [hasPerm]);
-
   // 已绑定账号（PAT）：供创建实例模态框选择目标账号。
   const loadTokens = useCallback(async () => {
     try {
@@ -132,14 +104,12 @@ export default function Instances() {
       setFirstLoadDone(true);
       resetRowStates();
       bump();
-      loadScriptStatus();
-      loadAutoRebuildStatus();
     } catch (err) {
       showBanner("加载失败：" + (err.message || "未知错误"), false);
     } finally {
       setLoading(false);
     }
-  }, [hideBanner, showBanner, loadScriptStatus, loadAutoRebuildStatus, resetRowStates, bump]);
+  }, [hideBanner, showBanner, resetRowStates, bump]);
 
   // 重建任务运行中时轮询任务列表，以更新重建按钮可用状态。
   const prevRebuildRunningRef = useRef(new Set());
@@ -379,13 +349,10 @@ export default function Instances() {
           instances={instances}
           getRowState={getRowState}
           rebuildRunningIds={rebuildRunningIds}
-          customScriptIds={customScriptIds}
-          autoRebuildIds={autoRebuildIds}
           hasPerm={hasPerm}
           agentNameForToken={boundAgentNameOf}
           onAction={(inst, action) => setActionModal({ inst, action })}
           onRebuild={(inst) => setRebuildModal(inst)}
-          onEdit={(inst) => setEditModal(inst)}
           onMigrate={(inst) => setMigrateModal(inst)}
           onRefreshGroup={refreshGroup}
           refreshingKey={refreshingKey}
@@ -410,16 +377,6 @@ export default function Instances() {
           boundAgentName={boundAgentNameOf(rebuildModal.token_id)}
           onClose={() => setRebuildModal(null)}
           onConfirm={confirmRebuild}
-        />
-      )}
-      {editModal && (
-        <InstanceEditModal
-          inst={editModal}
-          canScript={hasPerm("script")}
-          canAutoRebuild={hasPerm("rebuild")}
-          onClose={() => setEditModal(null)}
-          onScriptChanged={loadScriptStatus}
-          onAutoRebuildChanged={loadAutoRebuildStatus}
         />
       )}
       {migrateModal && (

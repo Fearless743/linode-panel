@@ -103,30 +103,6 @@ export default function InstanceRow({
         );
       }
     }
-    // 「编辑」按钮：合并开机脚本与自动换 IP 两个编辑区；需要其中任一权限才显示。
-    if (hasPerm("script") || hasPerm("rebuild")) {
-      const marks = [hasCustomScript ? "脚本" : "", autoRebuildEnabled ? "自动换IP" : ""]
-        .filter(Boolean)
-        .join("、");
-      buttons.push(
-        <button
-          key="edit"
-          className="action-btn"
-          type="button"
-          title={
-            "编辑：" +
-            [hasPerm("script") ? "开机脚本" : "", hasPerm("rebuild") ? "自动换 IP" : ""]
-              .filter(Boolean)
-              .join("、") +
-            (marks ? "（已配置：" + marks + "）" : "")
-          }
-          onClick={() => onEdit(inst)}
-        >
-          编辑
-          {(hasCustomScript || autoRebuildEnabled) && " •"}
-        </button>
-      );
-    }
     // 「删除」按钮：需 power 权限；过渡态（操作进行中）禁用，避免误删。
     // 对不可用实例，删除只会清理面板中的缓存记录及其配置。
     if (canPower) {
