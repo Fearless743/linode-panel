@@ -597,8 +597,33 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 	api := m.srv.clientFor(pat)
 	inst, err := api.GetInstance(ctx, cfg.StandbyInstanceID)
 	if err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用: "+err.Error(), m.now())
-		return
+		// 备用机也缺失（重建中误删/带外删除等）：按缓存 spec 重建一台再扶正，不要直接报错卡死。
+		specRegion, specType, specImage, specLabel := "", "", "", ""
+		if row, ok := m.srv.Store.CachedInstance(cfg.ActiveInstanceID); ok && row.Region != "" {
+			specRegion, specType, specImage = row.Region, row.Type, row.Image
+			specLabel = row.Label
+		}
+		if specRegion == "" {
+			if row, ok := m.srv.Store.CachedInstance(cfg.StandbyInstanceID); ok && row.Region != "" {
+				specRegion, specType, specImage = row.Region, row.Type, row.Image
+				specLabel = row.Label
+			}
+		}
+		rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
+		standbyLabel := dualStandbyLabel(specLabel)
+		standbyID := cfg.StandbyInstanceID
+		// ensureCleanStandby 内部处理缺失：立即可用 spec 立刻新建（其构造阶段仍需探活）
+		// 但这里 active 本身已失，按缓存重建 standby 再开机扶正。
+		newID, cerr := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, linode.Instance{})
+		if cerr != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用且重建失败: "+err.Error()+" / "+cerr.Error(), m.now())
+			return
+		}
+		inst, err = api.GetInstance(ctx, newID)
+		if err != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用: "+err.Error(), m.now())
+			return
+		}
 	}
 	if inst.Status != "running" {
 		if err := api.Boot(ctx, inst.ID); err != nil {
