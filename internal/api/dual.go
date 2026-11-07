@@ -148,11 +148,17 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		return
 	}
 	// 轮换/重建进行中不重复进入，避免与正在执行的 rotate/rebuildStandbyLoop 竞态。
+	// 若状态卡在 rotating/rebuilding 但并无运行中任务（ForceRotate 误拦截/进程重启导致），视为过期自愈。
+	busy := m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID)))
 	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
-		m.log.Info("双机轮询: 轮换/重建进行中，跳过检测", "token_id", cfg.TokenID)
-		return
+		if !busy {
+			m.log.Warn("双机轮询: 轮换状态疑似卡死（无运行中任务），恢复检测", "token_id", cfg.TokenID, "state", cfg.State)
+		} else {
+			m.log.Info("双机轮询: 轮换/重建进行中，跳过检测", "token_id", cfg.TokenID)
+			return
+		}
 	}
-	if m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID))) {
+	if busy {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "rotating", "rebuilding", "轮换/重建任务进行中，跳过检测", m.now())
 		return
 	}
@@ -600,14 +606,12 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 }
 
 // ForceRotate 立即执行一次轮换（不等被墙阈值）。
+// 注意：handleRotateDual 已做状态拦截并预占 rotating 锁，ForceRotate 不再重复拦截 rotating 本身，
+// 否则预占锁会使自身误判、永久卡死。
 func (m *DualMonitor) ForceRotate(ctx context.Context, cfg store.DualConfig) {
-	// 重新读取最新配置，轮换/重建进行中不再并发启动第二次轮换。
+	// 重新读取最新配置
 	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
 		cfg = fresh
-	}
-	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
-		m.log.Info("双机轮询: 轮换/重建进行中，忽略重复触发", "token_id", cfg.TokenID)
-		return
 	}
 	if m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID))) {
 		m.log.Info("双机轮询: 重建任务进行中，忽略重复触发", "token_id", cfg.TokenID)

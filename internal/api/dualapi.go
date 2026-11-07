@@ -234,8 +234,19 @@ func (s *Server) handleRotateDual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "轮换/重建进行中，请稍后再试"})
-		return
+		// 状态疑似卡死且无运行中任务时允许重试，避免永久锁死。
+		busy := s.Tasks != nil && (s.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && s.Tasks.Busy(cfg.StandbyInstanceID)))
+		// rotating 是同步上锁阶段（ForceRotate 应速进入 rotate），无 Busy 即疑似卡死
+		if busy {
+			writeJSON(w, http.StatusConflict, errorResponse{Error: "轮换/重建进行中，请稍后再试"})
+			return
+		}
+		if cfg.State == "rotating" {
+			// rotating 无 Busy 即上次 ForceRotate 被误拦截/进程重启残留，直接自愈
+		} else {
+			// rebuilding_standby 且无 Busy 时 rebuildStandbyLoop 已结束/未启动，同样自愈
+			// rebuilding 任务若真在跑，Busy 必为 true，这里可安全重置
+		}
 	}
 	if s.dualMonitor == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "双机轮询监控未启用"})
