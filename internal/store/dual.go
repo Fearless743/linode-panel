@@ -166,6 +166,25 @@ func (s *Store) UpdateDualState(tokenID, failCount int, state, status, detail, c
 	return err
 }
 
+// RepointDualInstances 把双机配置中指向 oldID 的实例 id 改为 newID（删机重建后调用）。
+// 仅更新 active/standby 指针，不改变其它设置；无匹配行时无操作。
+func (s *Store) RepointDualInstances(oldID, newID int) error {
+	if oldID <= 0 || newID <= 0 || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`UPDATE account_dual SET active_instance_id=? WHERE active_instance_id=?`, newID, oldID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(
+		`UPDATE account_dual SET standby_instance_id=? WHERE standby_instance_id=?`, newID, oldID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DeleteDualConfig 删除账号的双机配置（两台实例本身保留）。
 func (s *Store) DeleteDualConfig(tokenID int) error {
 	s.mu.Lock()

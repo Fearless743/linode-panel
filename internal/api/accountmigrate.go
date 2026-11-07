@@ -111,16 +111,9 @@ func (s *Server) handleMigrateAccount(w http.ResponseWriter, r *http.Request) {
 		if err := s.clientFor(tgtPAT).AttachAllowAllFirewall(ctx, region, newInst.ID); err != nil {
 			// 尽力而为。
 		}
-		if rootPass != "" {
-			if err := s.Store.SetInstanceRootPassword(newInst.ID, rootPass); err != nil {
-				// 非致命。
-			}
-		}
-		if strings.TrimSpace(script) != "" {
-			if err := s.Store.SetInstanceScript(newInst.ID, script); err != nil {
-				// 非致命。
-			}
-		}
+		// root 密码与开机脚本已挂在源稳定缓存行上，MigrateInstanceCache 会把
+		// 同一行（含配置）迁移到目标账号/新实例，这里不必再写一次，避免
+		// 产生多余的 anchor 行再合并。
 		if err := s.Store.MigrateInstanceCache(row.CacheID, req.TargetTokenID, newInst); err != nil {
 			res.Error = "缓存迁移失败: " + err.Error()
 			resp.Results = append(resp.Results, res)

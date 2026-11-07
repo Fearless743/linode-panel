@@ -117,6 +117,9 @@ func (s *Server) completeAgentCommand(cmd agenthub.Command, result agenthub.Resu
 	case cmd.Type == agenthub.CmdReboot:
 		oldID, oldOK := agenthub.IntParam(cmd.Params["id"])
 		newID, newOK := agenthub.IntParam(result.Payload["new_instance_id"])
+		if !newOK {
+			newID, newOK = agenthub.IntParam(result.Payload["new_id"])
+		}
 		if oldOK && newOK && newID > 0 {
 			s.repointInstanceCache(oldID, newID)
 		}

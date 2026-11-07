@@ -136,6 +136,9 @@ func (s *Server) repointInstanceCache(oldID, newID int) {
 		slog.Warn("repoint instance cache failed", "old_id", oldID, "new_id", newID, "error", err)
 		return
 	}
+	if err := s.Store.RepointDualInstances(oldID, newID); err != nil {
+		slog.Warn("repoint dual instances failed", "old_id", oldID, "new_id", newID, "error", err)
+	}
 	s.bootScriptMu.Lock()
 	if st, ok := s.bootScriptRuns[oldID]; ok {
 		delete(s.bootScriptRuns, oldID)
