@@ -275,10 +275,13 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	standbyID = cleanStandby
 
-	// 3. B 开机（幂等）并等待运行。
-	if err := api.Boot(ctx, standbyID); err != nil {
-		// 已在运行的实例 Boot 会报错，忽略已运行情况：查询确认。
-		if inst, gerr := api.GetInstance(ctx, standbyID); gerr != nil || inst.Status == "offline" {
+	// 3. 启动 B（不新建）：仅当离线时才开机，已在运行时直接进入脚本。
+	if cur, gerr := api.GetInstance(ctx, standbyID); gerr != nil {
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "读取备用机失败: "+gerr.Error(), m.now())
+		m.notifyDualFailed(label, "读取备用机失败: "+gerr.Error())
+		return
+	} else if cur.Status != "running" {
+		if err := api.Boot(ctx, standbyID); err != nil {
 			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机开机失败: "+err.Error(), m.now())
 			m.notifyDualFailed(label, "备用机开机失败: "+err.Error())
 			return
@@ -371,11 +374,30 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		}
 		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), id)
 	}
-	// 探测 SSH 是否被墙；被墙则重建直到干净。
+	// 先开机再探测：离线时 22 端口必然不通，会被误判为被墙而无限重建。
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		inst, err := api.GetInstance(ctx, id)
 		if err != nil {
 			return 0, fmt.Errorf("读取备用机失败: %w", err)
+		}
+		if inst.Status != "running" {
+			if err := api.Boot(ctx, id); err != nil {
+				c, gerr := api.GetInstance(ctx, id)
+				if gerr != nil || c.Status == "offline" || c.Status == "" {
+					return 0, fmt.Errorf("备用机开机失败: %w", err)
+				}
+				inst = c
+			}
+			waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			if err := m.srv.waitForInstanceStatus(waitCtx, api, id, "running"); err != nil {
+				cancel()
+				return 0, fmt.Errorf("等待备用机运行失败: %w", err)
+			}
+			cancel()
+			inst, err = api.GetInstance(ctx, id)
+			if err != nil {
+				return 0, fmt.Errorf("读取备用机失败: %w", err)
+			}
 		}
 		ip := ""
 		if len(inst.IPv4) > 0 {
