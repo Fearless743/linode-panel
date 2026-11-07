@@ -227,7 +227,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 	}
 }
 
-// rotate 执行一次轮换：关 A → 保证 B 干净 → B 开机并执行脚本 → 交换角色 →
+// rotate 执行一次轮换：删 A → 保证 B 干净 → 启动 B 并执行脚本 → 交换角色 →
 // 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
 // 成功后 TG 通知新 IP 与距上次被墙间隔。
 func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
@@ -247,15 +247,11 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
-	// 1. 关 A，并等待其离线再动 B，避免 Shutdown 异步期间两台同时运行。
-	if err := api.Shutdown(ctx, active.ID); err != nil {
-		m.log.Warn("双机轮询: 关闭使用中实例失败（继续）", "active", active.ID, "error", err)
+	// 1. 删 A（不再关机），随后把 B 切为主。删后旧主缓存保留供 rebuildStandbyLoop 从缓存 spec 重建。
+	if err := api.DeleteInstance(ctx, active.ID); err != nil {
+		m.log.Warn("双机轮询: 删除使用中实例失败（继续）", "active", active.ID, "error", err)
 	}
-	if err := m.waitOffline(ctx, api, active.ID); err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "关闭使用中实例超时，取消轮换避免双机同时运行: "+err.Error(), m.now())
-		m.notifyDualFailed(label, "旧使用中实例未及时关机，取消轮换")
-		return
-	}
+	_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, active.ID)
 
 	// 2. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
 	standbyID := cfg.StandbyInstanceID
