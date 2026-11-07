@@ -533,6 +533,29 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", fmt.Sprintf("使用中实例丢失，已扶正备用机 #%d", inst.ID), m.now())
 }
 
+// ForceRotate 立即执行一次轮换（不等被墙阈值）。
+func (m *DualMonitor) ForceRotate(ctx context.Context, cfg store.DualConfig) {
+	pat, err := m.srv.Store.TokenPAT(cfg.UserID, cfg.TokenID)
+	if err != nil {
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "取账号凭证失败: "+err.Error(), m.now())
+		m.notifyDualFailed(m.srv.dualAccountLabel(cfg), "取账号凭证失败: "+err.Error())
+		return
+	}
+	api := m.srv.clientFor(pat)
+	active, err := api.GetInstance(ctx, cfg.ActiveInstanceID)
+	if err != nil {
+		var apiErr *linode.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			m.promoteStandbyAfterLoss(ctx, cfg, pat)
+			return
+		}
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "读取使用中实例失败: "+err.Error(), m.now())
+		m.notifyDualFailed(m.srv.dualAccountLabel(cfg), "读取使用中实例失败: "+err.Error())
+		return
+	}
+	m.rotate(ctx, cfg, pat, active)
+}
+
 // runScriptWithRetry 通过 root 密码 SSH 执行脚本，连接失败最多重试 3 次。
 func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port int, password, script string) error {
 	if port == 0 {

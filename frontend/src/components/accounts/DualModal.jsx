@@ -1,7 +1,7 @@
 // 双机轮询设置弹窗：账号级开关 + 模板实例 + 探测参数 + 脚本/密码。
 import { useState } from "react";
 import Modal from "../Modal";
-import { setDual, checkDual } from "../../api";
+import { setDual, checkDual, forceDualRotate } from "../../api";
 
 function fmtTime(s) {
   if (!s) return "—";
@@ -27,6 +27,28 @@ export default function DualModal({ token, dual, instances, onClose, onSaved }) 
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [detail, setDetail] = useState(dual || null);
+
+  const [rotating, setRotating] = useState(false);
+
+  async function rotateNow() {
+    if (!detail || !detail.active_instance_id) return;
+    if (!window.confirm("立即把使用中实例切换到备用机并重建旧机？")) return;
+    setRotating(true);
+    setStatus({ msg: "已触发立即替换，后台执行中…", cls: "" });
+    try {
+      await forceDualRotate(token.id);
+      setTimeout(async () => {
+        try {
+          const data = await checkDual(token.id);
+          if (data && data.dual) setDetail(data.dual);
+        } catch {}
+      }, 2000);
+    } catch (err) {
+      setStatus({ msg: "触发失败：" + (err.message || "未知错误"), cls: "error" });
+    } finally {
+      setRotating(false);
+    }
+  }
 
   async function save() {
     const p = parseInt(port, 10);
@@ -217,6 +239,11 @@ export default function DualModal({ token, dual, instances, onClose, onSaved }) 
         {detail && detail.active_instance_id > 0 && (
           <button className="btn btn-ghost" type="button" onClick={checkNow} disabled={busy}>
             立即检测
+          </button>
+        )}
+        {detail && detail.active_instance_id > 0 && (
+          <button className="btn btn-danger" type="button" onClick={rotateNow} disabled={busy || rotating}>
+            {rotating ? "触发中…" : "立即替换"}
           </button>
         )}
         <button className="btn btn-primary" type="button" onClick={save} disabled={busy}>

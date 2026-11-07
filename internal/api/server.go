@@ -206,6 +206,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/account/dual/{tid}", s.requireAuth("", s.handlePutDual))
 	mux.HandleFunc("DELETE /api/account/dual/{tid}", s.requireAuth("", s.handleDeleteDual))
 	mux.HandleFunc("POST /api/account/dual/{tid}/check", s.requireAuth("", s.handleCheckDual))
+	mux.HandleFunc("POST /api/account/dual/{tid}/rotate", s.requireAuth("", s.handleRotateDual))
 
 	// View permission.
 	mux.HandleFunc("GET /api/instances", s.requireAuth(store.PermView, s.handleListInstances))

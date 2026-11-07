@@ -204,6 +204,44 @@ func (s *Server) handleDeleteDual(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
 }
 
+// handleRotateDual 立即执行一次轮换（不等被墙阈值）。
+func (s *Server) handleRotateDual(w http.ResponseWriter, r *http.Request) {
+	tid, err := strconv.Atoi(r.PathValue("tid"))
+	if err != nil || tid <= 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "账号 ID 无效"})
+		return
+	}
+	user, _ := UserFrom(r.Context())
+	cfg, ok := s.Store.DualConfigOf(tid)
+	if !ok || cfg.UserID != user.ID {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "该账号未配置双机轮询"})
+		return
+	}
+	if !cfg.Enabled {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "双机轮询未开启"})
+		return
+	}
+	if cfg.ActiveInstanceID <= 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "未配置使用中实例"})
+		return
+	}
+	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "轮换/重建进行中，请稍后再试"})
+		return
+	}
+	if s.dualMonitor == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "双机轮询监控未启用"})
+		return
+	}
+	if s.Tasks != nil && (s.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && s.Tasks.Busy(cfg.StandbyInstanceID))) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "轮换/重建任务进行中，请稍后再试"})
+		return
+	}
+	_ = s.Store.UpdateDualState(tid, cfg.FailCount, "rotating", cfg.LastStatus, "手动触发立即替换", time.Now().UTC().Format(time.RFC3339))
+	go s.dualMonitor.ForceRotate(context.Background(), cfg)
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "token_id": tid})
+}
+
 // handleCheckDual 立即探测一次并返回最新状态。
 func (s *Server) handleCheckDual(w http.ResponseWriter, r *http.Request) {
 	tid, err := strconv.Atoi(r.PathValue("tid"))

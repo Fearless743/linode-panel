@@ -424,6 +424,13 @@ export function checkDual(tokenId) {
   });
 }
 
+// 立即执行一次轮换（不等被墙阈值），异步执行，返回 accepted。
+export function forceDualRotate(tokenId) {
+  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId) + "/rotate", {
+    method: "POST",
+  });
+}
+
 // ---------- TG 通知全局配置（管理员） ----------
 // 返回 { enabled, chat_id, has_token }
 export function getNotify() {
