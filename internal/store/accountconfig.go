@@ -19,6 +19,18 @@ type AccountConfig struct {
 	Threshold  int    `json:"auto_threshold"`
 	IntervalSec int    `json:"auto_interval_seconds"`
 	UpdatedAt  string `json:"updated_at"`
+	// Dual enabled is a switch inside account config (single place)
+	DualEnabled bool `json:"dual_enabled"`
+	DualActiveInstanceID int `json:"dual_active_instance_id,omitempty"`
+	DualStandbyInstanceID int `json:"dual_standby_instance_id,omitempty"`
+	DualState string `json:"dual_state,omitempty"`
+	DualFailCount int `json:"dual_fail_count,omitempty"`
+	DualLastStatus string `json:"dual_last_status,omitempty"`
+	DualLastDetail string `json:"dual_last_detail,omitempty"`
+	DualLastCheckAt string `json:"dual_last_check_at,omitempty"`
+	DualPort int `json:"dual_port,omitempty"`
+	DualThreshold int `json:"dual_threshold,omitempty"`
+	DualIntervalSec int `json:"dual_interval_seconds,omitempty"`
 }
 
 const accountConfigCols = `token_id, user_id, script, has_script, has_password,
@@ -38,7 +50,19 @@ func (s *Store) ensureAccountConfigTable() error {
 		auto_threshold INTEGER NOT NULL DEFAULT 3,
 		auto_interval INTEGER NOT NULL DEFAULT 300,
 		updated_at TEXT NOT NULL DEFAULT '',
-		has_auto INTEGER NOT NULL DEFAULT 0
+		has_auto INTEGER NOT NULL DEFAULT 0,
+		dual_enabled INTEGER NOT NULL DEFAULT 0,
+		dual_port INTEGER NOT NULL DEFAULT 22,
+		dual_threshold INTEGER NOT NULL DEFAULT 3,
+		dual_interval INTEGER NOT NULL DEFAULT 300,
+		dual_active_instance_id INTEGER NOT NULL DEFAULT 0,
+		dual_standby_instance_id INTEGER NOT NULL DEFAULT 0,
+		dual_state TEXT NOT NULL DEFAULT 'idle',
+		dual_fail_count INTEGER NOT NULL DEFAULT 0,
+		dual_last_status TEXT NOT NULL DEFAULT '',
+		dual_last_detail TEXT NOT NULL DEFAULT '',
+		dual_last_check_at TEXT NOT NULL DEFAULT '',
+		dual_last_blocked_at TEXT NOT NULL DEFAULT ''
 	)`)
 	if err != nil {
 		return err
@@ -57,6 +81,34 @@ func (s *Store) ensureAccountConfigTable() error {
 		// 实际迁移行已写在下面 migrate 里；新表首次写入时 migrate 会带 has_auto，
 		// 这里若表刚建且为空，回填无意义。
 	}
+	// dual_* old DBs without columns: add missing columns
+	dualCols := []struct{ name, ddl string }{
+		{"dual_enabled", `ALTER TABLE account_config ADD COLUMN dual_enabled INTEGER NOT NULL DEFAULT 0`},
+		{"dual_port", `ALTER TABLE account_config ADD COLUMN dual_port INTEGER NOT NULL DEFAULT 22`},
+		{"dual_threshold", `ALTER TABLE account_config ADD COLUMN dual_threshold INTEGER NOT NULL DEFAULT 3`},
+		{"dual_interval", `ALTER TABLE account_config ADD COLUMN dual_interval INTEGER NOT NULL DEFAULT 300`},
+		{"dual_active_instance_id", `ALTER TABLE account_config ADD COLUMN dual_active_instance_id INTEGER NOT NULL DEFAULT 0`},
+		{"dual_standby_instance_id", `ALTER TABLE account_config ADD COLUMN dual_standby_instance_id INTEGER NOT NULL DEFAULT 0`},
+		{"dual_state", `ALTER TABLE account_config ADD COLUMN dual_state TEXT NOT NULL DEFAULT 'idle'`},
+		{"dual_fail_count", `ALTER TABLE account_config ADD COLUMN dual_fail_count INTEGER NOT NULL DEFAULT 0`},
+		{"dual_last_status", `ALTER TABLE account_config ADD COLUMN dual_last_status TEXT NOT NULL DEFAULT ''`},
+		{"dual_last_detail", `ALTER TABLE account_config ADD COLUMN dual_last_detail TEXT NOT NULL DEFAULT ''`},
+		{"dual_last_check_at", `ALTER TABLE account_config ADD COLUMN dual_last_check_at TEXT NOT NULL DEFAULT ''`},
+		{"dual_last_blocked_at", `ALTER TABLE account_config ADD COLUMN dual_last_blocked_at TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, c := range dualCols {
+		has, err := s.columnExists("account_config", c.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.Exec(c.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	// Merge old Dual (account_dual) into account_config single place.
+	_ = s.mergeDualIntoAccountConfig()
 	// 已迁移则不再重复（以 token 行存在与否判断）
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM account_config`).Scan(&n); err != nil {
@@ -70,6 +122,67 @@ func (s *Store) ensureAccountConfigTable() error {
 		return err
 	}
 	_ = migrated
+	return nil
+}
+
+func (s *Store) mergeDualIntoAccountConfig() error {
+	has, err := s.tableExists("account_dual")
+	if err != nil || !has {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT token_id, user_id, enabled, port, threshold, interval_sec,
+		active_instance_id, standby_instance_id, state, fail_count, last_status, last_detail, last_check_at, last_blocked_at
+		FROM account_dual`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	type d struct {
+		tokenID, userID, enabled, port, th, iv, active, standby, fail int
+		state, lastStatus, lastDetail, lastCheck, lastBlocked string
+	}
+	var list []d
+	for rows.Next() {
+		var dd d
+		if err := rows.Scan(&dd.tokenID, &dd.userID, &dd.enabled, &dd.port, &dd.th, &dd.iv,
+			&dd.active, &dd.standby, &dd.state, &dd.fail, &dd.lastStatus, &dd.lastDetail, &dd.lastCheck, &dd.lastBlocked); err != nil {
+			continue
+		}
+		list = append(list, dd)
+	}
+	_ = rows.Close()
+	for _, dd := range list {
+		if dd.port <= 0 {
+			dd.port = 22
+		}
+		if dd.th <= 0 {
+			dd.th = 3
+		}
+		if dd.iv <= 0 {
+			dd.iv = 300
+		}
+		// Only fill dual fields when account row doesn't already carry active pointer,
+		// to avoid overwriting newer account data on every open.
+		var curActive int
+		_ = s.db.QueryRow(`SELECT dual_active_instance_id FROM account_config WHERE token_id=?`, dd.tokenID).Scan(&curActive)
+		if curActive != 0 {
+			continue
+		}
+		_, _ = s.db.Exec(`INSERT INTO account_config
+			(token_id, user_id, dual_enabled, dual_port, dual_threshold, dual_interval,
+			 dual_active_instance_id, dual_standby_instance_id, dual_state, dual_fail_count,
+			 dual_last_status, dual_last_detail, dual_last_check_at, dual_last_blocked_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(token_id) DO UPDATE SET dual_enabled=excluded.dual_enabled,
+				dual_port=excluded.dual_port, dual_threshold=excluded.dual_threshold,
+				dual_interval=excluded.dual_interval,
+				dual_active_instance_id=excluded.dual_active_instance_id,
+				dual_standby_instance_id=excluded.dual_standby_instance_id,
+				dual_state=excluded.dual_state, dual_fail_count=excluded.dual_fail_count,
+				dual_last_status=excluded.dual_last_status, dual_last_detail=excluded.dual_last_detail,
+				dual_last_check_at=excluded.dual_last_check_at, dual_last_blocked_at=excluded.dual_last_blocked_at`,
+			dd.tokenID, dd.userID, dd.enabled, dd.port, dd.th, dd.iv, dd.active, dd.standby, dd.state, dd.fail, dd.lastStatus, dd.lastDetail, dd.lastCheck, dd.lastBlocked)
+	}
 	return nil
 }
 
@@ -203,17 +316,23 @@ func (s *Store) migrateInstanceConfigsToAccount() (int, error) {
 func (s *Store) accountConfigLocked(tokenID int) (AccountConfig, string, bool) {
 	row := s.db.QueryRow(`SELECT token_id, user_id, script, has_script, has_password,
 		auto_enabled, auto_port, auto_threshold, auto_interval, updated_at,
-		root_password FROM account_config WHERE token_id=?`, tokenID)
+		root_password, dual_enabled, dual_port, dual_threshold, dual_interval,
+		dual_active_instance_id, dual_standby_instance_id, dual_state, dual_fail_count,
+		dual_last_status, dual_last_detail, dual_last_check_at FROM account_config WHERE token_id=?`, tokenID)
 	var c AccountConfig
 	var enc string
-	var hasS, hasP, en int
+	var hasS, hasP, en, dualEn int
 	if err := row.Scan(&c.TokenID, &c.UserID, &c.Script, &hasS, &hasP, &en,
-		&c.Port, &c.Threshold, &c.IntervalSec, &c.UpdatedAt, &enc); err != nil {
+		&c.Port, &c.Threshold, &c.IntervalSec, &c.UpdatedAt, &enc,
+		&dualEn, &c.DualPort, &c.DualThreshold, &c.DualIntervalSec,
+		&c.DualActiveInstanceID, &c.DualStandbyInstanceID, &c.DualState, &c.DualFailCount,
+		&c.DualLastStatus, &c.DualLastDetail, &c.DualLastCheckAt); err != nil {
 		return AccountConfig{}, "", false
 	}
 	c.HasScript = hasS != 0
 	c.HasPass = hasP != 0
 	c.Enabled = en != 0
+	c.DualEnabled = dualEn != 0
 	plain := ""
 	if enc != "" && c.HasPass {
 		if p, err := s.decryptSecret(enc); err == nil {

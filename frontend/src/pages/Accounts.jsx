@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch, listAccountAgents, updateAccountToken, listDual, listInstances } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
-import DualModal from "../components/accounts/DualModal";
 import AccountConfigModal from "../components/accounts/AccountConfigModal";
 import AccountMigrateModal from "../components/accounts/AccountMigrateModal";
 import EditFormModal from "../components/ui/EditFormModal";
@@ -19,8 +18,7 @@ export default function Accounts() {
   // 弹窗状态。
   const [addTokenOpen, setAddTokenOpen] = useState(false);
   const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
-  const [dualToken, setDualToken] = useState(null); // 双机轮询设置弹窗的账号
-  const [configToken, setConfigToken] = useState(null); // 账号级配置弹窗的账号
+  const [configToken, setConfigToken] = useState(null); // 账号级配置弹窗的账号（双机为其中开关）
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [dualList, setDualList] = useState([]);
   const [allInstances, setAllInstances] = useState([]);
@@ -227,9 +225,6 @@ export default function Accounts() {
                       <button className="action-btn" type="button" onClick={() => setConfigToken(t)}>
                         账号配置
                       </button>
-                      <button className="action-btn" type="button" onClick={() => setDualToken(t)}>
-                        双机设置
-                      </button>
                     </div>
                   </td>
                   <td>
@@ -291,20 +286,8 @@ export default function Accounts() {
       {configToken && (
         <AccountConfigModal
           token={configToken}
+          instances={instancesOf(configToken.id)}
           onClose={() => setConfigToken(null)}
-          onSaved={() => {
-            loadDual();
-            loadAllInstances();
-          }}
-        />
-      )}
-
-      {dualToken && (
-        <DualModal
-          token={dualToken}
-          dual={dualOf(dualToken.id)}
-          instances={instancesOf(dualToken.id)}
-          onClose={() => setDualToken(null)}
           onSaved={() => {
             loadDual();
             loadAllInstances();

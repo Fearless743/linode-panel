@@ -837,7 +837,7 @@ func (s *Store) DeleteUser(id int) error {
 		if _, err := s.db.Exec(`DELETE FROM account_options_cache WHERE token_id=?`, tid); err != nil {
 			return err
 		}
-		if _, err := s.db.Exec(`DELETE FROM account_dual WHERE token_id=?`, tid); err != nil {
+		if _, err := s.db.Exec(`DELETE FROM account_config WHERE token_id=?`, tid); err != nil {
 			return err
 		}
 	}
@@ -950,7 +950,7 @@ func (s *Store) DeleteToken(userID, tokenID int) error {
 		return err
 	}
 	// 双机配置按 token 存放，删号时一并清理，避免监视器轮到孤儿账号。
-	if _, err := s.db.Exec(`DELETE FROM account_dual WHERE token_id=?`, tokenID); err != nil {
+	if _, err := s.db.Exec(`DELETE FROM account_config WHERE token_id=?`, tokenID); err != nil {
 		return err
 	}
 	return nil

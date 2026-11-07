@@ -92,7 +92,7 @@ func (s *Store) DualLastBlockedAt(tokenID int) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var v string
-	_ = s.db.QueryRow(`SELECT last_blocked_at FROM account_dual WHERE token_id=?`, tokenID).Scan(&v)
+	_ = s.db.QueryRow(`SELECT dual_last_blocked_at FROM account_config WHERE token_id=?`, tokenID).Scan(&v)
 	return v
 }
 
@@ -100,7 +100,7 @@ func (s *Store) DualLastBlockedAt(tokenID int) string {
 func (s *Store) SetDualLastBlockedAt(tokenID int, at string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE account_dual SET last_blocked_at=?, updated_at=? WHERE token_id=?`,
+	_, err := s.db.Exec(`UPDATE account_config SET dual_last_blocked_at=?, updated_at=? WHERE token_id=?`,
 		at, at, tokenID)
 	return err
 }

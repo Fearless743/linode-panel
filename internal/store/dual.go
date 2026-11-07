@@ -2,11 +2,9 @@ package store
 
 import "time"
 
-// DualConfig 是账号维度的双机轮询配置与运行状态。
-//
-// 一个账号只管理一对 A/B 实例：ActiveInstanceID 为当前使用中实例，
-// StandbyInstanceID 为闲置备用实例（关机）。脚本与 root 密码按账号保存，
-// 不再按实例保存：启用时从模板实例继承，之后在账号维度编辑。
+// DualConfig is the dual view of the account-level config (single place).
+// Enabled/Active/Standby/State live in account_config.dual_* columns;
+// script/root and detection params remain in the same row.
 type DualConfig struct {
 	TokenID           int    `json:"token_id"`
 	UserID            int    `json:"user_id"`
@@ -16,48 +14,54 @@ type DualConfig struct {
 	IntervalSec       int    `json:"interval_seconds"`
 	ActiveInstanceID  int    `json:"active_instance_id"`
 	StandbyInstanceID int    `json:"standby_instance_id"`
-	State             string `json:"state"` // idle | provisioning | rotating | rebuilding_standby | error
+	State             string `json:"state"`
 	FailCount         int    `json:"fail_count"`
 	LastStatus        string `json:"last_status"`
 	LastDetail        string `json:"last_detail"`
 	LastCheckAt       string `json:"last_check_at"`
-	// Script 与 RootPassword 按账号保存（RootPassword 返回明文，存储时加密）。
-	Script       string `json:"script"`
-	HasRootPass  bool   `json:"has_root_password"`
-	UpdatedAt    string `json:"updated_at"`
+	Script            string `json:"script"`
+	HasRootPass       bool   `json:"has_root_password"`
+	UpdatedAt         string `json:"updated_at"`
 }
 
-const dualCols = `token_id, user_id, enabled, port, threshold, interval_sec,
-	active_instance_id, standby_instance_id, state, fail_count, last_status,
-	last_detail, last_check_at, script, root_password, updated_at`
-
-func scanDualConfig(sc interface{ Scan(...any) error }) (DualConfig, string, error) {
-	var (
-		d       DualConfig
-		enabled int
-		encPass string
-	)
-	if err := sc.Scan(
-		&d.TokenID, &d.UserID, &enabled, &d.Port, &d.Threshold, &d.IntervalSec,
+func (s *Store) scanDualLocked(tokenID int) (DualConfig, bool) {
+	row := s.db.QueryRow(`SELECT token_id, user_id,
+		dual_enabled, dual_port, dual_threshold, dual_interval,
+		dual_active_instance_id, dual_standby_instance_id, dual_state, dual_fail_count,
+		dual_last_status, dual_last_detail, dual_last_check_at,
+		script, has_script, has_password, updated_at
+		FROM account_config WHERE token_id=?`, tokenID)
+	var d DualConfig
+	var enabled, hasS, hasP int
+	if err := row.Scan(&d.TokenID, &d.UserID, &enabled, &d.Port, &d.Threshold, &d.IntervalSec,
 		&d.ActiveInstanceID, &d.StandbyInstanceID, &d.State, &d.FailCount,
-		&d.LastStatus, &d.LastDetail, &d.LastCheckAt, &d.Script, &encPass, &d.UpdatedAt,
-	); err != nil {
-		return DualConfig{}, "", err
+		&d.LastStatus, &d.LastDetail, &d.LastCheckAt,
+		&d.Script, &hasS, &hasP, &d.UpdatedAt); err != nil {
+		return DualConfig{}, false
 	}
 	d.Enabled = enabled != 0
-	d.HasRootPass = encPass != ""
-	return d, encPass, nil
+	d.HasRootPass = hasP != 0
+	return d, true
 }
 
-// SetDualConfig upsert 账号的双机配置（状态字段保留，只更新设置项与脚本）。
-// 已存在行时也同步更新 A/B 指针：handlePutDual 传入的指针即期望值，
-// 允许换主/换备与迁移后重绑；不传指针的调用方应先读旧值再传入（现有调用点均如此）。
+// SetDualConfig upserts the dual switch + pointers (+ detection params).
+// Script/root with account are the same single place; callers pass the
+// account's current values via d.Script/rootPassword.
 func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	enabled := 0
 	if d.Enabled {
 		enabled = 1
+	}
+	if d.Port <= 0 {
+		d.Port = 22
+	}
+	if d.Threshold <= 0 {
+		d.Threshold = 3
+	}
+	if d.IntervalSec <= 0 {
+		d.IntervalSec = 300
 	}
 	encPass := ""
 	if rootPassword != "" {
@@ -67,66 +71,107 @@ func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 		}
 		encPass = enc
 	} else {
-		// 保留已有密码：读出旧值。
-		_ = s.db.QueryRow(`SELECT root_password FROM account_dual WHERE token_id=?`, d.TokenID).Scan(&encPass)
+		_ = s.db.QueryRow(`SELECT root_password FROM account_config WHERE token_id=?`, d.TokenID).Scan(&encPass)
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO account_dual
-		   (token_id, user_id, enabled, port, threshold, interval_sec,
-		    active_instance_id, standby_instance_id, script, root_password, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(token_id) DO UPDATE SET
-		   user_id=excluded.user_id, enabled=excluded.enabled, port=excluded.port,
-		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
-		   active_instance_id=excluded.active_instance_id,
-		   standby_instance_id=excluded.standby_instance_id,
-		   script=excluded.script, root_password=excluded.root_password,
-		   updated_at=excluded.updated_at`,
+	hasScript := 0
+	if d.Script != "" {
+		hasScript = 1
+	}
+	hasPass := 0
+	if encPass != "" {
+		hasPass = 1
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Exec(`INSERT INTO account_config
+		(token_id, user_id, dual_enabled, dual_port, dual_threshold, dual_interval,
+		 dual_active_instance_id, dual_standby_instance_id,
+		 script, has_script, root_password, has_password, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(token_id) DO UPDATE SET
+			user_id=excluded.user_id, dual_enabled=excluded.dual_enabled,
+			dual_port=excluded.dual_port, dual_threshold=excluded.dual_threshold,
+			dual_interval=excluded.dual_interval,
+			dual_active_instance_id=excluded.dual_active_instance_id,
+			dual_standby_instance_id=excluded.dual_standby_instance_id,
+			script=excluded.script, has_script=excluded.has_script,
+			root_password=excluded.root_password, has_password=excluded.has_password,
+			updated_at=excluded.updated_at`,
 		d.TokenID, d.UserID, enabled, d.Port, d.Threshold, d.IntervalSec,
-		d.ActiveInstanceID, d.StandbyInstanceID, d.Script, encPass,
-		time.Now().UTC().Format(time.RFC3339),
-	)
+		d.ActiveInstanceID, d.StandbyInstanceID, d.Script, hasScript, encPass, hasPass, now)
 	return err
 }
 
-// DualConfigOf 返回某账号的双机配置。
+// DualConfigOf returns dual view from the account row.
 func (s *Store) DualConfigOf(tokenID int) (DualConfig, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	row := s.db.QueryRow(`SELECT `+dualCols+` FROM account_dual WHERE token_id=?`, tokenID)
-	d, _, err := scanDualConfig(row)
-	if err != nil {
+	// Only return dual if the row was ever configured for dual (dual pointers/state set
+	// or explicit enabled). To keep old behavior (row exists only after SetDual),
+	// we check: dual_enabled or active/standby or state != idle or dual_last_status set.
+	// Simplest: if account row exists and (enabled or active/standby assigned) then ok.
+	// But tests create dual via SetDual always have row.
+	// We need to distinguish "never configured" (no dual row) from "configured but disabled".
+	// Use presence of dual_enabled/active/standby/state in the row created by SetDual
+	// or migration; for migration-less rows created only for script, dual fields are defaults
+	// indistinguishable. Track via active/standby/state: if all default, treat as not configured
+	// only when the row was created without dual. Migration sets active/state, so that covers legacy.
+	// For new writes, SetDual creates row with state ''? we set state '' default idle.
+	// Heuristic: if account row exists, check if dual was ever set by looking at dual_state != 'idle' or active/standby !=0 or enabled.
+	// To avoid false positives for script-only rows, return false when all dual fields are untouched.
+	d, ok := s.scanDualLocked(tokenID)
+	if !ok {
+		return DualConfig{}, false
+	}
+	// Row exists but may be script-only (no dual ever set): treat as no dual.
+	if !d.Enabled && d.ActiveInstanceID == 0 && d.StandbyInstanceID == 0 && (d.State == "" || d.State == "idle") && d.LastStatus == "" {
 		return DualConfig{}, false
 	}
 	return d, true
 }
 
-// DualConfigs 返回所有双机配置。
+// DualConfigs returns all dual rows (account rows that have dual pointers or enabled).
+// For compatibility, list every account row that was ever dual-configured.
 func (s *Store) DualConfigs() []DualConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT ` + dualCols + ` FROM account_dual ORDER BY token_id`)
+	rows, err := s.db.Query(`SELECT token_id, user_id,
+		dual_enabled, dual_port, dual_threshold, dual_interval,
+		dual_active_instance_id, dual_standby_instance_id, dual_state, dual_fail_count,
+		dual_last_status, dual_last_detail, dual_last_check_at,
+		script, has_script, has_password, updated_at
+		FROM account_config ORDER BY token_id`)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 	var out []DualConfig
 	for rows.Next() {
-		d, _, err := scanDualConfig(rows)
-		if err != nil {
-			break
+		var d DualConfig
+		var en, hasS, hasP int
+		if err := rows.Scan(&d.TokenID, &d.UserID, &en, &d.Port, &d.Threshold, &d.IntervalSec,
+			&d.ActiveInstanceID, &d.StandbyInstanceID, &d.State, &d.FailCount,
+			&d.LastStatus, &d.LastDetail, &d.LastCheckAt,
+			&d.Script, &hasS, &hasP, &d.UpdatedAt); err != nil {
+			continue
+		}
+		d.Enabled = en != 0
+		d.HasRootPass = hasP != 0
+		// Only list rows that ever had dual (to keep UI list clean, filter untouched script-only rows)
+		if !d.Enabled && d.ActiveInstanceID == 0 && d.StandbyInstanceID == 0 && (d.State == "" || d.State == "idle") && d.LastStatus == "" {
+			// Still include if the row was created via dual path? Without marker, skip script-only.
+			continue
 		}
 		out = append(out, d)
 	}
 	return out
 }
 
-// DualRootPassword 返回账号保存的 root 密码明文。
+// DualRootPassword returns the account root password (single place).
 func (s *Store) DualRootPassword(tokenID int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var enc string
-	if err := s.db.QueryRow(`SELECT root_password FROM account_dual WHERE token_id=?`, tokenID).Scan(&enc); err != nil || enc == "" {
+	if err := s.db.QueryRow(`SELECT root_password FROM account_config WHERE token_id=?`, tokenID).Scan(&enc); err != nil || enc == "" {
 		return "", false
 	}
 	plain, err := s.decryptSecret(enc)
@@ -136,28 +181,27 @@ func (s *Store) DualRootPassword(tokenID int) (string, bool) {
 	return plain, true
 }
 
-// UpdateDualInstances 更新双机对的 A/B 实例 id（轮换时调用）。
+// UpdateDualInstances updates A/B pointers.
 func (s *Store) UpdateDualInstances(tokenID, activeID, standbyID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		`UPDATE account_dual SET active_instance_id=?, standby_instance_id=?, updated_at=? WHERE token_id=?`,
+		`UPDATE account_config SET dual_active_instance_id=?, dual_standby_instance_id=?, updated_at=? WHERE token_id=?`,
 		activeID, standbyID, time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 
-// UpdateDualState 记录双机最近一次检查/轮换状态。
+// UpdateDualState records dual state.
 func (s *Store) UpdateDualState(tokenID, failCount int, state, status, detail, checkAt string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		`UPDATE account_dual SET
-		   fail_count=?,
-		   state=CASE WHEN ?='' THEN state ELSE ? END,
-		   last_status=CASE WHEN ?='' THEN last_status ELSE ? END,
-		   last_detail=CASE WHEN ?='' THEN last_detail ELSE ? END,
-		   last_check_at=CASE WHEN ?='' THEN last_check_at ELSE ? END,
-		   updated_at=?
+		`UPDATE account_config SET dual_fail_count=?,
+			dual_state=CASE WHEN ?='' THEN dual_state ELSE ? END,
+			dual_last_status=CASE WHEN ?='' THEN dual_last_status ELSE ? END,
+			dual_last_detail=CASE WHEN ?='' THEN dual_last_detail ELSE ? END,
+			dual_last_check_at=CASE WHEN ?='' THEN dual_last_check_at ELSE ? END,
+			updated_at=?
 		 WHERE token_id=?`,
 		failCount,
 		state, state,
@@ -170,34 +214,32 @@ func (s *Store) UpdateDualState(tokenID, failCount int, state, status, detail, c
 	return err
 }
 
-// RepointDualInstances 把双机配置中指向 oldID 的实例 id 改为 newID（删机重建后调用）。
-// 仅更新 active/standby 指针，不改变其它设置；无匹配行时无操作。
+// RepointDualInstances.
 func (s *Store) RepointDualInstances(oldID, newID int) error {
 	if oldID <= 0 || newID <= 0 || oldID == newID {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
-		`UPDATE account_dual SET active_instance_id=? WHERE active_instance_id=?`, newID, oldID); err != nil {
+	if _, err := s.db.Exec(`UPDATE account_config SET dual_active_instance_id=? WHERE dual_active_instance_id=?`, newID, oldID); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(
-		`UPDATE account_dual SET standby_instance_id=? WHERE standby_instance_id=?`, newID, oldID); err != nil {
-		return err
-	}
-	return nil
-}
-
-// DeleteDualConfig 删除账号的双机配置（两台实例本身保留）。
-func (s *Store) DeleteDualConfig(tokenID int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM account_dual WHERE token_id=?`, tokenID)
+	_, err := s.db.Exec(`UPDATE account_config SET dual_standby_instance_id=? WHERE dual_standby_instance_id=?`, newID, oldID)
 	return err
 }
 
-// DualInstanceRole 返回实例在某账号双机对中的角色："active"/"standby"/""。
+// DeleteDualConfig clears the dual switch and pointers in the single account row.
+func (s *Store) DeleteDualConfig(tokenID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE account_config SET dual_enabled=0, dual_active_instance_id=0,
+		dual_standby_instance_id=0, dual_state='idle', dual_fail_count=0,
+		dual_last_status='', dual_last_detail='', dual_last_check_at='', dual_last_blocked_at='',
+		updated_at=? WHERE token_id=?`, time.Now().UTC().Format(time.RFC3339), tokenID)
+	return err
+}
+
+// DualInstanceRole.
 func (s *Store) DualInstanceRole(tokenID, instanceID int) string {
 	if d, ok := s.DualConfigOf(tokenID); ok {
 		if d.ActiveInstanceID == instanceID && instanceID > 0 {
@@ -210,23 +252,21 @@ func (s *Store) DualInstanceRole(tokenID, instanceID int) string {
 	return ""
 }
 
-// ClearDualInstance 清空所有双机配置中指向 instanceID 的指针（实例被删后调用）。
+// ClearDualInstance.
 func (s *Store) ClearDualInstance(instanceID int) error {
 	if instanceID <= 0 {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`UPDATE account_dual SET active_instance_id=0 WHERE active_instance_id=?`, instanceID); err != nil {
+	if _, err := s.db.Exec(`UPDATE account_config SET dual_active_instance_id=0 WHERE dual_active_instance_id=?`, instanceID); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE account_dual SET standby_instance_id=0 WHERE standby_instance_id=?`, instanceID)
+	_, err := s.db.Exec(`UPDATE account_config SET dual_standby_instance_id=0 WHERE dual_standby_instance_id=?`, instanceID)
 	return err
 }
 
-// ReassignDualInstance 把 source 账号双机对中指向 oldID 的角色指针清空，
-// 并在 target 账号已有双机对且对应角色为空时指向 newID（单实例跨账号迁移用）。
-// target 无双机对时仅清空源指针。无匹配时无操作。
+// ReassignDualInstance.
 func (s *Store) ReassignDualInstance(sourceTokenID, targetTokenID, oldID, newID int) error {
 	if sourceTokenID <= 0 || oldID <= 0 || newID <= 0 || oldID == newID {
 		return nil
@@ -234,9 +274,7 @@ func (s *Store) ReassignDualInstance(sourceTokenID, targetTokenID, oldID, newID 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	read := func(tokenID int) (DualConfig, bool) {
-		row := s.db.QueryRow(`SELECT `+dualCols+` FROM account_dual WHERE token_id=?`, tokenID)
-		d, _, err := scanDualConfig(row)
-		return d, err == nil
+		return s.scanDualLocked(tokenID)
 	}
 	src, ok := read(sourceTokenID)
 	if !ok {
@@ -253,7 +291,7 @@ func (s *Store) ReassignDualInstance(sourceTokenID, targetTokenID, oldID, newID 
 		return nil
 	}
 	if _, err := s.db.Exec(
-		`UPDATE account_dual SET active_instance_id=?, standby_instance_id=?, updated_at=? WHERE token_id=?`,
+		`UPDATE account_config SET dual_active_instance_id=?, dual_standby_instance_id=?, updated_at=? WHERE token_id=?`,
 		src.ActiveInstanceID, src.StandbyInstanceID,
 		time.Now().UTC().Format(time.RFC3339), sourceTokenID); err != nil {
 		return err
@@ -276,7 +314,7 @@ func (s *Store) ReassignDualInstance(sourceTokenID, targetTokenID, oldID, newID 
 	}
 	if updated {
 		_, err := s.db.Exec(
-			`UPDATE account_dual SET active_instance_id=?, standby_instance_id=?, updated_at=? WHERE token_id=?`,
+			`UPDATE account_config SET dual_active_instance_id=?, dual_standby_instance_id=?, updated_at=? WHERE token_id=?`,
 			dst.ActiveInstanceID, dst.StandbyInstanceID,
 			time.Now().UTC().Format(time.RFC3339), targetTokenID)
 		return err
