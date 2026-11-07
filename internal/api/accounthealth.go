@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"linode-panel/internal/linode"
@@ -95,3 +98,46 @@ func probeAccountHealthWith(p accountHealthProber, ctx context.Context) (status,
 	}
 	return HealthOK, fmt.Sprintf("余额正常：欠款 %.2f，未出账 %.2f", acct.Balance, acct.BalanceUninvoiced)
 }
+
+const DefaultBalanceThreshold = 0.0
+
+func ClassifyAccountError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var apiErr *linode.APIError
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	msg := strings.ToLower(apiErr.Reason)
+	switch apiErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return HealthBanned
+	case http.StatusBadRequest:
+		if containsAny(msg, "insufficient", "not enough", "balance", "funds") {
+			return HealthNoBalance
+		}
+	}
+	return ""
+}
+
+func containsAny(s string, keywords ...string) bool {
+	for _, kw := range keywords {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func BalanceExhausted(balance, uninvoiced, threshold float64) bool {
+	return balance > threshold || uninvoiced > threshold
+}
+
+const (
+	HealthOK        = "ok"
+	HealthBlocked   = "blocked"
+	HealthNoBalance = "no_balance"
+	HealthBanned    = "banned"
+	HealthError     = "error"
+)

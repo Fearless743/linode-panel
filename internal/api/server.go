@@ -186,21 +186,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/account/options", s.requireAuth(store.PermPower, s.handleAccountOptions))
 	mux.HandleFunc("POST /api/account/instances", s.requireAuth(store.PermPower, s.handleCreateInstance))
 
-	// 账号组：任何登录用户管理自己的账号组与成员。
-	mux.HandleFunc("GET /api/account/groups", s.requireAuth("", s.handleListAccountGroups))
-	mux.HandleFunc("POST /api/account/groups", s.requireAuth("", s.handleCreateAccountGroup))
-	mux.HandleFunc("PUT /api/account/groups/{gid}", s.requireAuth("", s.handleUpdateAccountGroup))
-	mux.HandleFunc("DELETE /api/account/groups/{gid}", s.requireAuth("", s.handleDeleteAccountGroup))
-	mux.HandleFunc("POST /api/account/groups/{gid}/tokens", s.requireAuth("", s.handleAddAccountGroupMember))
-	mux.HandleFunc("DELETE /api/account/groups/{gid}/tokens/{tid}", s.requireAuth("", s.handleRemoveAccountGroupMember))
-	mux.HandleFunc("GET /api/account/groups/{gid}/instance-config", s.requireAuth("", s.handleGetAccountGroupInstanceConfig))
-	mux.HandleFunc("PUT /api/account/groups/{gid}/instance-config", s.requireAuth("", s.handlePutAccountGroupInstanceConfig))
-
-	// 账号组自动替换：组内某账号封号/无余额时换到另一账号。
-	mux.HandleFunc("GET /api/account/failover", s.requireAuth("", s.handleListFailover))
-	mux.HandleFunc("PUT /api/account/failover/{iid}", s.requireAuth("", s.handlePutFailover))
-	mux.HandleFunc("DELETE /api/account/failover/{iid}", s.requireAuth("", s.handleDeleteFailover))
-
 	// 账号迁移：把一个账号的全部实例与面板配置迁移到另一个账号。
 	mux.HandleFunc("POST /api/account/migrate", s.requireAuth("", s.handleMigrateAccount))
 

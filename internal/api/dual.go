@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,7 +109,7 @@ func (m *DualMonitor) due(cfg store.DualConfig) bool {
 func (m *DualMonitor) now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // isDualManaged 报告实例是否被任一已启用的双机配置接管（用于隔离自动换 IP /
-// 账号组替换，避免重复删机）。
+// 避免重复删机）。
 func (s *Server) isDualManaged(instanceID int) bool {
 	if instanceID <= 0 {
 		return false
@@ -599,4 +600,16 @@ func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port 
 		}
 	}
 	return fmt.Errorf("SSH 连接失败（已尝试 3 次）: %w", lastErr)
+}
+
+func (s *Server) dualAccountLabel(cfg store.DualConfig) string {
+	for _, t := range s.Store.TokensOf(cfg.UserID) {
+		if t.ID == cfg.TokenID {
+			if t.Label != "" {
+				return t.Label + " (#" + strconv.Itoa(t.ID) + ")"
+			}
+			return "#" + strconv.Itoa(t.ID)
+		}
+	}
+	return "#" + strconv.Itoa(cfg.TokenID)
 }

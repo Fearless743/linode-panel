@@ -130,7 +130,7 @@ export default function DualModal({ token, dual, instances, onClose, onSaved }) 
           />
           <span className="exec-option-text">
             <span>开启双机轮询</span>
-            <span className="exec-option-sub">一个账号只管理一对 A/B；双机实例自动跳过自动换IP/账号组替换</span>
+            <span className="exec-option-sub">一个账号只管理一对 A/B；双机实例自动跳过自动换IP</span>
           </span>
         </label>
       </div>

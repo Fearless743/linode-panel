@@ -642,7 +642,7 @@ func TestInstanceScriptHTTP(t *testing.T) {
 
 // TestRebuildInheritsInstanceConfig verifies the stable-cache-id design: after
 // a delete+recreate rebuild the new Linode id inherits the old instance's
-// boot script, auto-rebuild and failover configuration.
+// boot script and auto-rebuild configuration.
 func TestRebuildInheritsInstanceConfig(t *testing.T) {
 	h := newStatefulHarness(t)
 	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
@@ -668,12 +668,6 @@ func TestRebuildInheritsInstanceConfig(t *testing.T) {
 	if err := srv.Store.SetAutoRebuild(store.AutoRebuild{
 		InstanceID: 42, UserID: 1, TokenID: tok.ID, Enabled: true,
 		Port: 22, Threshold: 3, IntervalSec: 300,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.Store.SetFailover(store.Failover{
-		InstanceID: 42, UserID: 1, GroupID: 1, TokenID: tok.ID, Enabled: true,
-		Threshold: 3, IntervalSec: 300,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -704,9 +698,6 @@ func TestRebuildInheritsInstanceConfig(t *testing.T) {
 	}
 	if cfg, ok := srv.Store.AutoRebuild(newID); !ok || !cfg.Enabled {
 		t.Fatalf("AutoRebuild(%d) = %+v, %v", newID, cfg, ok)
-	}
-	if cfg, ok := srv.Store.Failover(newID); !ok || !cfg.Enabled {
-		t.Fatalf("Failover(%d) = %+v, %v", newID, cfg, ok)
 	}
 	// The replacement instance is created with the inherited root password.
 	if createdOpts.RootPass != "Secret123!" {

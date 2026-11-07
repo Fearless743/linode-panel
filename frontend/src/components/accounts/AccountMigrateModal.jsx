@@ -39,7 +39,7 @@ export default function AccountMigrateModal({ tokens, onClose }) {
     <Modal title="账号迁移" onClose={onClose}>
       <p className="boot-script-hint">
         把源账号的全部实例与面板配置（开机脚本、root 密码、自动换 IP、替换配置）迁移到目标账号：
-        在目标账号按相同配置创建新实例并迁移缓存记录；可选删除源实例。账号级双机配置、Agent 绑定与账号组成员关系也会同步。
+        在目标账号按相同配置创建新实例并迁移缓存记录；可选删除源实例。账号级双机配置与 Agent 绑定也会同步。
       </p>
       <div className="modal-field">
         <label htmlFor="mig-source">源账号</label>

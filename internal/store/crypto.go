@@ -198,7 +198,7 @@ func (s *Store) encryptLegacySecrets() error {
 	if err := s.encryptLegacyColumn("tokens", "id", "token"); err != nil {
 		return fmt.Errorf("加密 PAT: %w", err)
 	}
-	if err := s.encryptLegacyColumn("instance_root_passwords", "cache_id", "password"); err != nil {
+	if err := s.encryptLegacyColumn("instance_config", "cache_id", "password"); err != nil {
 		return fmt.Errorf("加密 root 密码: %w", err)
 	}
 	// The registration code lives in the meta key/value table.
@@ -227,7 +227,7 @@ func (s *Store) encryptLegacySecrets() error {
 func (s *Store) verifySecretsDecryptable() error {
 	checks := []struct{ q string }{
 		{`SELECT token FROM tokens WHERE token <> '' LIMIT 1`},
-		{`SELECT password FROM instance_root_passwords WHERE password <> '' LIMIT 1`},
+		{`SELECT password FROM instance_config WHERE password <> '' LIMIT 1`},
 		{`SELECT value FROM meta WHERE key='reg_code' AND value <> '' LIMIT 1`},
 	}
 	for _, c := range checks {

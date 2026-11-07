@@ -126,29 +126,26 @@ CREATE TABLE IF NOT EXISTS tokens (
 	token    TEXT NOT NULL,
 	agent_id INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS instance_scripts (
-	cache_id INTEGER PRIMARY KEY,
-	script   TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS instance_root_passwords (
-	cache_id INTEGER PRIMARY KEY,
-	password TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS instance_auto_rebuild (
-	cache_id        INTEGER PRIMARY KEY,
-	user_id         INTEGER NOT NULL DEFAULT 0,
-	token_id        INTEGER NOT NULL DEFAULT 0,
-	enabled         INTEGER NOT NULL DEFAULT 0,
-	port            INTEGER NOT NULL DEFAULT 22,
-	threshold       INTEGER NOT NULL DEFAULT 3,
-	interval_sec    INTEGER NOT NULL DEFAULT 300,
-	fail_count      INTEGER NOT NULL DEFAULT 0,
-	last_status     TEXT NOT NULL DEFAULT '',
-	last_detail     TEXT NOT NULL DEFAULT '',
-	last_check_at   TEXT NOT NULL DEFAULT '',
-	last_blocked_at TEXT NOT NULL DEFAULT '',
-	last_task_id    TEXT NOT NULL DEFAULT '',
-	updated_at      TEXT NOT NULL DEFAULT ''
+CREATE TABLE IF NOT EXISTS instance_config (
+	cache_id         INTEGER PRIMARY KEY,
+	has_script       INTEGER NOT NULL DEFAULT 0,
+	script           TEXT NOT NULL DEFAULT '',
+	has_password     INTEGER NOT NULL DEFAULT 0,
+	password         TEXT NOT NULL DEFAULT '',
+	has_auto_rebuild INTEGER NOT NULL DEFAULT 0,
+	user_id          INTEGER NOT NULL DEFAULT 0,
+	token_id         INTEGER NOT NULL DEFAULT 0,
+	enabled          INTEGER NOT NULL DEFAULT 0,
+	port             INTEGER NOT NULL DEFAULT 22,
+	threshold        INTEGER NOT NULL DEFAULT 3,
+	interval_sec     INTEGER NOT NULL DEFAULT 300,
+	fail_count       INTEGER NOT NULL DEFAULT 0,
+	last_status      TEXT NOT NULL DEFAULT '',
+	last_detail      TEXT NOT NULL DEFAULT '',
+	last_check_at    TEXT NOT NULL DEFAULT '',
+	last_blocked_at  TEXT NOT NULL DEFAULT '',
+	last_task_id     TEXT NOT NULL DEFAULT '',
+	updated_at       TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS instance_cache (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,35 +165,6 @@ CREATE TABLE IF NOT EXISTS instance_cache (
 	alive       INTEGER NOT NULL DEFAULT 1,
 	stale       INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(token_id, instance_id)
-);
-CREATE TABLE IF NOT EXISTS account_groups (
-	id             INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id        INTEGER NOT NULL,
-	name           TEXT NOT NULL,
-	created_at     TEXT NOT NULL DEFAULT '',
-	instance_config TEXT NOT NULL DEFAULT '',
-	UNIQUE(user_id, name)
-);
-CREATE TABLE IF NOT EXISTS account_group_members (
-	group_id INTEGER NOT NULL,
-	token_id INTEGER NOT NULL,
-	PRIMARY KEY (group_id, token_id)
-);
-CREATE TABLE IF NOT EXISTS instance_failover (
-	cache_id     INTEGER PRIMARY KEY,
-	user_id      INTEGER NOT NULL DEFAULT 0,
-	group_id     INTEGER NOT NULL DEFAULT 0,
-	token_id     INTEGER NOT NULL DEFAULT 0,
-	enabled      INTEGER NOT NULL DEFAULT 0,
-	threshold    INTEGER NOT NULL DEFAULT 3,
-	interval_sec INTEGER NOT NULL DEFAULT 300,
-	fail_count   INTEGER NOT NULL DEFAULT 0,
-	last_status  TEXT NOT NULL DEFAULT '',
-	last_detail  TEXT NOT NULL DEFAULT '',
-	last_check_at TEXT NOT NULL DEFAULT '',
-	last_task_id TEXT NOT NULL DEFAULT '',
-	replaced_by  INTEGER NOT NULL DEFAULT 0,
-	updated_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS account_options_cache (
 	token_id   INTEGER PRIMARY KEY,
@@ -231,10 +199,6 @@ CREATE TABLE IF NOT EXISTS account_dual (
 	if err := s.ensureTokenAgentColumn(); err != nil {
 		return fmt.Errorf("迁移 tokens 表: %w", err)
 	}
-	// 旧库的 account_groups 表缺少 instance_config 列（目标开机配置），需要补列。
-	if err := s.ensureAccountGroupInstanceConfigColumn(); err != nil {
-		return fmt.Errorf("迁移 account_groups 表: %w", err)
-	}
 	// instance_cache 需要自增 id + alive/stale（稳定实例标识），旧库需要重建表。
 	if err := s.ensureInstanceCacheIDColumn(); err != nil {
 		return fmt.Errorf("迁移 instance_cache 表: %w", err)
@@ -243,6 +207,10 @@ CREATE TABLE IF NOT EXISTS account_dual (
 	// 关联后，删机重建只需更新缓存行的 instance_id，配置自动跟随新实例。
 	if err := s.ensureInstanceConfigCacheIDs(); err != nil {
 		return fmt.Errorf("迁移实例配置表: %w", err)
+	}
+	// 将同一类型的 per-instance 配置表合并为 instance_config 一张表。
+	if err := s.ensureInstanceConfigMerged(); err != nil {
+		return fmt.Errorf("合并实例配置表: %w", err)
 	}
 	// 双机表补 last_blocked_at 列（记录每次被墙时间，用于通知间隔）。
 	if err := s.ensureDualBlockedAtColumn(); err != nil {
@@ -263,22 +231,6 @@ func (s *Store) ensureTokenAgentColumn() error {
 		return nil
 	}
 	_, err = s.db.Exec(`ALTER TABLE tokens ADD COLUMN agent_id INTEGER NOT NULL DEFAULT 0`)
-	return err
-}
-
-// ensureAccountGroupInstanceConfigColumn adds the instance_config column to an
-// existing account_groups table created before the pre-filled boot-config
-// feature. New databases get the column from the schema above; this is a no-op
-// guard for old ones.
-func (s *Store) ensureAccountGroupInstanceConfigColumn() error {
-	has, err := s.columnExists("account_groups", "instance_config")
-	if err != nil {
-		return err
-	}
-	if has {
-		return nil
-	}
-	_, err = s.db.Exec(`ALTER TABLE account_groups ADD COLUMN instance_config TEXT NOT NULL DEFAULT ''`)
 	return err
 }
 
@@ -412,28 +364,6 @@ var instanceConfigTables = []struct {
 			"interval_sec", "fail_count", "last_status", "last_detail",
 			"last_check_at", "last_blocked_at", "last_task_id", "updated_at"},
 	},
-	{
-		name: "instance_failover",
-		ddl: `CREATE TABLE %s (
-			cache_id     INTEGER PRIMARY KEY,
-			user_id      INTEGER NOT NULL DEFAULT 0,
-			group_id     INTEGER NOT NULL DEFAULT 0,
-			token_id     INTEGER NOT NULL DEFAULT 0,
-			enabled      INTEGER NOT NULL DEFAULT 0,
-			threshold    INTEGER NOT NULL DEFAULT 3,
-			interval_sec INTEGER NOT NULL DEFAULT 300,
-			fail_count   INTEGER NOT NULL DEFAULT 0,
-			last_status  TEXT NOT NULL DEFAULT '',
-			last_detail  TEXT NOT NULL DEFAULT '',
-			last_check_at TEXT NOT NULL DEFAULT '',
-			last_task_id TEXT NOT NULL DEFAULT '',
-			replaced_by  INTEGER NOT NULL DEFAULT 0,
-			updated_at   TEXT NOT NULL DEFAULT ''
-		)`,
-		cols: []string{"user_id", "group_id", "token_id", "enabled", "threshold",
-			"interval_sec", "fail_count", "last_status", "last_detail",
-			"last_check_at", "last_task_id", "replaced_by", "updated_at"},
-	},
 }
 
 // ensureInstanceConfigCacheIDs upgrades config tables that were keyed by the
@@ -499,6 +429,114 @@ func (s *Store) migrateConfigTableToCacheID(name, ddl string, cols []string) err
 	return tx.Commit()
 }
 
+// ensureInstanceConfigMerged merges the legacy per-instance configuration tables
+// (instance_scripts, instance_root_passwords, instance_auto_rebuild) into the
+// single instance_config table, then drops the old tables. Idempotent.
+func (s *Store) ensureInstanceConfigMerged() error {
+	hasScripts, err := s.tableExists("instance_scripts")
+	if err != nil {
+		return err
+	}
+	hasPasswords, err := s.tableExists("instance_root_passwords")
+	if err != nil {
+		return err
+	}
+	hasAuto, err := s.tableExists("instance_auto_rebuild")
+	if err != nil {
+		return err
+	}
+	if hasScripts {
+		if _, err := s.db.Exec(`INSERT INTO instance_config (cache_id, script, has_script)
+			SELECT cache_id, script, 1 FROM instance_scripts s
+			WHERE NOT EXISTS (SELECT 1 FROM instance_config c WHERE c.cache_id = s.cache_id)`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE instance_config
+			SET script = (SELECT script FROM instance_scripts s WHERE s.cache_id = instance_config.cache_id),
+			    has_script = 1
+			WHERE cache_id IN (SELECT cache_id FROM instance_scripts)
+			  AND has_script = 0`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`DROP TABLE instance_scripts`); err != nil {
+			return err
+		}
+	}
+	if hasPasswords {
+		if _, err := s.db.Exec(`INSERT INTO instance_config (cache_id, password, has_password)
+			SELECT cache_id, password, 1 FROM instance_root_passwords p
+			WHERE NOT EXISTS (SELECT 1 FROM instance_config c WHERE c.cache_id = p.cache_id)`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE instance_config
+			SET password = (SELECT password FROM instance_root_passwords p WHERE p.cache_id = instance_config.cache_id),
+			    has_password = 1
+			WHERE cache_id IN (SELECT cache_id FROM instance_root_passwords)
+			  AND has_password = 0`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`DROP TABLE instance_root_passwords`); err != nil {
+			return err
+		}
+	}
+	if hasAuto {
+		if _, err := s.db.Exec(`INSERT INTO instance_config
+			(cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
+			 fail_count, last_status, last_detail, last_check_at, last_blocked_at,
+			 last_task_id, updated_at, has_auto_rebuild)
+			SELECT cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
+			 fail_count, last_status, last_detail, last_check_at, last_blocked_at,
+			 last_task_id, updated_at, 1
+			FROM instance_auto_rebuild a
+			WHERE NOT EXISTS (SELECT 1 FROM instance_config c WHERE c.cache_id = a.cache_id)`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE instance_config
+			SET user_id = (SELECT user_id FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    token_id = (SELECT token_id FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    enabled = (SELECT enabled FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    port = (SELECT port FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    threshold = (SELECT threshold FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    interval_sec = (SELECT interval_sec FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    fail_count = (SELECT fail_count FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    last_status = (SELECT last_status FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    last_detail = (SELECT last_detail FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    last_check_at = (SELECT last_check_at FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    last_blocked_at = (SELECT last_blocked_at FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    last_task_id = (SELECT last_task_id FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    updated_at = (SELECT updated_at FROM instance_auto_rebuild a WHERE a.cache_id = instance_config.cache_id),
+			    has_auto_rebuild = 1
+			WHERE cache_id IN (SELECT cache_id FROM instance_auto_rebuild)
+			  AND has_auto_rebuild = 0`); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`DROP TABLE instance_auto_rebuild`); err != nil {
+			return err
+		}
+	}
+	hasFailover, err := s.tableExists("instance_failover")
+	if err != nil {
+		return err
+	}
+	if hasFailover {
+		if _, err := s.db.Exec(`DROP TABLE instance_failover`); err != nil {
+			return err
+		}
+	}
+	for _, t := range []string{"account_group_members", "account_groups"} {
+		exists, err := s.tableExists(t)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if _, err := s.db.Exec(`DROP TABLE ` + t); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // cacheIDForInstanceLocked returns the canonical cache id for a Linode
 // instance id (the smallest id across all tokens' snapshots). When ensure is
 // true and no row exists, a token-less anchor row is inserted so configuration
@@ -532,10 +570,7 @@ func (s *Store) cacheIDForInstanceLocked(instanceID int, ensure bool) (int, bool
 // per-instance configuration are kept as dead anchors (so the stable id keeps
 // resolving); the rest are deleted.
 func (s *Store) dropTokenCacheLocked(tokenID int) error {
-	const referenced = `id IN (SELECT cache_id FROM instance_scripts
-	                           UNION SELECT cache_id FROM instance_root_passwords
-	                           UNION SELECT cache_id FROM instance_auto_rebuild
-	                           UNION SELECT cache_id FROM instance_failover)`
+	const referenced = `id IN (SELECT cache_id FROM instance_config)`
 	if _, err := s.db.Exec(
 		`UPDATE instance_cache SET alive=0, stale=1 WHERE token_id=? AND `+referenced, tokenID); err != nil {
 		return err
@@ -543,6 +578,17 @@ func (s *Store) dropTokenCacheLocked(tokenID int) error {
 	_, err := s.db.Exec(
 		`DELETE FROM instance_cache WHERE token_id=? AND NOT (`+referenced+`)`, tokenID)
 	return err
+}
+
+// tableExists reports whether a table with the given name exists.
+func (s *Store) tableExists(table string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // columnExists reports whether table has a column named col.
@@ -1129,8 +1175,9 @@ func (s *Store) InstanceScriptForCacheID(cacheID int) (string, bool) {
 
 func (s *Store) instanceScriptLocked(cacheID int) (string, bool) {
 	var script string
-	err := s.db.QueryRow(`SELECT script FROM instance_scripts WHERE cache_id=?`, cacheID).Scan(&script)
-	if err != nil {
+	var has int
+	err := s.db.QueryRow(`SELECT has_script, script FROM instance_config WHERE cache_id=?`, cacheID).Scan(&has, &script)
+	if err != nil || has == 0 {
 		return "", false
 	}
 	return script, true
@@ -1145,8 +1192,8 @@ func (s *Store) SetInstanceScript(instanceID int, script string) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO instance_scripts(cache_id, script) VALUES(?, ?)
-		 ON CONFLICT(cache_id) DO UPDATE SET script=excluded.script`, cacheID, script)
+		`INSERT INTO instance_config(cache_id, script, has_script) VALUES(?, ?, 1)
+		 ON CONFLICT(cache_id) DO UPDATE SET script=excluded.script, has_script=1`, cacheID, script)
 	return err
 }
 
@@ -1159,7 +1206,10 @@ func (s *Store) DeleteInstanceScript(instanceID int) error {
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`DELETE FROM instance_scripts WHERE cache_id=?`, cacheID)
+	_, err = s.db.Exec(`UPDATE instance_config SET has_script=0, script='' WHERE cache_id=?`, cacheID)
+	if err == nil {
+		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
+	}
 	return err
 }
 
@@ -1186,9 +1236,10 @@ func (s *Store) InstanceRootPasswordForCacheID(cacheID int) (string, bool) {
 
 func (s *Store) instanceRootPasswordLocked(cacheID int) (string, bool) {
 	var password string
+	var has int
 	err := s.db.QueryRow(
-		`SELECT password FROM instance_root_passwords WHERE cache_id=?`, cacheID).Scan(&password)
-	if err != nil {
+		`SELECT has_password, password FROM instance_config WHERE cache_id=?`, cacheID).Scan(&has, &password)
+	if err != nil || has == 0 {
 		return "", false
 	}
 	plain, err := s.decryptSecret(password)
@@ -1219,8 +1270,8 @@ func (s *Store) SetInstanceRootPassword(instanceID int, password string) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO instance_root_passwords(cache_id, password) VALUES(?, ?)
-		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password`, cacheID, enc)
+		`INSERT INTO instance_config(cache_id, password, has_password) VALUES(?, ?, 1)
+		 ON CONFLICT(cache_id) DO UPDATE SET password=excluded.password, has_password=1`, cacheID, enc)
 	return err
 }
 
@@ -1232,7 +1283,10 @@ func (s *Store) DeleteInstanceRootPassword(instanceID int) error {
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`DELETE FROM instance_root_passwords WHERE cache_id=?`, cacheID)
+	_, err = s.db.Exec(`UPDATE instance_config SET has_password=0, password='' WHERE cache_id=?`, cacheID)
+	if err == nil {
+		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
+	}
 	return err
 }
 
@@ -1243,7 +1297,8 @@ func (s *Store) InstanceScriptIDs() []int {
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
 		`SELECT DISTINCT c.instance_id
-		   FROM instance_scripts s JOIN instance_cache c ON c.id = s.cache_id
+		   FROM instance_config s JOIN instance_cache c ON c.id = s.cache_id
+		  WHERE s.has_script=1
 		  ORDER BY c.instance_id`)
 	if err != nil {
 		return nil
@@ -1520,13 +1575,8 @@ func (s *Store) DeleteInstanceCache(tokenID, instanceID int) error {
 	if err != nil {
 		return err
 	}
-	for _, table := range []string{
-		"instance_scripts", "instance_root_passwords",
-		"instance_auto_rebuild", "instance_failover",
-	} {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE cache_id=?`, cacheID); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(`DELETE FROM instance_config WHERE cache_id=?`, cacheID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM instance_cache WHERE id=?`, cacheID); err != nil {
 		return err
@@ -1602,12 +1652,7 @@ func (s *Store) MigrateInstanceCache(cacheID, targetTokenID int, inst linode.Ins
 	// Background monitors read the account from the config row; point them at
 	// the account now hosting the instance.
 	if _, err := tx.Exec(
-		`UPDATE instance_auto_rebuild SET token_id=? WHERE cache_id=?`,
-		targetTokenID, cacheID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(
-		`UPDATE instance_failover SET token_id=? WHERE cache_id=?`,
+		`UPDATE instance_config SET token_id=? WHERE cache_id=? AND has_auto_rebuild=1`,
 		targetTokenID, cacheID); err != nil {
 		return err
 	}
@@ -1718,33 +1763,61 @@ func (s *Store) RepointInstanceCache(oldID, newID int) error {
 // another when a repointed row collides with an already-cached new instance.
 // The destination's existing configuration wins when both are present.
 func mergeConfigToCacheID(tx *sql.Tx, fromID, toID int) error {
-	stmts := []string{
-		`INSERT INTO instance_scripts (cache_id, script)
-		 SELECT ?, script FROM instance_scripts WHERE cache_id=?
-		 ON CONFLICT(cache_id) DO NOTHING`,
-		`INSERT INTO instance_root_passwords (cache_id, password)
-		 SELECT ?, password FROM instance_root_passwords WHERE cache_id=?
-		 ON CONFLICT(cache_id) DO NOTHING`,
-		`INSERT INTO instance_auto_rebuild
-		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec, updated_at)
-		 SELECT ?, user_id, token_id, enabled, port, threshold, interval_sec, updated_at
-		   FROM instance_auto_rebuild WHERE cache_id=?
-		 ON CONFLICT(cache_id) DO NOTHING`,
-		`INSERT INTO instance_failover
-		   (cache_id, user_id, group_id, token_id, enabled, threshold, interval_sec, updated_at)
-		 SELECT ?, user_id, group_id, token_id, enabled, threshold, interval_sec, updated_at
-		   FROM instance_failover WHERE cache_id=?
-		 ON CONFLICT(cache_id) DO NOTHING`,
+	if _, err := tx.Exec(`INSERT INTO instance_config(cache_id) VALUES(?) ON CONFLICT(cache_id) DO NOTHING`, toID); err != nil {
+		return err
 	}
-	for _, stmt := range stmts {
-		if _, err := tx.Exec(stmt, toID, fromID); err != nil {
-			return err
+	var (
+		hasScript, hasPass, hasAuto int
+		script, password            string
+		userID, tokenID, enabled   int
+		port, threshold, interval  int
+		failCount                  int
+		lastStatus, lastDetail     string
+		lastCheckAt, lastBlockedAt string
+		lastTaskID, updatedAt      string
+	)
+	err := tx.QueryRow(`SELECT has_script, script, has_password, password,
+		has_auto_rebuild, user_id, token_id, enabled, port, threshold, interval_sec,
+		fail_count, last_status, last_detail, last_check_at, last_blocked_at,
+		last_task_id, updated_at
+		FROM instance_config WHERE cache_id=?`, fromID).Scan(
+		&hasScript, &script, &hasPass, &password,
+		&hasAuto, &userID, &tokenID, &enabled, &port, &threshold, &interval,
+		&failCount, &lastStatus, &lastDetail, &lastCheckAt, &lastBlockedAt,
+		&lastTaskID, &updatedAt,
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if hasScript == 1 {
+			if _, err := tx.Exec(`UPDATE instance_config SET script=?, has_script=1 WHERE cache_id=? AND has_script=0`, script, toID); err != nil {
+				return err
+			}
+		}
+		if hasPass == 1 {
+			if _, err := tx.Exec(`UPDATE instance_config SET password=?, has_password=1 WHERE cache_id=? AND has_password=0`, password, toID); err != nil {
+				return err
+			}
+		}
+		if hasAuto == 1 {
+			if _, err := tx.Exec(`UPDATE instance_config SET
+				user_id=?, token_id=?, enabled=?, port=?, threshold=?, interval_sec=?,
+				fail_count=?, last_status=?, last_detail=?, last_check_at=?,
+				last_blocked_at=?, last_task_id=?, updated_at=?, has_auto_rebuild=1
+				WHERE cache_id=? AND has_auto_rebuild=0`,
+				userID, tokenID, enabled, port, threshold, interval,
+				failCount, lastStatus, lastDetail, lastCheckAt,
+				lastBlockedAt, lastTaskID, updatedAt, toID); err != nil {
+				return err
+			}
 		}
 	}
-	for _, table := range []string{"instance_scripts", "instance_root_passwords", "instance_auto_rebuild", "instance_failover"} {
-		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE cache_id=?`, fromID); err != nil {
-			return err
-		}
+	if _, err := tx.Exec(`DELETE FROM instance_config WHERE cache_id=?`, fromID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, toID); err != nil {
+		return err
 	}
 	return nil
 }

@@ -814,7 +814,7 @@ func TestInstanceCacheIDStableAcrossRefresh(t *testing.T) {
 }
 
 // TestRepointInstanceCacheInheritsConfig is the core rebuild-inheritance test:
-// scripts / auto-rebuild / failover configuration keyed by the stable cache id
+// scripts / auto-rebuild configuration keyed by the stable cache id
 // follows the instance when its Linode id changes.
 func TestRepointInstanceCacheInheritsConfig(t *testing.T) {
 	s, _ := newTestStore(t)
@@ -833,11 +833,6 @@ func TestRepointInstanceCacheInheritsConfig(t *testing.T) {
 	}
 	if err := s.SetAutoRebuild(AutoRebuild{
 		InstanceID: 42, UserID: 1, TokenID: 7, Enabled: true, Port: 2222, Threshold: 2, IntervalSec: 60,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetFailover(Failover{
-		InstanceID: 42, UserID: 1, GroupID: 3, TokenID: 7, Enabled: true, Threshold: 2, IntervalSec: 60,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -863,9 +858,6 @@ func TestRepointInstanceCacheInheritsConfig(t *testing.T) {
 	}
 	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled || cfg.Port != 2222 {
 		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
-	}
-	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled || cfg.GroupID != 3 {
-		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
 	}
 	if _, ok := s.InstanceScript(42); ok {
 		t.Fatal("script should no longer resolve under the old instance id")
@@ -912,11 +904,6 @@ func TestMigrateInstanceCacheMovesToTargetAccount(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetFailover(Failover{
-		InstanceID: 42, UserID: 1, GroupID: 3, TokenID: 7, Enabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	newInst := linode.Instance{
 		ID: 99, Label: "web", Status: "provisioning", Region: "us-east",
@@ -947,9 +934,6 @@ func TestMigrateInstanceCacheMovesToTargetAccount(t *testing.T) {
 	}
 	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled || cfg.TokenID != 8 {
 		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
-	}
-	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled || cfg.TokenID != 8 || cfg.GroupID != 3 {
-		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
 	}
 	if _, ok := s.InstanceScript(42); ok {
 		t.Fatal("script should no longer resolve under the old instance id")
@@ -984,19 +968,10 @@ CREATE TABLE instance_auto_rebuild (
 	last_status TEXT NOT NULL DEFAULT '', last_detail TEXT NOT NULL DEFAULT '',
 	last_check_at TEXT NOT NULL DEFAULT '', last_blocked_at TEXT NOT NULL DEFAULT '',
 	last_task_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
-CREATE TABLE instance_failover (
-	instance_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL DEFAULT 0,
-	group_id INTEGER NOT NULL DEFAULT 0, token_id INTEGER NOT NULL DEFAULT 0,
-	enabled INTEGER NOT NULL DEFAULT 0, threshold INTEGER NOT NULL DEFAULT 3,
-	interval_sec INTEGER NOT NULL DEFAULT 300, fail_count INTEGER NOT NULL DEFAULT 0,
-	last_status TEXT NOT NULL DEFAULT '', last_detail TEXT NOT NULL DEFAULT '',
-	last_check_at TEXT NOT NULL DEFAULT '', last_task_id TEXT NOT NULL DEFAULT '',
-	replaced_by INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '');
 INSERT INTO groups(name) VALUES('legacy');
 INSERT INTO instance_cache(token_id, instance_id, label, fetched_at) VALUES(7, 42, 'web', '2026-01-01T00:00:00Z');
 INSERT INTO instance_scripts(instance_id, script) VALUES(42, 'echo inherited');
 INSERT INTO instance_auto_rebuild(instance_id, user_id, token_id, enabled, port) VALUES(42, 1, 7, 1, 22);
-INSERT INTO instance_failover(instance_id, user_id, group_id, token_id, enabled) VALUES(42, 1, 3, 7, 1);
 `
 	if _, err := db.Exec(legacy); err != nil {
 		t.Fatalf("seed legacy schema: %v", err)
@@ -1013,9 +988,6 @@ INSERT INTO instance_failover(instance_id, user_id, group_id, token_id, enabled)
 	if cfg, ok := s.AutoRebuild(42); !ok || !cfg.Enabled {
 		t.Fatalf("AutoRebuild(42) = %+v, %v", cfg, ok)
 	}
-	if cfg, ok := s.Failover(42); !ok || !cfg.Enabled || cfg.GroupID != 3 {
-		t.Fatalf("Failover(42) = %+v, %v", cfg, ok)
-	}
 	// The migrated configuration is inherited by a rebuilt instance id.
 	if err := s.RepointInstanceCache(42, 99); err != nil {
 		t.Fatal(err)
@@ -1025,9 +997,6 @@ INSERT INTO instance_failover(instance_id, user_id, group_id, token_id, enabled)
 	}
 	if cfg, ok := s.AutoRebuild(99); !ok || !cfg.Enabled {
 		t.Fatalf("AutoRebuild(99) = %+v, %v", cfg, ok)
-	}
-	if cfg, ok := s.Failover(99); !ok || !cfg.Enabled {
-		t.Fatalf("Failover(99) = %+v, %v", cfg, ok)
 	}
 }
 
@@ -1148,8 +1117,8 @@ func TestSecretsEncryptedAtRest(t *testing.T) {
 	if !isEncryptedSecret(rawToken) || strings.Contains(rawToken, "linode_pat_plaintext") {
 		t.Fatalf("token stored in plaintext: %q", rawToken)
 	}
-	rawPass := rawSecret(t, s, `SELECT p.password FROM instance_root_passwords p
-		JOIN instance_cache c ON c.id=p.cache_id WHERE c.instance_id=42`)
+	rawPass := rawSecret(t, s, `SELECT password FROM instance_config
+		WHERE cache_id=(SELECT id FROM instance_cache WHERE instance_id=42 LIMIT 1)`)
 	if !isEncryptedSecret(rawPass) || strings.Contains(rawPass, "root-secret") {
 		t.Fatalf("root password stored in plaintext: %q", rawPass)
 	}

@@ -30,8 +30,8 @@ type accountMigrateResponse struct {
 // handleMigrateAccount 把一个账号（PAT）的全部实例与面板配置迁移到另一个账号：
 // 对源账号缓存的每个实例，在目标账号用相同 region/type/image/label + 已保存的
 // root 密码与开机脚本创建新实例，把稳定缓存行（脚本、root 密码、自动换 IP、
-// 替换配置）迁移到新实例；可选删除源实例。账号级双机配置与 Agent 绑定、
-// 账号组成员关系也会同步。
+// 替换配置）迁移到新实例；可选删除源实例。账号级双机配置与 Agent 绑定
+// 也会同步。
 func (s *Server) handleMigrateAccount(w http.ResponseWriter, r *http.Request) {
 	user, _ := UserFrom(r.Context())
 	var req accountMigrateRequest
@@ -168,13 +168,6 @@ func (s *Server) handleMigrateAccount(w http.ResponseWriter, r *http.Request) {
 			if t.ID == req.TargetTokenID && t.AgentID == 0 {
 				_ = s.Store.SetTokenAgent(user.ID, req.TargetTokenID, srcAgent)
 			}
-		}
-	}
-	// 账号组成员关系：目标加入源所在的全部组；delete_source 时移出源。
-	for _, g := range s.Store.AccountGroupsOfToken(user.ID, req.SourceTokenID) {
-		_ = s.Store.AddAccountGroupMember(user.ID, g.ID, req.TargetTokenID)
-		if req.DeleteSource {
-			_ = s.Store.RemoveAccountGroupMember(user.ID, g.ID, req.SourceTokenID)
 		}
 	}
 	_ = s.Store.InvalidateInstanceCache(req.TargetTokenID)

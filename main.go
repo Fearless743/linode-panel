@@ -40,8 +40,6 @@ func main() {
 	autoRebuild := flag.Bool("auto-rebuild", true, "启用「被墙后自动删机重建换 IP」后台监测")
 	autoRebuildTick := flag.Duration("auto-rebuild-tick", time.Minute, "自动换 IP 监听的轮询间隔（每个实例仍按自身配置的检测间隔探测）")
 	autoRebuildCheckAPI := flag.String("auto-rebuild-check-api", defaultAutoRebuildCheckAPI(), "国产 IP 连通性探测接口（被墙判定用，环境变量 AUTO_REBUILD_CHECK_API）")
-	failoverEnabled := flag.Bool("failover", true, "启用账号组自动替换监测（组内账号封号/无余额时换到另一账号）")
-	failoverTick := flag.Duration("failover-tick", time.Minute, "账号组自动替换监听的轮询间隔（每个实例仍按自身配置的检测间隔检查）")
 	dualEnabled := flag.Bool("dual", true, "启用双机轮询替换监测（被墙时切换到备用机并重建）")
 	dualTick := flag.Duration("dual-tick", time.Minute, "双机轮询监听的轮询间隔（每个账号仍按自身配置的检测间隔探测）")
 	cacheEnabled := flag.Bool("instance-cache", true, "启用实例缓存后台刷新（每轮拉取所有账号实例并更新列表缓存）")
@@ -107,12 +105,6 @@ func main() {
 	if *autoRebuild {
 		apiSrv.StartAutoRebuildMonitor(rootCtx, *autoRebuildTick)
 		log.Info("自动换 IP 监测已启动", "tick", autoRebuildTick.String(), "check_api", *autoRebuildCheckAPI)
-	}
-
-	// 账号组自动替换：组内账号封号/无余额时换到同组另一账号的后台监测。
-	if *failoverEnabled {
-		apiSrv.StartFailoverMonitor(rootCtx, *failoverTick)
-		log.Info("账号组自动替换监测已启动", "tick", failoverTick.String())
 	}
 
 	// 双机轮询替换：被墙时切换到备用机并重建旧机。

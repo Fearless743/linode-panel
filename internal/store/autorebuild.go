@@ -42,7 +42,7 @@ const autoRebuildCols = `a.cache_id, c.instance_id, a.user_id, a.token_id, a.ena
 	a.port, a.threshold, a.interval_sec, a.fail_count, a.last_status,
 	a.last_detail, a.last_check_at, a.last_blocked_at, a.last_task_id, a.updated_at`
 
-const autoRebuildFrom = ` FROM instance_auto_rebuild a JOIN instance_cache c ON c.id = a.cache_id`
+const autoRebuildFrom = ` FROM instance_config a JOIN instance_cache c ON c.id = a.cache_id`
 
 // scanAutoRebuild reads one row in autoRebuildCols order.
 func scanAutoRebuild(sc interface{ Scan(...any) error }) (AutoRebuild, error) {
@@ -76,15 +76,15 @@ func (s *Store) SetAutoRebuild(a AutoRebuild) error {
 		enabled = 1
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO instance_auto_rebuild
+		`INSERT INTO instance_config
 		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
-		    updated_at)
-		 VALUES(?,?,?,?,?,?,?,?)
+		    updated_at, has_auto_rebuild)
+		 VALUES(?,?,?,?,?,?,?, ?,1)
 		 ON CONFLICT(cache_id) DO UPDATE SET
 		   user_id=excluded.user_id, token_id=excluded.token_id,
 		   enabled=excluded.enabled, port=excluded.port,
 		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
-		   updated_at=excluded.updated_at`,
+		   updated_at=excluded.updated_at, has_auto_rebuild=1`,
 		cacheID, a.UserID, a.TokenID, enabled, a.Port, a.Threshold,
 		a.IntervalSec, time.Now().UTC().Format(time.RFC3339),
 	)
@@ -100,7 +100,7 @@ func (s *Store) AutoRebuild(instanceID int) (AutoRebuild, bool) {
 	if err != nil || !ok {
 		return AutoRebuild{}, false
 	}
-	row := s.db.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=?`, cacheID)
+	row := s.db.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=? AND a.has_auto_rebuild=1`, cacheID)
 	a, err := scanAutoRebuild(row)
 	if err != nil {
 		return AutoRebuild{}, false
@@ -113,7 +113,7 @@ func (s *Store) AutoRebuild(instanceID int) (AutoRebuild, bool) {
 func (s *Store) AutoRebuilds() []AutoRebuild {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT ` + autoRebuildCols + autoRebuildFrom + ` ORDER BY c.instance_id`)
+	rows, err := s.db.Query(`SELECT ` + autoRebuildCols + autoRebuildFrom + ` WHERE a.has_auto_rebuild=1 ORDER BY c.instance_id`)
 	if err != nil {
 		return nil
 	}
@@ -137,7 +137,10 @@ func (s *Store) DeleteAutoRebuild(instanceID int) error {
 	if err != nil || !ok {
 		return err
 	}
-	_, err = s.db.Exec(`DELETE FROM instance_auto_rebuild WHERE cache_id=?`, cacheID)
+	_, err = s.db.Exec(`UPDATE instance_config SET has_auto_rebuild=0, user_id=0, token_id=0, enabled=0, port=22, threshold=3, interval_sec=300, fail_count=0, last_status='', last_detail='', last_check_at='', last_blocked_at='', last_task_id='', updated_at='' WHERE cache_id=?`, cacheID)
+	if err == nil {
+		_, err = s.db.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, cacheID)
+	}
 	return err
 }
 
@@ -168,7 +171,7 @@ func (s *Store) UpdateAutoRebuildStateByCache(cacheID, failCount int, status, de
 
 func (s *Store) updateAutoRebuildStateLocked(cacheID, failCount int, status, detail, checkAt, blockedAt, taskID string) error {
 	_, err := s.db.Exec(
-		`UPDATE instance_auto_rebuild SET
+		`UPDATE instance_config SET
 		   fail_count=?,
 		   last_status=CASE WHEN ?='' THEN last_status ELSE ? END,
 		   last_detail=CASE WHEN ?='' THEN last_detail ELSE ? END,
@@ -176,7 +179,7 @@ func (s *Store) updateAutoRebuildStateLocked(cacheID, failCount int, status, det
 		   last_blocked_at=CASE WHEN ?='' THEN last_blocked_at ELSE ? END,
 		   last_task_id=CASE WHEN ?='' THEN last_task_id ELSE ? END,
 		   updated_at=?
-		 WHERE cache_id=?`,
+		 WHERE cache_id=? AND has_auto_rebuild=1`,
 		failCount,
 		status, status,
 		detail, detail,
@@ -212,13 +215,13 @@ func (s *Store) MoveAutoRebuild(fromID, toID int) error {
 		return err
 	}
 	defer tx.Rollback()
-	row := tx.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=?`, from)
+	row := tx.QueryRow(`SELECT `+autoRebuildCols+autoRebuildFrom+` WHERE a.cache_id=? AND a.has_auto_rebuild=1`, from)
 	a, err := scanAutoRebuild(row)
 	if err != nil {
 		// Nothing to move (config already removed).
 		return nil
 	}
-	if _, err := tx.Exec(`DELETE FROM instance_auto_rebuild WHERE cache_id=?`, from); err != nil {
+	if _, err := tx.Exec(`UPDATE instance_config SET has_auto_rebuild=0, user_id=0, token_id=0, enabled=0, port=22, threshold=3, interval_sec=300, fail_count=0, last_status='', last_detail='', last_check_at='', last_blocked_at='', last_task_id='', updated_at='' WHERE cache_id=?`, from); err != nil {
 		return err
 	}
 	enabled := 0
@@ -226,18 +229,21 @@ func (s *Store) MoveAutoRebuild(fromID, toID int) error {
 		enabled = 1
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO instance_auto_rebuild
+		`INSERT INTO instance_config
 		   (cache_id, user_id, token_id, enabled, port, threshold, interval_sec,
-		    updated_at)
-		 VALUES(?,?,?,?,?,?,?,?)
+		    updated_at, has_auto_rebuild)
+		 VALUES(?,?,?,?,?,?,?, ?,1)
 		 ON CONFLICT(cache_id) DO UPDATE SET
 		   user_id=excluded.user_id, token_id=excluded.token_id,
 		   enabled=excluded.enabled, port=excluded.port,
 		   threshold=excluded.threshold, interval_sec=excluded.interval_sec,
-		   updated_at=excluded.updated_at`,
+		   updated_at=excluded.updated_at, has_auto_rebuild=1`,
 		to, a.UserID, a.TokenID, enabled, a.Port, a.Threshold, a.IntervalSec,
 		time.Now().UTC().Format(time.RFC3339),
 	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM instance_config WHERE cache_id=? AND has_script=0 AND has_password=0 AND has_auto_rebuild=0`, from); err != nil {
 		return err
 	}
 	return tx.Commit()
