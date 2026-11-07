@@ -114,4 +114,4 @@ jobs:
           tags=$(echo "$TAGS" | tr '\n' ' ' | xargs -n1 | sed 's/^/-t /' | tr '\n' ' ')
           # shellcheck disable=SC2086
           docker buildx imagetools create $tags \
-            $(printf "ghcr.io/%s@sha256:%s " "$OWNER" *)
+            $(printf "ghcr.io/fearless743/linode-panel@sha256:%s " *)
