@@ -396,6 +396,18 @@ export function deleteInstanceFailover(instanceId) {
   });
 }
 
+// ---------- 账号迁移（把一个账号的全部实例与面板配置迁移到另一个账号） ----------
+// payload: { source_token_id, target_token_id, delete_source }
+// 返回 { migrated, failed, results: [{ source_instance_id, target_instance_id, ok, error }] }
+export function migrateAccount(payload) {
+  return apiFetch("/api/account/migrate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    timeout: 600000,
+  });
+}
+
 // ---------- 双机轮询替换（账号维度，一对 A/B） ----------
 // 返回 { dual: [{ token_id, user_id, enabled, port, threshold, interval_seconds,
 //   active_instance_id, standby_instance_id, state, fail_count, last_status,

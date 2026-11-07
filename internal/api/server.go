@@ -201,6 +201,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/account/failover/{iid}", s.requireAuth("", s.handlePutFailover))
 	mux.HandleFunc("DELETE /api/account/failover/{iid}", s.requireAuth("", s.handleDeleteFailover))
 
+	// 账号迁移：把一个账号的全部实例与面板配置迁移到另一个账号。
+	mux.HandleFunc("POST /api/account/migrate", s.requireAuth("", s.handleMigrateAccount))
+
 	// 双机轮询替换：一个账号一对 A/B，被墙时轮换。
 	mux.HandleFunc("GET /api/account/dual", s.requireAuth("", s.handleListDual))
 	mux.HandleFunc("PUT /api/account/dual/{tid}", s.requireAuth("", s.handlePutDual))

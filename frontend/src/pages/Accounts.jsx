@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { apiFetch, listAccountAgents, updateAccountToken, listDual, listInstances } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
 import DualModal from "../components/accounts/DualModal";
+import AccountMigrateModal from "../components/accounts/AccountMigrateModal";
 import EditFormModal from "../components/ui/EditFormModal";
 import AccountHealthCell from "../components/accounts/AccountHealthCell";
 
@@ -18,6 +19,7 @@ export default function Accounts() {
   const [addTokenOpen, setAddTokenOpen] = useState(false);
   const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
   const [dualToken, setDualToken] = useState(null); // 双机轮询设置弹窗的账号
+  const [migrateOpen, setMigrateOpen] = useState(false);
   const [dualList, setDualList] = useState([]);
   const [allInstances, setAllInstances] = useState([]);
 
@@ -177,6 +179,14 @@ export default function Accounts() {
             >
               绑定新账号
             </button>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              onClick={() => setMigrateOpen(true)}
+              disabled={!tokens || tokens.length < 2}
+            >
+              账号迁移
+            </button>
           </div>
         </div>
         {tokens === null && <div className="users-empty">正在加载…</div>}
@@ -283,6 +293,12 @@ export default function Accounts() {
             loadDual();
             loadAllInstances();
           }}
+        />
+      )}
+      {migrateOpen && (
+        <AccountMigrateModal
+          tokens={tokens || []}
+          onClose={() => setMigrateOpen(false)}
         />
       )}
     </section>
