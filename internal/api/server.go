@@ -598,6 +598,19 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	user, _ := UserFrom(r.Context())
 	sourceTID := s.tokenIDFor(user, r.URL.Query().Get("token_id"))
+	// 如果按传入 token 找不到该行，遍历用户全部账号，定位这条"不可用"记录
+	// 所属的 token，避免因 token_id 缺失/不匹配而无法清理。
+	if sourceTID <= 0 || func() bool {
+		row, found := s.Store.InstanceCacheRow(sourceTID, id)
+		return !found || row.Alive
+	}() {
+		for _, t := range s.Store.TokensOf(user.ID) {
+			if row, found := s.Store.InstanceCacheRow(t.ID, id); found && !row.Alive {
+				sourceTID = t.ID
+				break
+			}
+		}
+	}
 	// A missing instance cannot be deleted upstream (it is already gone), so
 	// only purge the panel record instead of failing with a 404.
 	if sourceTID > 0 {
