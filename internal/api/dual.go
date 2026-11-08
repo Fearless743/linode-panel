@@ -571,12 +571,22 @@ func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualCo
 		m.log.Warn("双机轮询: 缺备但无 root 密码，跳过补备", "token_id", cfg.TokenID)
 		return
 	}
+	// Label 必须全局唯一：若新主仍带 -standby 后缀，先把主改回根名再建备机。
+	api2 := m.srv.clientFor(pat)
+	m.renameActiveLabel(ctx, api2, active.ID, active.Label)
 	label := dualStandbyLabel(active.Label)
 	specRegion, specType, specImage := active.Region, active.Type, active.Image
 	if row, ok := m.srv.Store.CachedInstance(cfg.StandbyInstanceID); ok && row.Region != "" {
 		specRegion, specType, specImage = row.Region, row.Type, row.Image
 		if row.Label != "" {
 			label = row.Label
+		}
+	}
+	// 防御：若计算出的 standby 名与当前主同名，强制区分。
+	if label == strings.TrimSpace(active.Label) {
+		label = dualStandbyLabel(strings.TrimSuffix(strings.TrimSpace(active.Label), "-standby") + "-standby")
+		for label == strings.TrimSpace(active.Label) {
+			label += "2"
 		}
 	}
 	// 有 standby 指针但上游为 404 也视为缺备，ensureCleanStandby 内部处理缺失。

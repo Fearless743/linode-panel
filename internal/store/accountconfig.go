@@ -111,6 +111,8 @@ func (s *Store) ensureAccountConfigTable() error {
 	_, _ = s.db.Exec(`DELETE FROM account_config WHERE token_id NOT IN (SELECT id FROM tokens) AND token_id!=0`)
 	// Merge old Dual (account_dual) into account_config single place.
 	_ = s.mergeDualIntoAccountConfig()
+	// Merge after deletion also skips orphans; ensure orphans from legacy table don't resurface.
+	_, _ = s.db.Exec(`DELETE FROM account_config WHERE token_id NOT IN (SELECT id FROM tokens) AND token_id!=0`)
 	// 已迁移则不再重复（以 token 行存在与否判断）
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM account_config`).Scan(&n); err != nil {
@@ -154,6 +156,12 @@ func (s *Store) mergeDualIntoAccountConfig() error {
 	}
 	_ = rows.Close()
 	for _, dd := range list {
+		// Skip orphan tokens that no longer exist.
+		var owned int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE id=?`, dd.tokenID).Scan(&owned)
+		if owned == 0 {
+			continue
+		}
 		if dd.port <= 0 {
 			dd.port = 22
 		}
