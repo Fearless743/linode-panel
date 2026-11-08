@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"linode-panel/internal/linode"
@@ -36,6 +37,7 @@ type DualMonitor struct {
 	log      *slog.Logger
 
 	checkFn func(ctx context.Context, ip string, port int) blockCheckResult
+	lck sync.Map
 }
 
 // StartDualMonitor 启动后台双机监测；ctx 取消即退出。
@@ -566,6 +568,15 @@ func (m *DualMonitor) renameActiveLabel(ctx context.Context, api *linode.Client,
 
 // ensureNeutralStandby 在缺备时按使用中实例规格建一台关机备用机（不执行脚本）。
 func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
+	// Per-token guard: background tick + manual check may race creating two standbys.
+	muI, _ := m.lck.LoadOrStore(cfg.TokenID, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	// Re-read: another creator may have filled standby meanwhile.
+	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok && fresh.StandbyInstanceID > 0 {
+		return
+	}
 	rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
 	if rootPass == "" {
 		m.log.Warn("双机轮询: 缺备但无 root 密码，跳过补备", "token_id", cfg.TokenID)
