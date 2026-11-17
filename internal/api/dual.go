@@ -539,9 +539,8 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}()
 }
 
-// ensureCleanStandby 保证备用机存在且处于运行状态、SSH 端口可达：缺失则按
-// spec 重建；SSH 不可达则删机重建直到可用或达上限。返回 standby 实例 id。
-// 这里刻意不探测业务/检测端口：新机在开机脚本执行前只有 SSH 端口在线。
+// ensureCleanStandby 保证备用机存在、已开机且有公网 IP：缺失则按 spec 重建。
+// 不做任何端口探测——面板唯一的「检测端口（TCP）」由 rotate 在执行开机脚本后验证。
 func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConfig, pat string, standbyID int, region, typ, image, label, rootPass string, active linode.Instance) (int, error) {
 	api := m.srv.clientFor(pat)
 	id := standbyID
@@ -579,14 +578,8 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		}
 		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), id)
 	}
-	// 先开机再探测：离线时 SSH 端口必然不通，会被误判而无限重建。
-	// 这里只探测 SSH 端口（面板执行开机脚本用的端口）：新机尚未执行脚本，
-	// 业务/代理端口还不存在，用「检测端口」探测会把每台新机都判成被墙。
-	// 业务端口是否国内可达由 rotate 在脚本执行后验证。
-	// blockedIPs 记录本轮已不可达的 IP：Linode 的可分配 IP 池很小，重建
-	// 很快会拿回同一个地址，重复即说明池已耗尽，继续删建只是烧钱。
-	sshProbePort := m.srv.sshPort()
-	blockedIPs := make(map[string]bool, MaxStandbyRebuilds)
+	// 只保证实例已开机并有公网 IP。这里不做任何端口探测：面板只有一个
+	// 「检测端口（TCP）」，它的验证统一留给 rotate 在执行开机脚本之后进行。
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		inst, err := api.GetInstance(ctx, id)
 		if err != nil {
@@ -611,37 +604,11 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 				return 0, fmt.Errorf("读取备用机失败: %w", err)
 			}
 		}
-		ip := ""
-		if len(inst.IPv4) > 0 {
-			ip = inst.IPv4[0]
-		}
-		if ip == "" {
-			// 无 IP 则重建一次。
-			id, err = m.recreateStandbyOnce(ctx, cfg, pat, id, rootPass)
-			if err != nil {
-				return 0, err
-			}
-			continue
-		}
-		res := m.checkFn(ctx, ip, sshProbePort)
-		if res.err != nil {
-			m.log.Warn("双机轮询: 备用机 SSH 探测出错，重试", "id", id, "port", sshProbePort, "error", res.err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		if !res.blocked {
+		if len(inst.IPv4) > 0 && inst.IPv4[0] != "" {
 			m.clearCooldown(cfg.TokenID)
 			return id, nil
 		}
-		if blockedIPs[ip] {
-			m.log.Warn("双机轮询: 重建回到 SSH 仍不可达的 IP，停止重建", "id", id, "ip", ip,
-				"attempt", i+1, "blocked_ips", len(blockedIPs))
-			_ = api.Shutdown(ctx, id)
-			return 0, fmt.Errorf("%w：重建后回到 SSH 不可达的 IP %s（共 %d 个 IP 均不可用）",
-				errStandbyPoolExhausted, ip, len(blockedIPs))
-		}
-		blockedIPs[ip] = true
-		m.log.Info("双机轮询: 备用机 SSH 不可达，重建", "id", id, "ip", ip, "port", sshProbePort, "attempt", i+1)
+		// 没有公网 IP 则重建一次再试。
 		id, err = m.recreateStandbyOnce(ctx, cfg, pat, id, rootPass)
 		if err != nil {
 			return 0, err
@@ -649,7 +616,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 	}
 	// 重建不等同于关机：失败时把最后的 standby 关掉，避免与 active 双运行残留。
 	_ = api.Shutdown(ctx, id)
-	return 0, fmt.Errorf("%w：连续 %d 次重建后 SSH 仍不可达", errStandbyPoolExhausted, MaxStandbyRebuilds)
+	return 0, fmt.Errorf("备用机连续 %d 次重建仍没有公网 IP", MaxStandbyRebuilds)
 }
 
 // recreateStandbyOnce 删机重建一台备用机（不执行脚本），返回新实例 id。
@@ -692,12 +659,10 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 	return newInst.ID, nil
 }
 
-// rebuildStandbyLoop 把旧 active（现 standby）删机重建（不执行脚本），循环直到
-// SSH 端口可达，然后关机待命。这里不探测业务/检测端口：新机未执行脚本，
-// 业务端口尚不存在；下一次轮换会在脚本执行后再做业务端口验证。
-// 探测用重建必须开机，但该循环退出时无论以何种路径都关掉 standby，避免与 active 双运行残留。
+// rebuildStandbyLoop 把旧 active（现 standby）删机重建（不执行脚本），然后关机待命。
+// 不做端口探测：面板唯一的「检测端口（TCP）」只在轮换时对已执行脚本的备用机验证。
+// 重建必须开机，退出时无论以何种路径都关掉 standby，避免与 active 双运行残留。
 func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, standbyID int, rootPass string) {
-	sshProbePort := m.srv.sshPort()
 	api := m.srv.clientFor(pat)
 	id := standbyID
 	defer func() {
@@ -705,10 +670,9 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			_ = api.Shutdown(context.Background(), id)
 		}
 	}()
-	blockedIPs := make(map[string]bool, MaxStandbyRebuilds)
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		// 用重建任务执行删机重建（跳过脚本），任务日志可在任务页查看。
-		// 被墙或失败都不退出：继续重建，直到拿到没被墙的实例待命（上限防费用失控）。
+		// 任务失败则继续重建，直到成功或达上限（上限防费用失控）。
 		taskID, err := m.srv.Tasks.StartWithOptions(id, "", rootPass, pat, "双机备用重建", true)
 		if err != nil {
 			m.log.Warn("双机轮询: 备用重建启动失败，重试", "id", id, "error", err, "attempt", i+1)
@@ -722,9 +686,8 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			}
 		}
 		if newID <= 0 {
-			// 任务失败且未产生新实例：继续下一轮重建，直到干净或达上限。
 			m.log.Warn("双机轮询: 备用重建失败，继续下一轮", "id", id, "attempt", i+1)
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用重建失败，继续重建直到未被墙", m.now())
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用重建失败，继续重建", m.now())
 			// newID 失败优先沿用当前 id 重试（其缓存 spec 仍在），避免 standby 指针悬空。
 			continue
 		}
@@ -734,46 +697,18 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok && fresh.ActiveInstanceID > 0 && fresh.ActiveInstanceID != id {
 			_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, fresh.ActiveInstanceID, id)
 		}
-		// 探测新 IP 的 SSH 是否被墙：失败/被墙都不退出，继续重建直到干净。
-		inst, err := api.GetInstance(context.Background(), id)
-		if err != nil {
-			m.log.Warn("双机轮询: 读取重建后备用机失败，重建", "id", id, "error", err, "attempt", i+1)
-			continue
-		}
 		ip := ""
-		if len(inst.IPv4) > 0 {
+		if inst, gerr := api.GetInstance(context.Background(), id); gerr == nil && len(inst.IPv4) > 0 {
 			ip = inst.IPv4[0]
 		}
-		if ip == "" {
-			continue
-		}
-		// 只验证 SSH 可达（业务端口要等脚本执行后才会监听）。
-		res := m.checkFn(context.Background(), ip, sshProbePort)
-		if res.err != nil {
-			m.log.Warn("双机轮询: 备用机 SSH 探测出错，重建", "id", id, "port", sshProbePort, "error", res.err, "attempt", i+1)
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机 SSH 探测出错，重建: "+res.err.Error(), m.now())
-			continue
-		}
-		if res.blocked {
-			if blockedIPs[ip] {
-				m.log.Warn("双机轮询: 重建回到 SSH 仍不可达的 IP，停止重建", "id", id, "ip", ip,
-					"attempt", i+1, "blocked_ips", len(blockedIPs))
-				m.coolDown(cfg, fmt.Sprintf("%v：重建后回到 SSH 不可达的 IP %s（共 %d 个 IP 均不可用）",
-					errStandbyPoolExhausted, ip, len(blockedIPs)))
-				return
-			}
-			blockedIPs[ip] = true
-			m.log.Info("双机轮询: 重建后 SSH 仍不可达，继续重建", "id", id, "ip", ip, "port", sshProbePort, "attempt", i+1)
-			continue
-		}
-		// 干净：关机待命，回到 idle。
+		// 就绪：关机待命，回到 idle。
 		_ = api.Shutdown(context.Background(), id)
 		m.clearCooldown(cfg.TokenID)
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "idle", fmt.Sprintf("备用机 #%d 已就绪（%s），关机待命", id, ip), m.now())
 		m.log.Info("双机轮询: 备用机已就绪", "id", id, "ip", ip)
 		return
 	}
-	m.coolDown(cfg, fmt.Sprintf("%v：连续 %d 次重建仍被墙", errStandbyPoolExhausted, MaxStandbyRebuilds))
+	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", fmt.Sprintf("备用机连续 %d 次重建失败", MaxStandbyRebuilds), m.now())
 }
 
 // renameActiveLabel 把新主的标签还原为根名（去掉 -standby 后缀），使下次建备机不会与主同名。
