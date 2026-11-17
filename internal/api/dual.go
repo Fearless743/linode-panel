@@ -212,17 +212,39 @@ func (m *DualMonitor) tokenLock(tokenID int) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
+// isBusy reports whether a detection/rotation/rebuild currently holds the
+// account lock. It is advisory only (the lock may free immediately after).
+func (m *DualMonitor) isBusy(tokenID int) bool {
+	mu := m.tokenLock(tokenID)
+	if mu.TryLock() {
+		mu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) { m.tryCheck(ctx, cfg) }
+
+// tryCheck runs one detection round and reports whether it actually ran.
+// false means another detection/rotation/rebuild for the account is still in
+// flight; the manual-check API surfaces this instead of pretending success.
+func (m *DualMonitor) tryCheck(ctx context.Context, cfg store.DualConfig) bool {
 	mu := m.tokenLock(cfg.TokenID)
 	if !mu.TryLock() {
 		m.log.Info("双机轮询: 已有检测/轮换/重建在进行，跳过本轮", "token_id", cfg.TokenID)
-		return
+		return false
 	}
 	defer mu.Unlock()
 	// 快照可能已过期（轮换会改指针与状态），拿到锁后重新读取。
 	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
 		cfg = fresh
 	}
+	m.checkLocked(ctx, cfg)
+	return true
+}
+
+// checkLocked is tryCheck's body; the caller must hold the account lock.
+func (m *DualMonitor) checkLocked(ctx context.Context, cfg store.DualConfig) {
 	if cfg.ActiveInstanceID <= 0 {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "未配置使用中实例", m.now())
 		return
@@ -300,7 +322,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 	res := m.checkFn(ctx, ip, dualCheckPort(cfg))
 	switch {
 	case res.err != nil:
-		m.log.Warn("双机轮询: 检测出错（不计入失败）", "active", active.ID, "ip", ip, "error", res.err)
+		m.log.Warn("双机轮询: 检测出错（不计入失败）", "active", active.ID, "ip", ip, "port", dualCheckPort(cfg), "error", res.err)
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "error", "检测出错: "+res.err.Error(), m.now())
 	case res.blocked:
 		fails := cfg.FailCount + 1
@@ -308,7 +330,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		if threshold <= 0 {
 			threshold = DefaultDualThreshold
 		}
-		m.log.Info("双机轮询: 疑似被墙", "active", active.ID, "ip", ip, "fails", fails, "threshold", threshold)
+		m.log.Info("双机轮询: 疑似被墙", "active", active.ID, "ip", ip, "port", dualCheckPort(cfg), "fails", fails, "threshold", threshold)
 		if fails >= threshold {
 			// 冷却期内说明地区 IP 池暂时无干净地址，轮换只会删掉当前实例
 			// 再重建出一台同样被墙的机器；保留现状等待人工处理或冷却结束。
@@ -322,7 +344,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, fails, "", "blocked", res.detail, m.now())
 	default:
 		if cfg.FailCount > 0 {
-			m.log.Info("双机轮询: 恢复正常", "active", active.ID, "ip", ip)
+			m.log.Info("双机轮询: 恢复正常", "active", active.ID, "ip", ip, "port", dualCheckPort(cfg))
 		}
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", res.detail, m.now())
 	}
@@ -544,7 +566,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 				errStandbyPoolExhausted, ip, len(blockedIPs))
 		}
 		blockedIPs[ip] = true
-		m.log.Info("双机轮询: 备用机 IP 被墙，重建", "id", id, "ip", ip, "attempt", i+1)
+		m.log.Info("双机轮询: 备用机 IP 被墙，重建", "id", id, "ip", ip, "port", checkPort, "attempt", i+1)
 		id, err = m.recreateStandbyOnce(ctx, cfg, pat, id, rootPass)
 		if err != nil {
 			return 0, err
@@ -664,7 +686,7 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 				return
 			}
 			blockedIPs[ip] = true
-			m.log.Info("双机轮询: 重建后仍被墙，继续重建", "id", id, "ip", ip, "attempt", i+1)
+			m.log.Info("双机轮询: 重建后仍被墙，继续重建", "id", id, "ip", ip, "port", checkPort, "attempt", i+1)
 			continue
 		}
 		// 干净：关机待命，回到 idle。

@@ -9,28 +9,28 @@ import (
 // AccountConfig 是账号级配置（替代原单实例 script / root password / auto-rebuild）。
 // 同账号下所有实例共用；实例表 instance_cache 仅为缓存，不再存配置。
 type AccountConfig struct {
-	TokenID    int    `json:"token_id"`
-	UserID     int    `json:"user_id"`
-	Script     string `json:"script"`
-	HasScript  bool   `json:"has_script"`
-	HasPass    bool   `json:"has_root_password"`
-	Enabled    bool   `json:"auto_enabled"`
-	Port       int    `json:"auto_port"`
-	Threshold  int    `json:"auto_threshold"`
+	TokenID     int    `json:"token_id"`
+	UserID      int    `json:"user_id"`
+	Script      string `json:"script"`
+	HasScript   bool   `json:"has_script"`
+	HasPass     bool   `json:"has_root_password"`
+	Enabled     bool   `json:"auto_enabled"`
+	Port        int    `json:"auto_port"`
+	Threshold   int    `json:"auto_threshold"`
 	IntervalSec int    `json:"auto_interval_seconds"`
-	UpdatedAt  string `json:"updated_at"`
+	UpdatedAt   string `json:"updated_at"`
 	// Dual enabled is a switch inside account config (single place)
-	DualEnabled bool `json:"dual_enabled"`
-	DualActiveInstanceID int `json:"dual_active_instance_id,omitempty"`
-	DualStandbyInstanceID int `json:"dual_standby_instance_id,omitempty"`
-	DualState string `json:"dual_state,omitempty"`
-	DualFailCount int `json:"dual_fail_count,omitempty"`
-	DualLastStatus string `json:"dual_last_status,omitempty"`
-	DualLastDetail string `json:"dual_last_detail,omitempty"`
-	DualLastCheckAt string `json:"dual_last_check_at,omitempty"`
-	DualPort int `json:"dual_port,omitempty"`
-	DualThreshold int `json:"dual_threshold,omitempty"`
-	DualIntervalSec int `json:"dual_interval_seconds,omitempty"`
+	DualEnabled           bool   `json:"dual_enabled"`
+	DualActiveInstanceID  int    `json:"dual_active_instance_id,omitempty"`
+	DualStandbyInstanceID int    `json:"dual_standby_instance_id,omitempty"`
+	DualState             string `json:"dual_state,omitempty"`
+	DualFailCount         int    `json:"dual_fail_count,omitempty"`
+	DualLastStatus        string `json:"dual_last_status,omitempty"`
+	DualLastDetail        string `json:"dual_last_detail,omitempty"`
+	DualLastCheckAt       string `json:"dual_last_check_at,omitempty"`
+	DualPort              int    `json:"dual_port,omitempty"`
+	DualThreshold         int    `json:"dual_threshold,omitempty"`
+	DualIntervalSec       int    `json:"dual_interval_seconds,omitempty"`
 }
 
 const accountConfigCols = `token_id, user_id, script, has_script, has_password,
@@ -143,7 +143,7 @@ func (s *Store) mergeDualIntoAccountConfig() error {
 	defer rows.Close()
 	type d struct {
 		tokenID, userID, enabled, port, th, iv, active, standby, fail int
-		state, lastStatus, lastDetail, lastCheck, lastBlocked string
+		state, lastStatus, lastDetail, lastCheck, lastBlocked         string
 	}
 	var list []d
 	for rows.Next() {
@@ -212,12 +212,12 @@ func (s *Store) migrateInstanceConfigsToAccount() (int, error) {
 	defer rows.Close()
 	var migrated int
 	type byToken struct {
-		userID, tokID int
-		script, password string
-		hasScript, hasPass bool
-		enabled bool
+		userID, tokID             int
+		script, password          string
+		hasScript, hasPass        bool
+		enabled                   bool
 		port, threshold, interval int
-		hasAuto bool
+		hasAuto                   bool
 	}
 	best := map[int]*byToken{}
 	var order []int
@@ -473,6 +473,8 @@ func (s *Store) DeleteAccountRootPassword(tokenID int) error {
 }
 
 // SetAccountAutoRebuild 写入账号级自动换 IP 参数（不覆盖运行态）。
+// 同一「检测端口」同时写入 dual_port：界面只有一个检测端口，自动换 IP 与
+// 双机轮询必须保持一致，否则改了端口其中一个仍探测旧端口。
 func (s *Store) SetAccountAutoRebuild(tokenID, userID int, enabled bool, port, threshold, interval int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -483,9 +485,12 @@ func (s *Store) SetAccountAutoRebuild(tokenID, userID int, enabled bool, port, t
 	if enabled {
 		en = 1
 	}
+	if port <= 0 {
+		port = 22
+	}
 	_, err := s.db.Exec(`UPDATE account_config
-		SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, has_auto=1, updated_at=?
-		WHERE token_id=?`, en, port, threshold, interval, time.Now().UTC().Format(time.RFC3339), tokenID)
+		SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, dual_port=?, has_auto=1, updated_at=?
+		WHERE token_id=?`, en, port, threshold, interval, port, time.Now().UTC().Format(time.RFC3339), tokenID)
 	return err
 }
 

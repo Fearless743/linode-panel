@@ -249,6 +249,50 @@ func TestRotateKeepsActiveWhenStandbyPoolExhausted(t *testing.T) {
 	}
 }
 
+// TestDualCheckUsesConfiguredDetectionPort verifies the dual monitor probes the
+// configured detection port (not the SSH/script port).
+func TestDualCheckUsesConfiguredDetectionPort(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/linode/instances/10":
+			_, _ = w.Write([]byte(`{"id":10,"status":"running","ipv4":["1.2.3.4"]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/linode/instances/11":
+			_, _ = w.Write([]byte(`{"id":11,"status":"offline","ipv4":["5.6.7.8"]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/shutdown"):
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"reason":"not found"}]}`))
+		}
+	}))
+	defer ts.Close()
+
+	srv, _ := newDualServer(t)
+	srv.APIBase = ts.URL
+	if err := srv.Store.SetDualConfig(store.DualConfig{
+		TokenID: 1, UserID: 1, Enabled: true, Port: 443, Threshold: 3, IntervalSec: 60,
+		ActiveInstanceID: 10, StandbyInstanceID: 11,
+	}, "Secret123!"); err != nil {
+		t.Fatalf("SetDualConfig: %v", err)
+	}
+	cfg, _ := srv.Store.DualConfigOf(1)
+	if cfg.Port != 443 {
+		t.Fatalf("stored dual port = %d, want 443", cfg.Port)
+	}
+	gotPort := 0
+	m := &DualMonitor{srv: srv, log: slog.New(slog.DiscardHandler)}
+	m.checkFn = func(_ context.Context, _ string, port int) blockCheckResult {
+		gotPort = port
+		return blockCheckResult{detail: "ok"}
+	}
+	if !m.tryCheck(context.Background(), cfg) {
+		t.Fatal("tryCheck should run when the account lock is free")
+	}
+	if gotPort != 443 {
+		t.Fatalf("probed port = %d, want configured 443", gotPort)
+	}
+}
+
 // TestDualCheckSkippedWhileBusy verifies a concurrent tick cannot start while
 // another monitor operation holds the account lock.
 func TestDualCheckSkippedWhileBusy(t *testing.T) {
@@ -271,7 +315,9 @@ func TestDualCheckSkippedWhileBusy(t *testing.T) {
 	cfg, _ := srv.Store.DualConfigOf(1)
 	mu := m.tokenLock(1)
 	mu.Lock()
-	m.check(context.Background(), cfg)
+	if m.tryCheck(context.Background(), cfg) {
+		t.Fatal("tryCheck should report false while the account lock is held")
+	}
 	mu.Unlock()
 	if hits != 0 {
 		t.Fatalf("check made %d API calls while the account lock was held", hits)

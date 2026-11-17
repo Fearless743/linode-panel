@@ -279,13 +279,21 @@ func (s *Server) handleCheckDual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 手动检测是明确的重试意图：清掉自动重建冷却，让本轮可以立即补备/扶正。
+	// 若另一个检测/轮换/重建仍在执行，直接返回冲突，避免“检测完成”却什么都没做。
+	if s.dualMonitor.isBusy(tid) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "检测/轮换/重建进行中，请稍后再试"})
+		return
+	}
 	s.dualMonitor.clearCooldown(tid)
 	if cfg.State == dualStateCooldown {
 		_ = s.Store.UpdateDualState(tid, cfg.FailCount, "idle", cfg.LastStatus, "手动检测，退出重建冷却", time.Now().UTC().Format(time.RFC3339))
 		cfg.State = "idle"
 	}
 	// check 可能含建备机（耗时），用后台上下文，避免 HTTP 请求超时把轮换/补备掐断。
-	s.dualMonitor.check(context.Background(), cfg)
+	if !s.dualMonitor.tryCheck(context.Background(), cfg) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "检测/轮换/重建进行中，请稍后再试"})
+		return
+	}
 	out, _ := s.Store.DualConfigOf(tid)
 	writeJSON(w, http.StatusOK, map[string]any{"dual": out})
 }

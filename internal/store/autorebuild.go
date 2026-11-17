@@ -70,10 +70,15 @@ func (s *Store) SetAutoRebuild(a AutoRebuild) error {
 		if a.Enabled {
 			en = 1
 		}
+		// 账号只有一个「检测端口」：自动换 IP 与双机共用，写入时同步两列。
+		port := a.Port
+		if port <= 0 {
+			port = 22
+		}
 		if _, err := s.db.Exec(`UPDATE account_config
-			SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, has_auto=1, user_id=?, updated_at=?
+			SET auto_enabled=?, auto_port=?, auto_threshold=?, auto_interval=?, dual_port=?, has_auto=1, user_id=?, updated_at=?
 			WHERE token_id=?`,
-			en, a.Port, a.Threshold, a.IntervalSec, a.UserID,
+			en, port, a.Threshold, a.IntervalSec, port, a.UserID,
 			time.Now().UTC().Format(time.RFC3339), tokenID); err != nil {
 			return err
 		}

@@ -94,6 +94,30 @@ func newMonitorHarness(t *testing.T, ip string) *monitorHarness {
 	return h
 }
 
+// TestMonitorUsesConfiguredDetectionPort verifies the probe uses the
+// account-level detection port instead of a hard-coded SSH port.
+func TestMonitorUsesConfiguredDetectionPort(t *testing.T) {
+	h := newMonitorHarness(t, "1.2.3.4")
+	if err := h.srv.Store.SetAutoRebuild(store.AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 1, Enabled: true,
+		Port: 443, Threshold: 3, IntervalSec: 60,
+	}); err != nil {
+		t.Fatalf("SetAutoRebuild: %v", err)
+	}
+	gotPort := 0
+	m := &AutoRebuildMonitor{
+		srv: h.srv, checkAPI: "x", client: &http.Client{}, log: slog.New(slog.DiscardHandler),
+	}
+	m.checkFn = func(_ context.Context, _ string, port int) blockCheckResult {
+		gotPort = port
+		return blockCheckResult{detail: "ok"}
+	}
+	m.tickOnce(context.Background())
+	if gotPort != 443 {
+		t.Fatalf("probed port = %d, want configured 443", gotPort)
+	}
+}
+
 // TestMonitorTriggersRebuildWhenBlocked verifies the failure threshold starts a
 // rebuild and records the "rebuilding" state with the task id.
 func TestMonitorTriggersRebuildWhenBlocked(t *testing.T) {

@@ -85,8 +85,8 @@ func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 	_, err := s.db.Exec(`INSERT INTO account_config
 		(token_id, user_id, dual_enabled, dual_port, dual_threshold, dual_interval,
 		 dual_active_instance_id, dual_standby_instance_id,
-		 script, has_script, root_password, has_password, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 script, has_script, root_password, has_password, auto_port, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(token_id) DO UPDATE SET
 			user_id=excluded.user_id, dual_enabled=excluded.dual_enabled,
 			dual_port=excluded.dual_port, dual_threshold=excluded.dual_threshold,
@@ -95,9 +95,10 @@ func (s *Store) SetDualConfig(d DualConfig, rootPassword string) error {
 			dual_standby_instance_id=excluded.dual_standby_instance_id,
 			script=excluded.script, has_script=excluded.has_script,
 			root_password=excluded.root_password, has_password=excluded.has_password,
+			auto_port=excluded.auto_port,
 			updated_at=excluded.updated_at`,
 		d.TokenID, d.UserID, enabled, d.Port, d.Threshold, d.IntervalSec,
-		d.ActiveInstanceID, d.StandbyInstanceID, d.Script, hasScript, encPass, hasPass, now)
+		d.ActiveInstanceID, d.StandbyInstanceID, d.Script, hasScript, encPass, hasPass, d.Port, now)
 	return err
 }
 

@@ -249,7 +249,7 @@ func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRe
 	switch {
 	case res.err != nil:
 		// A probe failure is not evidence of blocking; do not count it.
-		m.log.Warn("自动换IP: 检测出错（不计入失败）", "instance_id", id, "ip", ip, "error", res.err)
+		m.log.Warn("自动换IP: 检测出错（不计入失败）", "instance_id", id, "ip", ip, "port", cfg.Port, "error", res.err)
 		_ = m.srv.Store.UpdateAutoRebuildState(id, cfg.FailCount, "error",
 			"检测出错: "+res.err.Error(), m.now(), "", "")
 	case res.blocked:
@@ -258,7 +258,7 @@ func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRe
 		if threshold <= 0 {
 			threshold = DefaultAutoRebuildThreshold
 		}
-		m.log.Info("自动换IP: 疑似被墙", "instance_id", id, "ip", ip, "fails", fails, "threshold", threshold, "detail", res.detail)
+		m.log.Info("自动换IP: 疑似被墙", "instance_id", id, "ip", ip, "port", cfg.Port, "fails", fails, "threshold", threshold, "detail", res.detail)
 		if fails >= threshold {
 			m.triggerRebuild(ctx, cfg, ip, res.detail, fails)
 			return
@@ -266,7 +266,7 @@ func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRe
 		_ = m.srv.Store.UpdateAutoRebuildState(id, fails, "blocked", res.detail, m.now(), "", "")
 	default:
 		if cfg.FailCount > 0 {
-			m.log.Info("自动换IP: 恢复正常", "instance_id", id, "ip", ip)
+			m.log.Info("自动换IP: 恢复正常", "instance_id", id, "ip", ip, "port", cfg.Port)
 		}
 		_ = m.srv.Store.UpdateAutoRebuildState(id, 0, "ok", res.detail, m.now(), "", "")
 	}

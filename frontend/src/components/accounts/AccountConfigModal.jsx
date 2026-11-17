@@ -335,6 +335,7 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
                 <div className="modal-detail auto-rebuild-state">
                   <div>状态：{dual.state || "—"} · {dual.last_status || "—"}</div>
                   <div>连续失败：{dual.fail_count || 0}</div>
+                  <div>检测端口：{dual.port || 22}（开机脚本 SSH 端口由面板 --ssh-port 决定）</div>
                   <div>最近检测：{fmtTime(dual.last_check_at)}</div>
                   {dual.last_detail ? <div>详情：{dual.last_detail}</div> : null}
                 </div>
