@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 	"linode-panel/internal/store"
 )
 
@@ -52,6 +52,8 @@ func createScriptMock(t *testing.T, createBody *map[string]any, mu *sync.Mutex) 
 			_, _ = io.WriteString(w, `{"id":200,"label":"boot","status":"running","region":"us-east","type":"g6-standard-1","image":"linode/debian12","ipv4":["198.51.100.9"],"ipv6":""}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/linode/instances/200/ips":
 			_, _ = io.WriteString(w, `{"ipv4":{"public":[{"address":"198.51.100.9","public":true}]},"ipv6":{}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/linode/instances/200/lish":
+			_, _ = io.WriteString(w, `{"weblish_url":"wss://lish.example.com/websocket/lish/token","glish_url":"","monitor_url":"","ws_protocols":["binary"]}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
 			_, _ = io.WriteString(w, `{"data":[],"page":1,"pages":1}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
@@ -69,8 +71,8 @@ func createScriptMock(t *testing.T, createBody *map[string]any, mu *sync.Mutex) 
 
 // TestCreateInstanceRunsBootScript verifies that a create request with a
 // non-empty script returns before the instance has booted and runs the script
-// over SSH with the root password once the instance is running, exposing the
-// result via GET /api/instances/{id}/script.
+// on the Lish console with the root password once the instance is running,
+// exposing the result via GET /api/instances/{id}/script.
 func TestCreateInstanceRunsBootScript(t *testing.T) {
 	var (
 		mu         sync.Mutex
@@ -83,14 +85,14 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 	srv.APIBase = mock.URL
 	srv.BootScriptPollInterval = time.Millisecond
 
-	type sshCall struct {
-		opts   sshrun.Options
+	type lishCall struct {
+		opts   lish.Options
 		script string
 	}
-	calls := make(chan sshCall, 1)
-	srv.BootScriptRun = func(_ context.Context, opts sshrun.Options, script string) (sshrun.Result, error) {
-		calls <- sshCall{opts: opts, script: script}
-		return sshrun.Result{Exit: 0}, nil
+	calls := make(chan lishCall, 1)
+	srv.BootScriptRun = func(_ context.Context, opts lish.Options, script string) (lish.Result, error) {
+		calls <- lishCall{opts: opts, script: script}
+		return lish.Result{Exit: 0, Host: "lish.example.com"}, nil
 	}
 
 	// The handler trims surrounding whitespace before saving/running.
@@ -106,17 +108,20 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 
 	select {
 	case call := <-calls:
-		if call.opts.Host != "198.51.100.9" {
-			t.Fatalf("ssh host = %q, want 198.51.100.9", call.opts.Host)
+		if call.opts.InstanceID != 200 {
+			t.Fatalf("lish instance id = %d, want 200", call.opts.InstanceID)
+		}
+		if call.opts.PAT != "linode_pat_test" {
+			t.Fatalf("lish PAT = %q, want linode_pat_test", call.opts.PAT)
 		}
 		if call.script != script {
-			t.Fatalf("ssh script = %q, want %q", call.script, script)
+			t.Fatalf("lish script = %q, want %q", call.script, script)
 		}
 		if call.opts.Password != "Secret123!" {
-			t.Fatal("ssh password not passed through")
+			t.Fatal("root password not passed through")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("boot script was not executed over SSH")
+		t.Fatal("boot script was not executed over Lish")
 	}
 
 	// The run state is exposed alongside the saved script.
@@ -146,8 +151,8 @@ func TestCreateInstanceRunsBootScript(t *testing.T) {
 	if got.Script != script || !got.Configured {
 		t.Fatalf("script response = %+v, want configured script", got)
 	}
-	if got.LastRun.State != ScriptRunSuccess || got.LastRun.Host != "198.51.100.9" {
-		t.Fatalf("last_run = %+v, want success on 198.51.100.9", got.LastRun)
+	if got.LastRun.State != ScriptRunSuccess || got.LastRun.Host != "lish.example.com" {
+		t.Fatalf("last_run = %+v, want success on lish.example.com", got.LastRun)
 	}
 }
 
@@ -166,9 +171,9 @@ func TestCreateInstanceWithoutScriptSkipsBootScript(t *testing.T) {
 	srv.BootScriptPollInterval = time.Millisecond
 
 	ran := make(chan struct{}, 1)
-	srv.BootScriptRun = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+	srv.BootScriptRun = func(context.Context, lish.Options, string) (lish.Result, error) {
 		ran <- struct{}{}
-		return sshrun.Result{Exit: 0}, nil
+		return lish.Result{Exit: 0}, nil
 	}
 
 	body := `{"token_id":1,"label":"boot","region":"us-east","type":"g6-standard-1","image":"linode/debian12","root_pass":"Secret123!"}`

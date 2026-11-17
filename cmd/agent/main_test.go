@@ -28,7 +28,7 @@ func newTestAgent(t *testing.T, panel *fakePanel, fake *fakeLinodeAPI, statePath
 	ex := &agenthub.Executor{
 		APIBase: panel.URL + "/linode",
 		SSHPort: 22,
-		Run: func(ctx context.Context, host string, port int, password string, script string) error {
+		Run: func(ctx context.Context, instanceID int, pat, apiBase, password, script string) error {
 			return nil
 		},
 		Probe: func(ctx context.Context, host string, port int) error { return nil },
@@ -481,7 +481,7 @@ func TestPowerSinglePAT(t *testing.T) {
 	ex := &agenthub.Executor{
 		APIBase: "http://x",
 		SSHPort: 22,
-		Run:     func(ctx context.Context, h string, p int, pw string, s string) error { return nil },
+		Run:     func(ctx context.Context, id int, pat, base, pw, s string) error { return nil },
 		Probe:   func(ctx context.Context, h string, p int) error { return nil },
 		Log:     testLogger(),
 	}

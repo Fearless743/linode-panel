@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 	"linode-panel/internal/store"
 )
 
@@ -149,18 +149,18 @@ func TestRebuildHappyPath(t *testing.T) {
 		return inst, nil
 	}
 	ran := false
-	h.mgr.RunFn = func(_ context.Context, opts sshrun.Options, script string) (sshrun.Result, error) {
+	h.mgr.RunFn = func(_ context.Context, opts lish.Options, script string) (lish.Result, error) {
 		ran = true
-		if opts.Host != "203.0.113.7" || opts.Port != 22 || opts.User != "" {
+		if opts.InstanceID != 99 || opts.PAT != "" {
 			t.Fatalf("RunFn got wrong opts: %+v", opts)
 		}
-		if opts.Password == "" || !opts.InsecureSkipVerify {
-			t.Fatalf("RunFn opts missing password/skip-verify: %+v", opts)
+		if opts.Password == "" {
+			t.Fatalf("RunFn opts missing password: %+v", opts)
 		}
 		if script != "echo hi" {
 			t.Fatalf("RunFn got wrong script: %q", script)
 		}
-		return sshrun.Result{Exit: 0, Stdout: "ok\n"}, nil
+		return lish.Result{Exit: 0, Stdout: "ok\n"}, nil
 	}
 	h.mgr.sshPort = 22
 
@@ -199,8 +199,8 @@ func TestRebuildHappyPath(t *testing.T) {
 // and that a firewall failure does not abort the rebuild.
 func TestRebuildAttachesAllowAllFirewall(t *testing.T) {
 	h := newStatefulHarness(t)
-	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
+	h.mgr.RunFn = func(context.Context, lish.Options, string) (lish.Result, error) {
+		return lish.Result{Exit: 0}, nil
 	}
 	var gotRegion string
 	var gotID int
@@ -220,8 +220,8 @@ func TestRebuildAttachesAllowAllFirewall(t *testing.T) {
 
 	// A firewall failure must not fail the rebuild (best-effort).
 	h2 := newStatefulHarness(t)
-	h2.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
+	h2.mgr.RunFn = func(context.Context, lish.Options, string) (lish.Result, error) {
+		return lish.Result{Exit: 0}, nil
 	}
 	h2.api.attachFirewall = func(context.Context, string, int) error {
 		return errors.New("no firewall scope")
@@ -265,8 +265,8 @@ func TestRebuildOldInstanceNotFoundCreatesNew(t *testing.T) {
 		ips.IPv4.Public = []linode.IPAddress{{Address: "203.0.113.7", Public: true}}
 		return ips, nil
 	}
-	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
+	h.mgr.RunFn = func(context.Context, lish.Options, string) (lish.Result, error) {
+		return lish.Result{Exit: 0}, nil
 	}
 	h.mgr.ResolveInstance = func(id int) (linode.Instance, bool) {
 		if id != 42 {
@@ -367,8 +367,8 @@ func TestRebuildPollTimeout(t *testing.T) {
 // stdout/stderr in the log.
 func TestRebuildSSHNonZeroExit(t *testing.T) {
 	h := newStatefulHarness(t)
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 3, Stdout: "out", Stderr: "some error line"}, nil
+	h.mgr.RunFn = func(_ context.Context, _ lish.Options, _ string) (lish.Result, error) {
+		return lish.Result{Exit: 3, Stdout: "out", Stderr: "some error line"}, nil
 	}
 
 	id := startRebuild(t, h.mgr, 42, "bad script")
@@ -385,8 +385,8 @@ func TestRebuildSSHNonZeroExit(t *testing.T) {
 // task with the error recorded.
 func TestRebuildSSHTransportError(t *testing.T) {
 	h := newStatefulHarness(t)
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
-		return sshrun.Result{}, errors.New("dial tcp: connection refused")
+	h.mgr.RunFn = func(_ context.Context, _ lish.Options, _ string) (lish.Result, error) {
+		return lish.Result{}, errors.New("lish: session: connection refused")
 	}
 
 	id := startRebuild(t, h.mgr, 42, "echo hi")
@@ -394,7 +394,7 @@ func TestRebuildSSHTransportError(t *testing.T) {
 	if task.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", task.Status)
 	}
-	if !strings.Contains(task.Err, "SSH 执行开机脚本失败") || !strings.Contains(task.Err, "connection refused") {
+	if !strings.Contains(task.Err, "Lish 执行开机脚本失败") || !strings.Contains(task.Err, "connection refused") {
 		t.Fatalf("Err = %q", task.Err)
 	}
 }
@@ -406,12 +406,12 @@ func TestRebuildSSHConnectErrorRetriesThenSucceeds(t *testing.T) {
 	h.mgr.BootScriptAttempts = 3
 	h.mgr.BootScriptRetryDelay = 0
 	attempts := 0
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
+	h.mgr.RunFn = func(_ context.Context, _ lish.Options, _ string) (lish.Result, error) {
 		attempts++
 		if attempts < 3 {
-			return sshrun.Result{}, errors.New("sshrun: dial 203.0.113.7:22: connect: connection refused")
+			return lish.Result{}, errors.New("lish: dial 203.0.113.7:22: connect: connection refused")
 		}
-		return sshrun.Result{Exit: 0}, nil
+		return lish.Result{Exit: 0}, nil
 	}
 
 	id := startRebuild(t, h.mgr, 42, "echo hi")
@@ -431,9 +431,9 @@ func TestRebuildSSHConnectErrorExhaustsRetries(t *testing.T) {
 	h.mgr.BootScriptAttempts = 3
 	h.mgr.BootScriptRetryDelay = 0
 	attempts := 0
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
+	h.mgr.RunFn = func(_ context.Context, _ lish.Options, _ string) (lish.Result, error) {
 		attempts++
-		return sshrun.Result{}, errors.New("sshrun: dial 203.0.113.7:22: connect: connection refused")
+		return lish.Result{}, errors.New("lish: dial 203.0.113.7:22: connect: connection refused")
 	}
 
 	id := startRebuild(t, h.mgr, 42, "echo hi")
@@ -444,7 +444,7 @@ func TestRebuildSSHConnectErrorExhaustsRetries(t *testing.T) {
 	if attempts != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts)
 	}
-	if !strings.Contains(task.Err, "SSH 执行开机脚本失败") || !strings.Contains(task.Err, "connection refused") {
+	if !strings.Contains(task.Err, "Lish 执行开机脚本失败") || !strings.Contains(task.Err, "connection refused") {
 		t.Fatalf("Err = %q", task.Err)
 	}
 }
@@ -687,8 +687,8 @@ func TestInstanceScriptHTTP(t *testing.T) {
 // boot script and auto-rebuild configuration.
 func TestRebuildInheritsInstanceConfig(t *testing.T) {
 	h := newStatefulHarness(t)
-	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
-		return sshrun.Result{}, nil
+	h.mgr.RunFn = func(context.Context, lish.Options, string) (lish.Result, error) {
+		return lish.Result{}, nil
 	}
 	var createdOpts linode.CreateOptions
 	inner := h.api.createInstance
@@ -901,8 +901,8 @@ func TestRebuildHTTPTaskRoutes(t *testing.T) {
 // TestRebuildProbeFail verifies a failed SSH port probe fails the task.
 func TestRebuildProbeFail(t *testing.T) {
 	h := newStatefulHarness(t)
-	h.mgr.RunFn = func(_ context.Context, _ sshrun.Options, _ string) (sshrun.Result, error) {
-		return sshrun.Result{Exit: 0}, nil
+	h.mgr.RunFn = func(_ context.Context, _ lish.Options, _ string) (lish.Result, error) {
+		return lish.Result{Exit: 0}, nil
 	}
 	h.mgr.ProbeFn = func(_ context.Context, _ string) error {
 		return errors.New("probe refused")

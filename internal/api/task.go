@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 )
 
 const (
@@ -48,11 +48,11 @@ type Task struct {
 	EndedAt    string   `json:"ended_at"`
 
 	// rootPass is the instance's saved root password, used for the replacement
-	// instance and for the SSH boot-script run. It is deliberately unexported
-	// so it never appears in task JSON.
+	// instance and for the Lish console boot-script run. It is deliberately
+	// unexported so it never appears in task JSON.
 	rootPass string
 
-	// SkipBootScript skips the SSH boot-script step (dual standby rebuilds):
+	// SkipBootScript skips the boot-script step (dual standby rebuilds):
 	// the replacement is created without running any script, and success is
 	// decided by the SSH port probe alone.
 	SkipBootScript bool `json:"skip_boot_script,omitempty"`
@@ -96,9 +96,9 @@ type Manager struct {
 	// APIBase applied. Injectable for tests to record the per-run PAT.
 	newAPI func(pat string) LinodeAPI
 
-	// RunFn executes the boot script over SSH. Injectable for tests; defaults
-	// to sshrun.Run.
-	RunFn func(context.Context, sshrun.Options, string) (sshrun.Result, error)
+	// RunFn executes the boot script over the Lish console. Injectable for
+	// tests; defaults to lish.Run.
+	RunFn func(context.Context, lish.Options, string) (lish.Result, error)
 
 	// ProbeFn checks TCP connectivity to a host's SSH port. Injectable for
 	// tests; defaults to a net.DialTimeout with sshProbeTimeout.
@@ -108,10 +108,10 @@ type Manager struct {
 	PollInterval time.Duration
 	PollTimeout  time.Duration
 
-	// BootScriptAttempts is the total number of SSH attempts when the boot
-	// script cannot connect (sshd not listening yet), and
-	// BootScriptRetryDelay is the pause between those attempts. Non-connect
-	// errors are never retried. Defaults: 3 attempts, 1 minute apart.
+	// BootScriptAttempts is the total number of console attempts when the
+	// boot script cannot connect, and BootScriptRetryDelay is the pause
+	// between those attempts. Non-connect errors are never retried.
+	// Defaults: 3 attempts, 1 minute apart.
 	BootScriptAttempts   int
 	BootScriptRetryDelay time.Duration
 
@@ -133,7 +133,7 @@ func NewManager(api LinodeAPI) *Manager {
 		tasks:                map[string]*Task{},
 		busy:                 map[int]string{},
 		api:                  api,
-		RunFn:                sshrun.Run,
+		RunFn:                lish.Run,
 		PollInterval:         3 * time.Second,
 		PollTimeout:          10 * time.Minute,
 		BootScriptAttempts:   3,
@@ -150,7 +150,7 @@ func NewManager(api LinodeAPI) *Manager {
 	return m
 }
 
-// SetSSHPort sets the SSH port used for the boot-script run and probe.
+// SetSSHPort sets the SSH port used for the post-rebuild probe.
 func (m *Manager) SetSSHPort(port int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -161,7 +161,7 @@ func (m *Manager) SetSSHPort(port int) {
 // instance are serialized: while one is in flight, Start returns ErrBusy.
 // Different instances may be rebuilt concurrently. The pat is the
 // Personal Access Token for the requesting user's chosen token; rootPass is the
-// instance's saved root password (required for the SSH boot-script run), and
+// instance's saved root password (required for the Lish boot-script run), and
 // tokenLabel is recorded on the task for display.
 func (m *Manager) Start(instanceID int, script, rootPass, pat string, tokenLabel string) (string, error) {
 	return m.StartWithOptions(instanceID, script, rootPass, pat, tokenLabel, false)

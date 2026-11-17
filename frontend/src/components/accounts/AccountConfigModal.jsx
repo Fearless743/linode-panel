@@ -201,7 +201,7 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
               </div>
 
               <div className="modal-field">
-                <label>root 密码（用于 SSH 执行开机脚本 / 重建，不回显明文）</label>
+                <label>root 密码（用于 Lish 控制台执行开机脚本 / 重建，不回显明文）</label>
                 <input type="password" value={rootPass} placeholder={hasPass ? "已保存，留空表示不修改" : "请输入 root 密码"} onChange={(e) => setRootPass(e.target.value)} />
               </div>
 

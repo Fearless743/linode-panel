@@ -313,8 +313,8 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	booted := true
-	// 可选开机脚本：创建后由后台协程在实例上通过 root 密码 SSH 执行，同时
-	// 保存为该实例配置（之后重建也会执行）。
+	// 可选开机脚本：创建后由后台协程通过 Lish 控制台（root 密码登录）执行，
+	// 同时保存为该实例配置（之后重建也会执行）。
 	script := strings.TrimSpace(req.Script)
 	createOpts := linode.CreateOptions{
 		Region:   req.Region,

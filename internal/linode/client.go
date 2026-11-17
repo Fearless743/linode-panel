@@ -82,6 +82,24 @@ func (c *Client) GetInstanceIPs(ctx context.Context, id int) (InstanceIPs, error
 	return ips, err
 }
 
+// LishData is the one-time credential set returned by POST
+// /linode/instances/{id}/lish. WeblishURL is a wss:// endpoint and
+// WSProtocols are the subprotocols that must be requested when opening it.
+type LishData struct {
+	WeblishURL  string   `json:"weblish_url"`
+	GlishURL    string   `json:"glish_url"`
+	MonitorURL  string   `json:"monitor_url"`
+	WSProtocols []string `json:"ws_protocols"`
+}
+
+// GetInstanceLish generates one-time Weblish/Glish console credentials for an
+// instance. The token is short-lived and should be used immediately.
+func (c *Client) GetInstanceLish(ctx context.Context, id int) (LishData, error) {
+	var data LishData
+	err := c.do(ctx, http.MethodPost, "/linode/instances/"+strconv.Itoa(id)+"/lish", nil, &data)
+	return data, err
+}
+
 // do performs one request, decoding a successful JSON response into out.
 // out may be nil for actions with no response body (POST boot/shutdown/reboot).
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, out any) error {

@@ -19,7 +19,7 @@ import (
 
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 	"linode-panel/internal/store"
 )
 
@@ -85,9 +85,9 @@ type Server struct {
 	NotifyHTTP *http.Client
 	NotifySend func(ctx context.Context, text string) error
 
-	// BootScriptRun executes the create-time boot script over SSH. Injectable
-	// for tests; nil means sshrun.Run.
-	BootScriptRun func(context.Context, sshrun.Options, string) (sshrun.Result, error)
+	// BootScriptRun executes the create-time boot script over the Lish console.
+	// Injectable for tests; nil means lish.Run.
+	BootScriptRun func(context.Context, lish.Options, string) (lish.Result, error)
 
 	// BootScriptPollInterval overrides how often the background runner polls
 	// the instance status while waiting for it to boot. 0 means 3s.

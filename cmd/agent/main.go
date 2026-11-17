@@ -23,7 +23,7 @@ func main() {
 	code := flag.String("code", "", "注册码（首次注册用；已有 token 时可省略）")
 	statePath := flag.String("state", defaultAgentStatePath(), "agent 本地状态文件路径")
 	apiBase := flag.String("api-base", "https://api.linode.com/v4", "Linode API v4 基础地址")
-	sshPort := flag.Int("ssh-port", 22, "SSH 端口（重建编排用）")
+	sshPort := flag.Int("ssh-port", 22, "SSH 端口（重建后探测用）")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))

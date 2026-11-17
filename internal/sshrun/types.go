@@ -1,6 +1,6 @@
 // Package sshrun runs shell scripts on a remote host over SSH
-// (golang.org/x/crypto/ssh). Used to execute the boot script on a freshly
-// created Linode, since Linode has no cloud-init/user-data equivalent.
+// (golang.org/x/crypto/ssh). Kept as a general-purpose SSH runner; the panel's
+// boot scripts now use the Lish serial console (see internal/lish).
 //
 // Contract (frozen):
 //

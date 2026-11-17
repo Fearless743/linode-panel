@@ -14,7 +14,7 @@ import (
 
 	"linode-panel/internal/agenthub"
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 	"linode-panel/internal/store"
 )
 
@@ -35,9 +35,10 @@ const rebuildPollTimeout = 10 * time.Minute
 //  4. attach the allow-all Cloud Firewall (best-effort, so no firewall policy
 //     can block SSH on the replacement instance)
 //  5. poll until the new instance is running (3s interval, 10m cap)
-//  6. run the boot script over SSH with the root password (5m timeout,
-//     skipped when SkipBootScript is set)
-//  7. probe the SSH port; task succeeds only when the probe connects
+//  6. run the boot script on the Lish console with the root password (5m
+//     timeout, skipped when SkipBootScript is set)
+//  7. probe the SSH port when a public IP exists; without one the console
+//     run alone decides success (Lish needs no public IP)
 func (m *Manager) run(t *Task, pat string) {
 	ctx := context.Background()
 	oldID := t.InstanceID
@@ -128,32 +129,16 @@ func (m *Manager) run(t *Task, pat string) {
 		return
 	}
 
-	m.log(t, "step 6: run boot script via SSH")
-	ips, err := api.GetInstanceIPs(ctx, newID)
-	if err != nil {
-		m.fail(t, fmt.Errorf("获取新实例 IP 失败: %w", err))
-		return
-	}
-	host := ips.PublicIPv4()
-	if host == "" {
-		host = ips.SLAACv6()
-	}
-	if host == "" {
-		m.fail(t, fmt.Errorf("新实例没有可用的公网 IP"))
-		return
-	}
-	m.mu.Lock()
-	sshPort := m.sshPort
-	m.mu.Unlock()
+	m.log(t, "step 6: run boot script via Lish console")
 	if t.SkipBootScript {
 		m.log(t, "step 6: skip boot script (dual standby rebuild)")
 	} else {
-		res, runErr := m.runBootScript(t, ctx, host, sshPort, t.rootPass, t.Script)
+		res, runErr := m.runBootScript(t, ctx, newID, pat, t.rootPass, t.Script)
 		if runErr != nil {
-			m.fail(t, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
+			m.fail(t, fmt.Errorf("Lish 执行开机脚本失败: %w", runErr))
 			return
 		}
-		m.log(t, "  ssh exit=%d", res.Exit)
+		m.log(t, "  console exit=%d host=%s", res.Exit, res.Host)
 		if res.Exit != 0 {
 			detail := res.Stderr
 			if detail == "" {
@@ -162,27 +147,37 @@ func (m *Manager) run(t *Task, pat string) {
 			m.fail(t, fmt.Errorf("开机脚本退出码 %d: %s", res.Exit, detail))
 			return
 		}
-		if res.Stderr != "" {
-			m.log(t, "  stderr: %s", res.Stderr)
+	}
+
+	// The SSH port probe is only a post-check. Lish works without a public
+	// IP, so its absence must not fail an otherwise successful console run.
+	ips, err := api.GetInstanceIPs(ctx, newID)
+	host := ""
+	if err == nil {
+		host = ips.PublicIPv4()
+		if host == "" {
+			host = ips.SLAACv6()
 		}
 	}
-	m.log(t, "step 7: probe SSH port on %s", host)
-
-	if err := m.ProbeFn(ctx, host); err != nil {
-		m.fail(t, fmt.Errorf("SSH 端口探测失败: %w", err))
-		return
+	if host != "" {
+		m.log(t, "step 7: probe SSH port on %s", host)
+		if err := m.ProbeFn(ctx, host); err != nil {
+			m.fail(t, fmt.Errorf("SSH 端口探测失败: %w", err))
+			return
+		}
+	} else {
+		m.log(t, "step 7: skip SSH port probe (no public IP; Lish run used)")
 	}
 
 	m.succeed(t, host)
 }
 
-// runBootScript runs the boot script over SSH with the root password,
-// retrying connection failures (dial or handshake: the instance is up but
-// sshd is not listening yet) up to m.BootScriptAttempts times with
-// m.BootScriptRetryDelay between attempts.
-// Errors after the session started are returned immediately: a partially
-// applied script may not be safe to re-run.
-func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port int, password string, script string) (sshrun.Result, error) {
+// runBootScript runs the boot script on the instance's Lish console with the
+// root password, retrying console connection failures up to
+// m.BootScriptAttempts times with m.BootScriptRetryDelay between attempts.
+// Errors after login started are returned immediately: a partially applied
+// script may not be safe to re-run.
+func (m *Manager) runBootScript(t *Task, ctx context.Context, instanceID int, pat, password, script string) (lish.Result, error) {
 	attempts := m.BootScriptAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -190,31 +185,31 @@ func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port 
 	delay := m.BootScriptRetryDelay
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		res, err := m.RunFn(ctx, sshrun.Options{
-			Host:               host,
-			Port:               port,
-			Password:           password,
-			InsecureSkipVerify: true,
-			Timeout:            5 * time.Minute,
+		res, err := m.RunFn(ctx, lish.Options{
+			InstanceID: instanceID,
+			PAT:        pat,
+			Password:   password,
+			APIBase:    m.APIBase,
+			Timeout:    5 * time.Minute,
 		}, script)
 		if err == nil {
 			return res, nil
 		}
-		if !isSSHConnectError(err) {
+		if !lish.IsConnectError(err) {
 			return res, err
 		}
 		lastErr = err
 		if attempt == attempts {
 			break
 		}
-		m.log(t, "step 6: SSH 连接失败（%v），%s 后重试（第 %d/%d 次）", err, delay, attempt+1, attempts)
+		m.log(t, "step 6: Lish 连接失败（%v），%s 后重试（第 %d/%d 次）", err, delay, attempt+1, attempts)
 		select {
 		case <-ctx.Done():
 			return res, lastErr
 		case <-time.After(delay):
 		}
 	}
-	return sshrun.Result{}, fmt.Errorf("SSH 连接失败（已尝试 %d 次）: %w", attempts, lastErr)
+	return lish.Result{}, fmt.Errorf("Lish 连接失败（已尝试 %d 次）: %w", attempts, lastErr)
 }
 
 // oldInstanceFallback resolves the spec to recreate when GetInstance reports

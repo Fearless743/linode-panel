@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 )
 
 // LinodeAPI is the subset of the Linode client used by the executor.
@@ -26,8 +26,9 @@ type LinodeAPI interface {
 	DeleteInstance(ctx context.Context, id int) error
 }
 
-// RunFn runs the boot script over SSH with the root password.
-type RunFn func(ctx context.Context, host string, port int, password string, script string) error
+// RunFn runs the boot script on an instance's Lish console with the root
+// password. apiBase overrides the Linode API endpoint (empty = official).
+type RunFn func(ctx context.Context, instanceID int, pat, apiBase, password, script string) error
 
 // ProbeFn verifies the instance's SSH port is reachable.
 type ProbeFn func(ctx context.Context, host string, port int) error
@@ -38,9 +39,9 @@ type ProbeFn func(ctx context.Context, host string, port int) error
 type Executor struct {
 	// APIBase is the Linode API v4 base URL used by per-PAT clients.
 	APIBase string
-	// SSHPort is the SSH port used for boot scripts and probes.
+	// SSHPort is the SSH port used for the post-rebuild probe.
 	SSHPort int
-	// Run executes the boot script over SSH. Defaults to sshrun.Run.
+	// Run executes the boot script over the Lish console. Defaults to DefaultRunFn.
 	Run RunFn
 	// Probe verifies the instance's SSH port is reachable.
 	Probe ProbeFn
@@ -63,14 +64,14 @@ func NewExecutor() *Executor {
 	}
 }
 
-// DefaultRunFn wraps sshrun.Run with the Executor's signature.
-func DefaultRunFn(ctx context.Context, host string, port int, password string, script string) error {
-	res, err := sshrun.Run(ctx, sshrun.Options{
-		Host:               host,
-		Port:               port,
-		Password:           password,
-		InsecureSkipVerify: true,
-		Timeout:            5 * time.Minute,
+// DefaultRunFn wraps lish.Run with the Executor's signature.
+func DefaultRunFn(ctx context.Context, instanceID int, pat, apiBase, password, script string) error {
+	res, err := lish.Run(ctx, lish.Options{
+		InstanceID: instanceID,
+		PAT:        pat,
+		Password:   password,
+		APIBase:    apiBase,
+		Timeout:    5 * time.Minute,
 	}, script)
 	if err != nil {
 		return err
@@ -80,7 +81,7 @@ func DefaultRunFn(ctx context.Context, host string, port int, password string, s
 		if detail == "" {
 			detail = res.Stdout
 		}
-		return fmt.Errorf("SSH 脚本退出码 %d: %s", res.Exit, detail)
+		return fmt.Errorf("Lish 脚本退出码 %d: %s", res.Exit, detail)
 	}
 	return nil
 }
@@ -288,7 +289,7 @@ func (e *Executor) Execute(ctx context.Context, cmd Command, report Reporter) {
 
 // Rebuild executes the full rebuild orchestration:
 // shutdown old → delete → create (root password, booted) → wait running →
-// sshrun script (root password) → probe SSH port. progress (when non-nil) is
+// Lish console script (root password) → probe SSH port. progress (when non-nil) is
 // called with a Chinese label before each step. fallback, when non-nil, is the
 // panel's cached snapshot of the old instance; it is used to create the
 // replacement directly when the old instance no longer exists upstream (404),
@@ -354,30 +355,33 @@ func (e *Executor) Rebuild(ctx context.Context, id int, script, rootPass, pat st
 		return newID, "", err
 	}
 
-	step(5, "获取新实例 IP 并执行开机脚本")
-	ips, err := api.GetInstanceIPs(ctx, newID)
-	if err != nil {
-		return newID, "", fmt.Errorf("获取新实例 IP 失败: %w", err)
-	}
-	host := ips.PublicIPv4()
-	if host == "" {
-		host = ips.SLAACv6()
-	}
-	if host == "" {
-		return newID, "", fmt.Errorf("新实例没有可用的公网 IP")
-	}
+	step(5, "在 Lish 控制台执行开机脚本")
 	if e.Run == nil {
-		return newID, "", fmt.Errorf("SSH 运行器未配置")
+		return newID, "", fmt.Errorf("Lish 运行器未配置")
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	if err := e.Run(runCtx, host, e.SSHPort, rootPass, script); err != nil {
-		return newID, host, fmt.Errorf("SSH 执行开机脚本失败: %w", err)
+	if err := e.Run(runCtx, newID, pat, e.APIBase, rootPass, script); err != nil {
+		return newID, "", fmt.Errorf("Lish 执行开机脚本失败: %w", err)
 	}
 
-	step(6, "探测 SSH 端口 %s:%d", host, e.SSHPort)
-	if err := e.ProbePort(ctx, host); err != nil {
-		return newID, host, fmt.Errorf("SSH 端口探测失败: %w", err)
+	// The SSH probe is only a post-check. Lish needs no public IP, so a
+	// missing IP must not fail an otherwise successful console run.
+	ips, ipErr := api.GetInstanceIPs(ctx, newID)
+	host := ""
+	if ipErr == nil {
+		host = ips.PublicIPv4()
+		if host == "" {
+			host = ips.SLAACv6()
+		}
+	}
+	if host != "" {
+		step(6, "探测 SSH 端口 %s:%d", host, e.SSHPort)
+		if err := e.ProbePort(ctx, host); err != nil {
+			return newID, host, fmt.Errorf("SSH 端口探测失败: %w", err)
+		}
+	} else {
+		step(6, "跳过 SSH 端口探测（无公网 IP，Lish 执行完成）")
 	}
 	return newID, host, nil
 }

@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
-	"linode-panel/internal/sshrun"
+	"linode-panel/internal/lish"
 	"linode-panel/internal/store"
 )
 
@@ -204,9 +204,8 @@ func (m *SelfHealMonitor) rebuildFailed(cfg store.SelfHeal, err error) {
 
 // healCheckPort 是双机被墙检测用的 TCP 端口（未配置时默认 22）。
 //
-// 检测端口与开机脚本的 SSH 端口是两件事：检测可以指向代理/业务端口
-// （443、8443 等）来判断国内是否可达，而脚本仍通过面板的 --ssh-port
-// （默认 22）登录执行，否则把检测端口改成 443 会让 SSH 也连 443 而失败。
+// 检测端口与开机脚本执行无关：检测可以指向代理/业务端口（443、8443 等）
+// 来判断国内是否可达，而开机脚本现在经 Lish 控制台执行，不依赖 SSH 端口。
 func healCheckPort(cfg store.SelfHeal) int {
 	if cfg.Port > 0 {
 		return cfg.Port
@@ -436,8 +435,8 @@ func (m *SelfHealMonitor) rotate(ctx context.Context, cfg store.SelfHeal, pat st
 		return
 	}
 
-	// 1. 准备 B：确保存在并运行（此阶段只验证 SSH，因为业务端口要等开机脚本
-	//    执行后才会监听），执行账号开机脚本，再用「检测端口」从国内验证业务端口；
+	// 1. 准备 B：确保存在并运行，执行账号开机脚本（经 Lish 控制台），再用
+	//    「检测端口」从国内验证业务端口；
 	//    不通就换一台重试。只有全部通过才删 A，任何失败都保留当前使用中实例。
 	standbyID := cfg.StandbyInstanceID
 	if standbyID == active.ID {
@@ -515,7 +514,7 @@ func (m *SelfHealMonitor) rotate(ctx context.Context, cfg store.SelfHeal, pat st
 		}
 
 		// 先执行脚本把业务/代理端口拉起来，再判断该端口是否国内可达。
-		if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
+		if err := m.runScriptWithRetry(ctx, standbyID, pat, rootPass, script); err != nil {
 			_ = m.srv.Store.UpdateSelfHealState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
 			m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
 			return
@@ -940,17 +939,8 @@ func (m *SelfHealMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store
 		script = DefaultBootScript
 	}
 	var scriptErr error
-	ips, err := api.GetInstanceIPs(ctx, inst.ID)
-	if err != nil {
-		scriptErr = fmt.Errorf("获取实例 IP 失败: %w", err)
-	} else {
-		host := ips.PublicIPv4()
-		if host == "" {
-			host = ips.SLAACv6()
-		}
-		if host != "" && rootPass != "" {
-			scriptErr = m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script)
-		}
+	if rootPass != "" {
+		scriptErr = m.runScriptWithRetry(ctx, inst.ID, pat, rootPass, script)
 	}
 	m.renameActiveLabel(ctx, api, inst.ID, inst.Label)
 	// 扶正后 standby 指向已不存在的旧 active 无法再重建；置 0，下次轮换时重建。
@@ -1010,23 +1000,23 @@ func (m *SelfHealMonitor) ForceRotate(ctx context.Context, cfg store.SelfHeal) {
 	m.rotate(ctx, cfg, pat, active)
 }
 
-// runScriptWithRetry 通过 root 密码 SSH 执行脚本；连接类失败最多重试 10 次，
-// 密码/认证错误立即失败。
-func (m *SelfHealMonitor) runScriptWithRetry(ctx context.Context, host string, port int, password, script string) error {
-	if port == 0 {
-		port = 22
-	}
-	run := m.srv.sshRunner()
-	sshCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+// runScriptWithRetry 通过 Lish 控制台（root 密码登录）执行脚本；连接类失败
+// 最多重试 10 次，密码/认证错误立即失败。
+func (m *SelfHealMonitor) runScriptWithRetry(ctx context.Context, instanceID int, pat, password, script string) error {
+	run := m.srv.lishRunner()
+	lishCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	// 新机从 "running" 到 sshd 可登录通常需要几十秒：连接类失败多给几次机会。
+	// 新机从 "running" 到控制台可登录通常需要几十秒：连接类失败多给几次机会。
 	// 密码错误则立即失败，不做无意义的重复尝试。
 	const maxAttempts = 10
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		res, err := run(sshCtx, sshrun.Options{
-			Host: host, Port: port, Password: password,
-			InsecureSkipVerify: true, Timeout: 5 * time.Minute,
+		res, err := run(lishCtx, lish.Options{
+			InstanceID: instanceID,
+			PAT:        pat,
+			Password:   password,
+			APIBase:    m.srv.APIBase,
+			Timeout:    5 * time.Minute,
 		}, script)
 		if err == nil {
 			if res.Exit != 0 {
@@ -1038,20 +1028,20 @@ func (m *SelfHealMonitor) runScriptWithRetry(ctx context.Context, host string, p
 			}
 			return nil
 		}
-		if isSSHAuthError(err) {
-			return fmt.Errorf("root 密码不正确或 SSH 禁止密码登录（请更新账号配置里的 root 密码）: %w", err)
+		if lish.IsAuthError(err) {
+			return fmt.Errorf("root 密码不正确或控制台登录失败（请更新账号配置里的 root 密码）: %w", err)
 		}
-		if !isSSHConnectError(err) {
-			return fmt.Errorf("SSH 执行开机脚本失败: %w", err)
+		if !lish.IsConnectError(err) {
+			return fmt.Errorf("Lish 执行开机脚本失败: %w", err)
 		}
 		lastErr = err
 		select {
-		case <-sshCtx.Done():
-			return fmt.Errorf("SSH 连接备用机超时: %w", lastErr)
+		case <-lishCtx.Done():
+			return fmt.Errorf("Lish 连接备用机超时: %w", lastErr)
 		case <-time.After(10 * time.Second):
 		}
 	}
-	return fmt.Errorf("SSH 连接失败（已尝试 %d 次）: %w", maxAttempts, lastErr)
+	return fmt.Errorf("Lish 连接失败（已尝试 %d 次）: %w", maxAttempts, lastErr)
 }
 
 func (s *Server) dualAccountLabel(cfg store.SelfHeal) string {

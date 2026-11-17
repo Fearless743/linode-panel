@@ -665,3 +665,27 @@ func TestClient_AttachAllowAllFirewallNoop(t *testing.T) {
 		t.Errorf("unexpected POST count = %d, want no-op", posts.Load())
 	}
 }
+
+// TestClient_GetInstanceLish checks the one-time console credential request.
+func TestClient_GetInstanceLish(t *testing.T) {
+	var gotMethod, gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"weblish_url":"wss://lish.linode.com/websocket/lish/tok","glish_url":"wss://glish.linode.com/tok","monitor_url":"wss://lish.linode.com/websocket/monitor/tok","ws_protocols":["binary"]}`)
+	}))
+	defer srv.Close()
+
+	c := New("secret-token")
+	c.BaseURL = srv.URL
+	data, err := c.GetInstanceLish(context.Background(), 200)
+	if err != nil {
+		t.Fatalf("GetInstanceLish error: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/linode/instances/200/lish" || gotAuth != "Bearer secret-token" {
+		t.Errorf("request = %s %s %q", gotMethod, gotPath, gotAuth)
+	}
+	if data.WeblishURL != "wss://lish.linode.com/websocket/lish/tok" || len(data.WSProtocols) != 1 || data.WSProtocols[0] != "binary" {
+		t.Errorf("unexpected lish data: %+v", data)
+	}
+}
