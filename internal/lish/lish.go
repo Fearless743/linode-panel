@@ -274,11 +274,14 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 		return Result{}, fmt.Errorf("lish: 关闭回显失败: %w", err)
 	}
 
-	// 3. Write the script to a temp file in small base64 chunks. Chunking
-	//    avoids PTY canonical line limits and shell quoting problems.
-	path := "/tmp/.panel-boot-" + nonce + ".sh"
+	// 3. Write the base64-encoded script to a temp file in small chunks.
+	//    Chunking avoids PTY canonical line limits and shell quoting problems.
+	//    Decoding happens once at the end (decoding each chunk separately would
+	//    break the 4-byte base64 group alignment on the final chunk).
+	b64Path := "/tmp/.panel-boot-" + nonce + ".b64"
+	scriptPath := "/tmp/.panel-boot-" + nonce + ".sh"
 	c.mark()
-	if err := c.send(ctx, ": > '"+path+"'\r"); err != nil {
+	if err := c.send(ctx, ": > '"+b64Path+"'\r"); err != nil {
 		return Result{}, err
 	}
 	if _, err := c.waitFor(ctx, shellPromptRE, readyTimeout); err != nil {
@@ -291,7 +294,7 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 			j = len(encoded)
 		}
 		c.mark()
-		if err := c.send(ctx, fmt.Sprintf("printf %%s '%s' >> '%s'\r", encoded[i:j], path)); err != nil {
+		if err := c.send(ctx, fmt.Sprintf("printf %%s '%s' >> '%s'\r", encoded[i:j], b64Path)); err != nil {
 			return Result{}, err
 		}
 		if _, err := c.waitFor(ctx, shellPromptRE, readyTimeout); err != nil {
@@ -299,11 +302,13 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 		}
 	}
 
-	// 4. Run it and capture the exit code through a unique sentinel.
+	// 4. Decode it to a real script, run it, and capture the exit code through
+	//    a unique sentinel. "&&" means a decode failure is reported as the
+	//    exit code instead of silently running an empty script.
 	marker := "__PANEL_BOOT_" + nonce + "_RC__"
 	rcRE := regexp.MustCompile(regexp.QuoteMeta(marker) + `:(\d+)__`)
 	start := c.mark()
-	if err := c.send(ctx, fmt.Sprintf("bash '%s'; printf '\\n%s:%%d__\\n' $?\r", path, marker)); err != nil {
+	if err := c.send(ctx, fmt.Sprintf("base64 -d '%s' > '%s' && bash '%s'; printf '\\n%s:%%d__\\n' $?\r", b64Path, scriptPath, scriptPath, marker)); err != nil {
 		return Result{}, err
 	}
 	match, err := c.waitFor(ctx, rcRE, scriptTimeout)
@@ -317,7 +322,7 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 
 	// 5. Best-effort cleanup.
 	c.mark()
-	_ = c.send(ctx, "rm -f '"+path+"'\r")
+	_ = c.send(ctx, "rm -f '"+b64Path+"' '"+scriptPath+"'\r")
 
 	return Result{
 		Stdout: stripANSI(string(c.buf[start:])),

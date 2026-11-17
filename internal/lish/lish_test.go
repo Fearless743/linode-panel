@@ -13,10 +13,11 @@ import (
 // scriptedConn emulates a Lish console: it emits a login prompt on connect
 // and answers each keystroke batch with the expected console response.
 type scriptedConn struct {
-	out     chan []byte
-	pass    string
-	badPass bool
-	exit    int
+	out      chan []byte
+	pass     string
+	badPass  bool
+	exit     int
+	commands []string
 }
 
 func newScriptedConn(pass string, badPass bool, exit int) *scriptedConn {
@@ -46,6 +47,7 @@ func (c *scriptedConn) Read(ctx context.Context) ([]byte, error) {
 
 func (c *scriptedConn) Write(_ context.Context, data []byte) error {
 	cmd := strings.TrimRight(string(data), "\r")
+	c.commands = append(c.commands, cmd)
 	switch {
 	case cmd == "root":
 		c.out <- []byte("Password: ")
@@ -118,6 +120,11 @@ func TestRunDeliversScriptAndExitCode(t *testing.T) {
 	}
 	if !strings.Contains(res.Command, "42") {
 		t.Fatalf("Command = %q, want instance id", res.Command)
+	}
+	// The base64 written to the console must be decoded before bash runs it.
+	joined := strings.Join(conn.commands, "\n")
+	if !strings.Contains(joined, "base64 -d") || !strings.Contains(joined, "&& bash '") {
+		t.Fatalf("console commands missing decode+run step: %q", joined)
 	}
 }
 
