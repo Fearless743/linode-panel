@@ -50,6 +50,8 @@ type DualMonitor struct {
 
 	checkFn func(ctx context.Context, ip string, port int) blockCheckResult
 	lck     sync.Map
+	// ops serializes check/rotate/rebuild per account (tokenID -> *sync.Mutex).
+	ops sync.Map
 	// cooldowns holds the per-token rebuild circuit breaker deadline. It is
 	// in-memory on purpose: probe results keep updating dual_state/last_check_at
 	// and must not accidentally close (or endlessly reopen) the breaker.
@@ -196,13 +198,35 @@ func (s *Server) isDualManaged(instanceID int) bool {
 	return false
 }
 
+// tokenLock returns the mutex that serializes every monitor operation for one
+// account (detection, rotation, post-rotation standby rebuild). Without it a
+// tick or a manual check can start while rotate() is still in its synchronous
+// phase (no rebuild task yet), mistake the "rotating" state for a stuck one,
+// see the already-deleted active as lost and promote the standby at the same
+// time — leaving the pair without an active instance.
+func (m *DualMonitor) tokenLock(tokenID int) *sync.Mutex {
+	v, _ := m.ops.LoadOrStore(tokenID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
+	mu := m.tokenLock(cfg.TokenID)
+	if !mu.TryLock() {
+		m.log.Info("双机轮询: 已有检测/轮换/重建在进行，跳过本轮", "token_id", cfg.TokenID)
+		return
+	}
+	defer mu.Unlock()
+	// 快照可能已过期（轮换会改指针与状态），拿到锁后重新读取。
+	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+		cfg = fresh
+	}
 	if cfg.ActiveInstanceID <= 0 {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "未配置使用中实例", m.now())
 		return
 	}
 	// 轮换/重建进行中不重复进入，避免与正在执行的 rotate/rebuildStandbyLoop 竞态。
-	// 若状态卡在 rotating/rebuilding 但并无运行中任务（ForceRotate 误拦截/进程重启导致），视为过期自愈。
+	// 同进程内已由 tokenLock 串行化；这里只用于进程重启等导致的内存锁丢失场景：
+	// 状态停在 rotating/rebuilding 且确实没有运行中任务时才视为过期自愈。
 	busy := m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID)))
 	if cfg.State == "rotating" || cfg.State == "rebuilding_standby" {
 		if !busy {
@@ -226,11 +250,9 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 	if err != nil {
 		var apiErr *linode.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-			// 使用中实例已在上游消失：尝试直接扶正备用机。
-			// 冷却期内不再自动重建（否则每次 tick 都会删建一台实例）。
-			if m.inCooldown(cfg) {
-				return
-			}
+			// 使用中实例已在上游消失：扶正备用机。扶正本身不建新机，
+			// 即使处于重建冷却也应执行，否则会长时间“无主”；只有备用机也
+			// 缺失、需要删建时才会受冷却限制（见 promoteStandbyAfterLoss）。
 			m.log.Warn("双机轮询: 使用中实例已不存在，尝试扶正备用机", "active", cfg.ActiveInstanceID)
 			m.promoteStandbyAfterLoss(ctx, cfg, pat)
 			return
@@ -303,8 +325,9 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 	}
 }
 
-// rotate 执行一次轮换：删 A → 保证 B 干净 → 启动 B 并执行脚本 → 交换角色 →
-// 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
+// rotate 执行一次轮换：先保证 B 干净并执行脚本，成功后再删 A 并交换角色，
+// 最后异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
+// 顺序不能反过来：先删 A 会在 B 不可用（IP 池耗尽等）时留下两台都没有的“无主”状态。
 // 成功后 TG 通知新 IP 与距上次被墙间隔。
 func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
 	m.log.Info("双机轮询: 达到阈值，开始轮换", "token_id", cfg.TokenID, "active", active.ID, "standby", cfg.StandbyInstanceID)
@@ -323,14 +346,13 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
-	// 1. 删 A（不再关机），随后把 B 切为主。删后旧主缓存保留供 rebuildStandbyLoop 从缓存 spec 重建。
-	if err := api.DeleteInstance(ctx, active.ID); err != nil {
-		m.log.Warn("双机轮询: 删除使用中实例失败（继续）", "active", active.ID, "error", err)
-	}
-	_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, active.ID)
-
-	// 2. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
+	// 1. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
+	// 此时 A 仍然存在：B 准备失败时直接返回，保持现有主可用。
 	standbyID := cfg.StandbyInstanceID
+	if standbyID == active.ID {
+		// 防御：指针异常重合时不能把当前主当备用机删建。
+		standbyID = 0
+	}
 	specRegion, specType, specImage := active.Region, active.Type, active.Image
 	standbyLabel := dualStandbyLabel(active.Label)
 	if row, ok := m.srv.Store.CachedInstance(standbyID); ok && row.Region != "" {
@@ -347,7 +369,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	standbyID = cleanStandby
 
-	// 3. 启动 B（不新建）：仅当离线时才开机，已在运行时直接进入脚本。
+	// 2. 启动 B（不新建）：仅当离线时才开机，已在运行时直接进入脚本。
 	if cur, gerr := api.GetInstance(ctx, standbyID); gerr != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "读取备用机失败: "+gerr.Error(), m.now())
 		m.notifyDualFailed(label, "读取备用机失败: "+gerr.Error())
@@ -368,7 +390,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
-	// 4. 取 B 的 IP 并执行账号级开机脚本（为空则跳过）。
+	// 3. 取 B 的 IP 并执行账号级开机脚本（为空则跳过）。
 	ips, err := api.GetInstanceIPs(ctx, standbyID)
 	if err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "获取备用机 IP 失败: "+err.Error(), m.now())
@@ -394,6 +416,12 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
+	// 4. B 已就绪且脚本执行成功，现在才删 A（缓存行保留供重建时读取规格）。
+	if err := api.DeleteInstance(ctx, active.ID); err != nil {
+		m.log.Warn("双机轮询: 删除使用中实例失败（继续）", "active", active.ID, "error", err)
+	}
+	_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, active.ID)
+
 	// 5. 交换角色：B 成为 active，旧 A 成为 standby（随后重建）。
 	// 把新主的标签还原为根名（去掉 -standby），使新备机命名不与新主撞名——否则两台会同名“都是主”。
 	m.renameActiveLabel(ctx, api, standbyID, standbyLabel)
@@ -405,7 +433,14 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	m.notifyDualRotated(cfg.TokenID, label, oldIP, host, standbyID)
 
 	// 6. 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
-	go m.rebuildStandbyLoop(cfg, pat, active.ID, rootPass)
+	// 与检测/轮换共用账号锁：等 rotate 返回（释放锁）后再开始，避免检测误判“状态卡死”。
+	oldID := active.ID
+	go func() {
+		mu := m.tokenLock(cfg.TokenID)
+		mu.Lock()
+		defer mu.Unlock()
+		m.rebuildStandbyLoop(cfg, pat, oldID, rootPass)
+	}()
 }
 
 // ensureCleanStandby 保证备用机存在且 SSH 端口国内可达：缺失则按 spec 重建；
@@ -746,8 +781,13 @@ func (m *DualMonitor) awaitTaskNewID(taskID string) int {
 }
 
 // promoteStandbyAfterLoss 在 active 已消失时尝试扶正 standby。
+// 扶正已有实例不产生新实例，不受重建冷却限制；只有备用机也缺失、需要
+// 删机重建时才检查冷却，避免 IP 池耗尽时反复删建。
 func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.DualConfig, pat string) {
 	if cfg.StandbyInstanceID <= 0 {
+		if m.inCooldown(cfg) {
+			return
+		}
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "使用中实例已不存在且无备用机", m.now())
 		return
 	}
@@ -756,6 +796,10 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 	api := m.srv.clientFor(pat)
 	inst, err := api.GetInstance(ctx, cfg.StandbyInstanceID)
 	if err != nil {
+		if m.inCooldown(cfg) {
+			m.log.Info("双机轮询: 重建冷却中，暂不重建备用机", "token_id", cfg.TokenID)
+			return
+		}
 		// 备用机也缺失（重建中误删/带外删除等）：按缓存 spec 重建一台再扶正，不要直接报错卡死。
 		specRegion, specType, specImage, specLabel := "", "", "", ""
 		if row, ok := m.srv.Store.CachedInstance(cfg.ActiveInstanceID); ok && row.Region != "" {
@@ -826,10 +870,20 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 // 注意：handleRotateDual 已做状态拦截并预占 rotating 锁，ForceRotate 不再重复拦截 rotating 本身，
 // 否则预占锁会使自身误判、永久卡死。
 func (m *DualMonitor) ForceRotate(ctx context.Context, cfg store.DualConfig) {
+	// 与后台检测共用账号锁：检测/轮换/重建进行中时不叠加重入。
+	mu := m.tokenLock(cfg.TokenID)
+	if !mu.TryLock() {
+		m.log.Info("双机轮询: 已有检测/轮换/重建在进行，忽略立即替换", "token_id", cfg.TokenID)
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "已有检测/轮换在进行，请稍后重试", m.now())
+		return
+	}
+	defer mu.Unlock()
 	// 重新读取最新配置
 	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
 		cfg = fresh
 	}
+	// 用户明确点击“立即替换”：解除该账号的重建冷却，允许立即补备/重建。
+	m.clearCooldown(cfg.TokenID)
 	if m.srv.Tasks != nil && (m.srv.Tasks.Busy(cfg.ActiveInstanceID) || (cfg.StandbyInstanceID > 0 && m.srv.Tasks.Busy(cfg.StandbyInstanceID))) {
 		m.log.Info("双机轮询: 重建任务进行中，忽略重复触发", "token_id", cfg.TokenID)
 		return
