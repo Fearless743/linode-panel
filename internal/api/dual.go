@@ -24,6 +24,9 @@ const (
 	// MaxStandbyRebuilds bounds the "rebuild until clean" loop so a fully
 	// blocked region does not burn money forever.
 	MaxStandbyRebuilds = 20
+	// MaxServiceProbeRetries bounds how many freshly scripted standbys are
+	// tried before the rotation gives up (service port unreachable from CN).
+	MaxServiceProbeRetries = 5
 	// StandbyRebuildCooldown pauses automatic standby/promote rebuilds after a
 	// full cycle still could not find a clean IP (Linode's region IP pool is
 	// small and tends to hand back the same blocked addresses). Without it the
@@ -390,8 +393,9 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 		return
 	}
 
-	// 1. 保证 B 存在且 IP 干净（SSH 端口国内可达），不干净则重建直到干净。
-	// 此时 A 仍然存在：B 准备失败时直接返回，保持现有主可用。
+	// 1. 准备 B：确保存在并运行（此阶段只验证 SSH，因为业务端口要等开机脚本
+	//    执行后才会监听），执行账号开机脚本，再用「检测端口」从国内验证业务端口；
+	//    不通就换一台重试。只有全部通过才删 A，任何失败都保留当前使用中实例。
 	standbyID := cfg.StandbyInstanceID
 	if standbyID == active.ID {
 		// 防御：指针异常重合时不能把当前主当备用机删建。
@@ -405,68 +409,116 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 			standbyLabel = row.Label
 		}
 	}
-	cleanStandby, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, active)
-	if err != nil {
-		m.rebuildFailed(cfg, fmt.Errorf("备用机准备失败: %w", err))
-		m.notifyDualFailed(label, "备用机准备失败: "+err.Error())
-		return
-	}
-	standbyID = cleanStandby
-
-	// 2. 启动 B（不新建）：仅当离线时才开机，已在运行时直接进入脚本。
-	if cur, gerr := api.GetInstance(ctx, standbyID); gerr != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "读取备用机失败: "+gerr.Error(), m.now())
-		m.notifyDualFailed(label, "读取备用机失败: "+gerr.Error())
-		return
-	} else if cur.Status != "running" {
-		if err := api.Boot(ctx, standbyID); err != nil {
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机开机失败: "+err.Error(), m.now())
-			m.notifyDualFailed(label, "备用机开机失败: "+err.Error())
-			return
-		}
-	}
-	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	err = m.srv.waitForInstanceStatus(waitCtx, api, standbyID, "running")
-	cancel()
-	if err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "等待备用机运行失败: "+err.Error(), m.now())
-		m.notifyDualFailed(label, "等待备用机运行失败: "+err.Error())
-		return
-	}
-
-	// 3. 取 B 的 IP 并执行账号级开机脚本（为空则跳过）。
-	ips, err := api.GetInstanceIPs(ctx, standbyID)
-	if err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "获取备用机 IP 失败: "+err.Error(), m.now())
-		m.notifyDualFailed(label, "获取备用机 IP 失败: "+err.Error())
-		return
-	}
-	host := ips.PublicIPv4()
-	if host == "" {
-		host = ips.SLAACv6()
-	}
-	if host == "" {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机没有公网 IP", m.now())
-		m.notifyDualFailed(label, "备用机没有公网 IP")
-		return
-	}
 	script := strings.TrimSpace(cfg.Script)
 	if script == "" {
 		script = DefaultBootScript
 	}
-	if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
-		m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
+	blockedIPs := make(map[string]bool, MaxServiceProbeRetries)
+	var host string
+	clean := false
+	for attempt := 0; attempt < MaxServiceProbeRetries; attempt++ {
+		cleanStandby, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, active)
+		if err != nil {
+			m.rebuildFailed(cfg, fmt.Errorf("备用机准备失败: %w", err))
+			m.notifyDualFailed(label, "备用机准备失败: "+err.Error())
+			return
+		}
+		standbyID = cleanStandby
+
+		// 兜底：确保 B 在运行（正常情况下 ensureCleanStandby 返回时已在运行）。
+		if cur, gerr := api.GetInstance(ctx, standbyID); gerr != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "读取备用机失败: "+gerr.Error(), m.now())
+			m.notifyDualFailed(label, "读取备用机失败: "+gerr.Error())
+			return
+		} else if cur.Status != "running" {
+			if err := api.Boot(ctx, standbyID); err != nil {
+				_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机开机失败: "+err.Error(), m.now())
+				m.notifyDualFailed(label, "备用机开机失败: "+err.Error())
+				return
+			}
+		}
+		waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		err = m.srv.waitForInstanceStatus(waitCtx, api, standbyID, "running")
+		cancel()
+		if err != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "等待备用机运行失败: "+err.Error(), m.now())
+			m.notifyDualFailed(label, "等待备用机运行失败: "+err.Error())
+			return
+		}
+
+		ips, err := api.GetInstanceIPs(ctx, standbyID)
+		if err != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "获取备用机 IP 失败: "+err.Error(), m.now())
+			m.notifyDualFailed(label, "获取备用机 IP 失败: "+err.Error())
+			return
+		}
+		host = ips.PublicIPv4()
+		if host == "" {
+			host = ips.SLAACv6()
+		}
+		if host == "" {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机没有公网 IP", m.now())
+			m.notifyDualFailed(label, "备用机没有公网 IP")
+			return
+		}
+
+		// 先执行脚本把业务/代理端口拉起来，再判断该端口是否国内可达。
+		if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
+			m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
+			return
+		}
+
+		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+			cfg = fresh
+		}
+		checkPort := dualCheckPort(cfg)
+		m.notePort(cfg.TokenID, checkPort)
+		res := m.checkFn(ctx, host, checkPort)
+		if res.err != nil {
+			// 检测接口异常不代表 IP 有问题：保留 A，稍后重试，避免误删当前主。
+			_ = api.Shutdown(ctx, standbyID)
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机业务端口探测出错: "+res.err.Error(), m.now())
+			m.notifyDualFailed(label, "备用机业务端口探测出错: "+res.err.Error())
+			return
+		}
+		if !res.blocked {
+			clean = true
+			break
+		}
+		if blockedIPs[host] {
+			_ = api.Shutdown(ctx, standbyID)
+			detail := fmt.Sprintf("%v：备用机业务端口在重复 IP %s 上仍不可达", errStandbyPoolExhausted, host)
+			m.coolDown(cfg, detail)
+			m.notifyDualFailed(label, detail)
+			return
+		}
+		blockedIPs[host] = true
+		m.log.Info("双机轮询: 备用机业务端口不通，换一台重建", "id", standbyID, "ip", host,
+			"port", checkPort, "attempt", attempt+1)
+		standbyID, err = m.recreateStandbyOnce(ctx, cfg, pat, standbyID, rootPass)
+		if err != nil {
+			m.rebuildFailed(cfg, fmt.Errorf("备用机重建失败: %w", err))
+			m.notifyDualFailed(label, "备用机重建失败: "+err.Error())
+			return
+		}
+	}
+	if !clean {
+		_ = api.Shutdown(ctx, standbyID)
+		detail := fmt.Sprintf("%v：连续 %d 次重建后业务端口仍不可达", errStandbyPoolExhausted, MaxServiceProbeRetries)
+		m.coolDown(cfg, detail)
+		m.notifyDualFailed(label, detail)
 		return
 	}
 
-	// 4. B 已就绪且脚本执行成功，现在才删 A（缓存行保留供重建时读取规格）。
+	// 2. B 已就绪且脚本执行成功、业务端口国内可达，现在才删 A
+	//    （缓存行保留供重建时读取规格）。
 	if err := api.DeleteInstance(ctx, active.ID); err != nil {
 		m.log.Warn("双机轮询: 删除使用中实例失败（继续）", "active", active.ID, "error", err)
 	}
 	_ = m.srv.Store.MarkInstanceMissing(cfg.TokenID, active.ID)
 
-	// 5. 交换角色：B 成为 active，旧 A 成为 standby（随后重建）。
+	// 3. 交换角色：B 成为 active，旧 A 成为 standby（随后重建）。
 	// 把新主的标签还原为根名（去掉 -standby），使新备机命名不与新主撞名——否则两台会同名“都是主”。
 	m.renameActiveLabel(ctx, api, standbyID, standbyLabel)
 	if err := m.srv.Store.UpdateDualInstances(cfg.TokenID, standbyID, active.ID); err != nil {
@@ -476,7 +528,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	m.log.Info("双机轮询: 已轮换", "new_active", standbyID, "old_active", active.ID)
 	m.notifyDualRotated(cfg.TokenID, label, oldIP, host, standbyID)
 
-	// 6. 异步重建旧 A（不执行脚本，循环直到 SSH 干净后关机）。
+	// 4. 异步重建旧 A（不执行脚本，循环直到 SSH 可达后关机）。
 	// 与检测/轮换共用账号锁：等 rotate 返回（释放锁）后再开始，避免检测误判“状态卡死”。
 	oldID := active.ID
 	go func() {
@@ -487,8 +539,9 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}()
 }
 
-// ensureCleanStandby 保证备用机存在且检测端口国内可达：缺失则按 spec 重建；
-// 若被墙则删机重建（不执行脚本）直到干净或达上限。返回干净的 standby 实例 id。
+// ensureCleanStandby 保证备用机存在且处于运行状态、SSH 端口可达：缺失则按
+// spec 重建；SSH 不可达则删机重建直到可用或达上限。返回 standby 实例 id。
+// 这里刻意不探测业务/检测端口：新机在开机脚本执行前只有 SSH 端口在线。
 func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConfig, pat string, standbyID int, region, typ, image, label, rootPass string, active linode.Instance) (int, error) {
 	api := m.srv.clientFor(pat)
 	id := standbyID
@@ -526,9 +579,13 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		}
 		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), id)
 	}
-	// 先开机再探测：离线时 22 端口必然不通，会被误判为被墙而无限重建。
-	// blockedIPs 记录本轮已判定被墙的 IP：Linode 的可分配 IP 池很小，重建
+	// 先开机再探测：离线时 SSH 端口必然不通，会被误判而无限重建。
+	// 这里只探测 SSH 端口（面板执行开机脚本用的端口）：新机尚未执行脚本，
+	// 业务/代理端口还不存在，用「检测端口」探测会把每台新机都判成被墙。
+	// 业务端口是否国内可达由 rotate 在脚本执行后验证。
+	// blockedIPs 记录本轮已不可达的 IP：Linode 的可分配 IP 池很小，重建
 	// 很快会拿回同一个地址，重复即说明池已耗尽，继续删建只是烧钱。
+	sshProbePort := m.srv.sshPort()
 	blockedIPs := make(map[string]bool, MaxStandbyRebuilds)
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		inst, err := api.GetInstance(ctx, id)
@@ -566,15 +623,9 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			}
 			continue
 		}
-		// 每轮重新读取端口：长时间重建期间用户可能改了检测端口，不能一直用旧端口。
-		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
-			cfg = fresh
-		}
-		checkPort := dualCheckPort(cfg)
-		m.notePort(cfg.TokenID, checkPort)
-		res := m.checkFn(ctx, ip, checkPort)
+		res := m.checkFn(ctx, ip, sshProbePort)
 		if res.err != nil {
-			m.log.Warn("双机轮询: 备用机探测出错，重试", "id", id, "error", res.err)
+			m.log.Warn("双机轮询: 备用机 SSH 探测出错，重试", "id", id, "port", sshProbePort, "error", res.err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -583,14 +634,14 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			return id, nil
 		}
 		if blockedIPs[ip] {
-			m.log.Warn("双机轮询: 重建回到已判定被墙的 IP，停止重建", "id", id, "ip", ip,
+			m.log.Warn("双机轮询: 重建回到 SSH 仍不可达的 IP，停止重建", "id", id, "ip", ip,
 				"attempt", i+1, "blocked_ips", len(blockedIPs))
 			_ = api.Shutdown(ctx, id)
-			return 0, fmt.Errorf("%w：重建后回到已判定被墙的 IP %s（共 %d 个 IP 均不可用）",
+			return 0, fmt.Errorf("%w：重建后回到 SSH 不可达的 IP %s（共 %d 个 IP 均不可用）",
 				errStandbyPoolExhausted, ip, len(blockedIPs))
 		}
 		blockedIPs[ip] = true
-		m.log.Info("双机轮询: 备用机 IP 被墙，重建", "id", id, "ip", ip, "port", checkPort, "attempt", i+1)
+		m.log.Info("双机轮询: 备用机 SSH 不可达，重建", "id", id, "ip", ip, "port", sshProbePort, "attempt", i+1)
 		id, err = m.recreateStandbyOnce(ctx, cfg, pat, id, rootPass)
 		if err != nil {
 			return 0, err
@@ -598,7 +649,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 	}
 	// 重建不等同于关机：失败时把最后的 standby 关掉，避免与 active 双运行残留。
 	_ = api.Shutdown(ctx, id)
-	return 0, fmt.Errorf("%w：连续 %d 次重建仍被墙", errStandbyPoolExhausted, MaxStandbyRebuilds)
+	return 0, fmt.Errorf("%w：连续 %d 次重建后 SSH 仍不可达", errStandbyPoolExhausted, MaxStandbyRebuilds)
 }
 
 // recreateStandbyOnce 删机重建一台备用机（不执行脚本），返回新实例 id。
@@ -642,10 +693,11 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 }
 
 // rebuildStandbyLoop 把旧 active（现 standby）删机重建（不执行脚本），循环直到
-// 检测端口国内可达，然后关机待命。
+// SSH 端口可达，然后关机待命。这里不探测业务/检测端口：新机未执行脚本，
+// 业务端口尚不存在；下一次轮换会在脚本执行后再做业务端口验证。
 // 探测用重建必须开机，但该循环退出时无论以何种路径都关掉 standby，避免与 active 双运行残留。
 func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, standbyID int, rootPass string) {
-	checkPort := dualCheckPort(cfg)
+	sshProbePort := m.srv.sshPort()
 	api := m.srv.clientFor(pat)
 	id := standbyID
 	defer func() {
@@ -695,28 +747,23 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		if ip == "" {
 			continue
 		}
-		// 同样每轮读取最新检测端口。
-		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
-			cfg = fresh
-		}
-		checkPort = dualCheckPort(cfg)
-		m.notePort(cfg.TokenID, checkPort)
-		res := m.checkFn(context.Background(), ip, checkPort)
+		// 只验证 SSH 可达（业务端口要等脚本执行后才会监听）。
+		res := m.checkFn(context.Background(), ip, sshProbePort)
 		if res.err != nil {
-			m.log.Warn("双机轮询: 备用机探测出错，重建", "id", id, "error", res.err, "attempt", i+1)
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机探测出错，重建: "+res.err.Error(), m.now())
+			m.log.Warn("双机轮询: 备用机 SSH 探测出错，重建", "id", id, "port", sshProbePort, "error", res.err, "attempt", i+1)
+			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机 SSH 探测出错，重建: "+res.err.Error(), m.now())
 			continue
 		}
 		if res.blocked {
 			if blockedIPs[ip] {
-				m.log.Warn("双机轮询: 重建回到已判定被墙的 IP，停止重建", "id", id, "ip", ip,
+				m.log.Warn("双机轮询: 重建回到 SSH 仍不可达的 IP，停止重建", "id", id, "ip", ip,
 					"attempt", i+1, "blocked_ips", len(blockedIPs))
-				m.coolDown(cfg, fmt.Sprintf("%v：重建后回到已判定被墙的 IP %s（共 %d 个 IP 均不可用）",
+				m.coolDown(cfg, fmt.Sprintf("%v：重建后回到 SSH 不可达的 IP %s（共 %d 个 IP 均不可用）",
 					errStandbyPoolExhausted, ip, len(blockedIPs)))
 				return
 			}
 			blockedIPs[ip] = true
-			m.log.Info("双机轮询: 重建后仍被墙，继续重建", "id", id, "ip", ip, "port", checkPort, "attempt", i+1)
+			m.log.Info("双机轮询: 重建后 SSH 仍不可达，继续重建", "id", id, "ip", ip, "port", sshProbePort, "attempt", i+1)
 			continue
 		}
 		// 干净：关机待命，回到 idle。

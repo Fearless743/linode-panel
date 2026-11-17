@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"linode-panel/internal/linode"
+	"linode-panel/internal/sshrun"
 	"linode-panel/internal/store"
 )
 
@@ -337,6 +338,120 @@ func TestIsSSHAuthError(t *testing.T) {
 	}
 }
 
+// TestRotateScriptsBeforeProbingServicePort covers the custom detection-port
+// case: a freshly booted standby only has SSH open until the boot script runs,
+// so readiness must be checked on SSH, and the service port is only probed
+// after scripting. A service-port failure must keep the current active and try
+// another standby, never delete A.
+func TestRotateScriptsBeforeProbingServicePort(t *testing.T) {
+	var mu sync.Mutex
+	insts := map[int]linode.Instance{
+		10: {ID: 10, Label: "main", Status: "running", Region: "in-maa", Type: "g6-nanode-1", Image: "linode/debian12", IPv4: []string{"5.6.7.8"}},
+		11: {ID: 11, Label: "main-standby", Status: "running", Region: "in-maa", Type: "g6-nanode-1", Image: "linode/debian12", IPv4: []string{"1.2.3.4"}},
+	}
+	nextID := 20
+	ipIdx := 0
+	created := 0
+	deleted := map[int]bool{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/linode/instances/") && strings.HasSuffix(r.URL.Path, "/ips"):
+			rest := strings.TrimPrefix(r.URL.Path, "/linode/instances/")
+			id, _ := strconv.Atoi(strings.Split(rest, "/")[0])
+			in, ok := insts[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"errors":[{"reason":"not found"}]}`))
+				return
+			}
+			var out linode.InstanceIPs
+			for _, a := range in.IPv4 {
+				out.IPv4.Public = append(out.IPv4.Public, linode.IPAddress{Address: a, Public: true})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/linode/instances/"):
+			rest := strings.TrimPrefix(r.URL.Path, "/linode/instances/")
+			id, _ := strconv.Atoi(strings.Split(rest, "/")[0])
+			in, ok := insts[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"errors":[{"reason":"not found"}]}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(in)
+		case r.Method == http.MethodPost && r.URL.Path == "/linode/instances":
+			var opts linode.CreateOptions
+			_ = json.NewDecoder(r.Body).Decode(&opts)
+			id := nextID
+			nextID++
+			ipIdx++
+			in := linode.Instance{ID: id, Label: opts.Label, Status: "running", Region: opts.Region,
+				Type: opts.Type, Image: opts.Image, IPv4: []string{fmt.Sprintf("9.9.9.%d", ipIdx)}}
+			created++
+			insts[id] = in
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(in)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/linode/instances/"):
+			id, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/linode/instances/"))
+			deleted[id] = true
+			delete(insts, id)
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/boot") || strings.HasSuffix(r.URL.Path, "/shutdown")):
+			_, _ = w.Write([]byte(`{}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
+			_, _ = w.Write([]byte(`{"data":[{"id":77,"label":"linode-panel-fw-in-maa","tags":["linode-panel-allow-all"]}],"page":1,"pages":1}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/devices"):
+			_, _ = w.Write([]byte(`{"data":[],"page":1,"pages":1}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/devices"):
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"reason":"not found"}]}`))
+		}
+	}))
+	defer ts.Close()
+
+	srv, _ := newDualServer(t)
+	srv.APIBase = ts.URL
+	srv.BootScriptRun = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+		return sshrun.Result{}, nil
+	}
+	if err := srv.Store.SetDualConfig(store.DualConfig{
+		TokenID: 1, UserID: 1, Enabled: true, Port: 443, Threshold: 3, IntervalSec: 60,
+		ActiveInstanceID: 10, StandbyInstanceID: 11,
+	}, "Secret123!"); err != nil {
+		t.Fatalf("SetDualConfig: %v", err)
+	}
+	cfg, _ := srv.Store.DualConfigOf(1)
+	m := &DualMonitor{srv: srv, log: slog.New(slog.DiscardHandler)}
+	m.checkFn = func(_ context.Context, _ string, port int) blockCheckResult {
+		if port == srv.sshPort() {
+			return blockCheckResult{detail: "ssh ok"}
+		}
+		return blockCheckResult{blocked: true, detail: "service blocked"}
+	}
+	m.rotate(context.Background(), cfg, "pat-acc", insts[10])
+
+	if deleted[10] {
+		t.Fatal("active must not be deleted when the standby service port is blocked")
+	}
+	got, _ := srv.Store.DualConfigOf(1)
+	if got.ActiveInstanceID != 10 {
+		t.Fatalf("active pointer = %d, want 10", got.ActiveInstanceID)
+	}
+	if got.State != dualStateCooldown {
+		t.Fatalf("state = %q, want cooldown", got.State)
+	}
+	if created != MaxServiceProbeRetries {
+		t.Fatalf("created %d standbys, want %d service-port attempts", created, MaxServiceProbeRetries)
+	}
+}
+
+// TestDualStandbyLabel tests standby label derivation.
 func TestDualStandbyLabel(t *testing.T) {
 	cases := map[string]string{
 		"web":         "web-standby",
