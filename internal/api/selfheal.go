@@ -444,6 +444,15 @@ func (m *SelfHealMonitor) rotate(ctx context.Context, cfg store.SelfHeal, pat st
 		// 防御：指针异常重合时不能把当前主当备用机删建。
 		standbyID = 0
 	}
+	// B 一旦开机，任何失败路径都必须让它回到关机待命，否则主备同时运行。
+	// 成功交换角色后 promoted 置位：此时 B 已是事实上的使用中实例，必须保持 running，
+	// 旧 A 的清理与重建交给后面的 rebuildStandbyLoop 收尾。
+	promoted := false
+	defer func() {
+		if !promoted && standbyID > 0 {
+			_ = api.Shutdown(context.Background(), standbyID)
+		}
+	}()
 	specRegion, specType, specImage := active.Region, active.Type, active.Image
 	standbyLabel := healStandbyLabel(active.Label)
 	if row, ok := m.srv.Store.CachedInstance(standbyID); ok && row.Region != "" {
@@ -567,6 +576,7 @@ func (m *SelfHealMonitor) rotate(ctx context.Context, cfg store.SelfHeal, pat st
 	if err := m.srv.Store.UpdateSelfHealInstances(cfg.TokenID, standbyID, active.ID); err != nil {
 		m.log.Warn("双机轮询: 更新角色失败", "error", err)
 	}
+	promoted = true // 旧 A 已删除，B 必须保持 running；旧 A 的重建收尾由 rebuildStandbyLoop 负责
 	_ = m.srv.Store.UpdateSelfHealState(cfg.TokenID, 0, "rebuilding_standby", "ok", fmt.Sprintf("已轮换到实例 #%d，原使用中 #%d 进入重建", standbyID, active.ID), m.now())
 	m.log.Info("双机轮询: 已轮换", "new_active", standbyID, "old_active", active.ID)
 	m.notifyDualRotated(cfg.TokenID, label, oldIP, host, standbyID)
