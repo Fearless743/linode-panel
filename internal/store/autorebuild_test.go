@@ -78,6 +78,40 @@ func TestAutoRebuildCRUD(t *testing.T) {
 	}
 }
 
+// TestDetectionPortSyncedAcrossMechanisms verifies the single "检测端口"
+// setting cannot diverge between auto-rebuild (auto_port) and dual rotation
+// (dual_port), regardless of which save path wrote last.
+func TestDetectionPortSyncedAcrossMechanisms(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.SetDualConfig(DualConfig{
+		TokenID: 7, UserID: 1, Enabled: false, Port: 443,
+		Threshold: 3, IntervalSec: 300, ActiveInstanceID: 42,
+	}, "Secret123!"); err != nil {
+		t.Fatalf("SetDualConfig: %v", err)
+	}
+	ac, ok := s.AccountConfig(7)
+	if !ok || ac.Port != 443 {
+		t.Fatalf("auto_port after dual save = %d (ok=%v), want 443", ac.Port, ok)
+	}
+	if err := s.SetAccountAutoRebuild(7, 1, true, 8443, 3, 300); err != nil {
+		t.Fatalf("SetAccountAutoRebuild: %v", err)
+	}
+	d, ok := s.DualConfigOf(7)
+	if !ok || d.Port != 8443 {
+		t.Fatalf("dual_port after auto save = %d (ok=%v), want 8443", d.Port, ok)
+	}
+	if err := s.SetAutoRebuild(AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 7, Enabled: true,
+		Port: 9443, Threshold: 3, IntervalSec: 300,
+	}); err != nil {
+		t.Fatalf("SetAutoRebuild: %v", err)
+	}
+	d, _ = s.DualConfigOf(7)
+	if d.Port != 9443 {
+		t.Fatalf("dual_port after per-instance save = %d, want 9443", d.Port)
+	}
+}
+
 // TestAutoRebuildsSkipsMissingInstances ensures a dead cache row (for example
 // the old active instance deleted by a dual rotation) is not probed and does
 // not re-trigger the out-of-band-deletion path on every tick.

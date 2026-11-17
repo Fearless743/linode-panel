@@ -56,6 +56,9 @@ type DualMonitor struct {
 	// in-memory on purpose: probe results keep updating dual_state/last_check_at
 	// and must not accidentally close (or endlessly reopen) the breaker.
 	cooldowns sync.Map
+	// ports remembers the last effective detection port per token so a change
+	// is visible in the log immediately (and proves which port is really used).
+	ports sync.Map
 }
 
 // StartDualMonitor 启动后台双机监测；ctx 取消即退出。
@@ -174,6 +177,20 @@ func dualCheckPort(cfg store.DualConfig) int {
 		return cfg.Port
 	}
 	return DefaultDualPort
+}
+
+// notePort logs when the effective detection port changes, so "I changed the
+// port but it still probes 22" is directly verifiable from the log.
+func (m *DualMonitor) notePort(tokenID, port int) {
+	v, ok := m.ports.LoadOrStore(tokenID, port)
+	if !ok {
+		m.log.Info("双机轮询: 使用检测端口", "token_id", tokenID, "port", port)
+		return
+	}
+	if prev, _ := v.(int); prev != port {
+		m.ports.Store(tokenID, port)
+		m.log.Info("双机轮询: 检测端口已更新", "token_id", tokenID, "old_port", prev, "port", port)
+	}
 }
 
 // freshActiveID 读回最新的 active（快照可能已过期，避免轮换后仍用旧值覆盖）。
@@ -319,7 +336,9 @@ func (m *DualMonitor) checkLocked(ctx context.Context, cfg store.DualConfig) {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例没有公网 IPv4，跳过检测", m.now())
 		return
 	}
-	res := m.checkFn(ctx, ip, dualCheckPort(cfg))
+	checkPort := dualCheckPort(cfg)
+	m.notePort(cfg.TokenID, checkPort)
+	res := m.checkFn(ctx, ip, checkPort)
 	switch {
 	case res.err != nil:
 		m.log.Warn("双机轮询: 检测出错（不计入失败）", "active", active.ID, "ip", ip, "port", dualCheckPort(cfg), "error", res.err)
@@ -472,7 +491,6 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 // 若被墙则删机重建（不执行脚本）直到干净或达上限。返回干净的 standby 实例 id。
 func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConfig, pat string, standbyID int, region, typ, image, label, rootPass string, active linode.Instance) (int, error) {
 	api := m.srv.clientFor(pat)
-	checkPort := dualCheckPort(cfg)
 	id := standbyID
 	// 缺失则创建。
 	if id > 0 {
@@ -548,6 +566,12 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			}
 			continue
 		}
+		// 每轮重新读取端口：长时间重建期间用户可能改了检测端口，不能一直用旧端口。
+		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+			cfg = fresh
+		}
+		checkPort := dualCheckPort(cfg)
+		m.notePort(cfg.TokenID, checkPort)
 		res := m.checkFn(ctx, ip, checkPort)
 		if res.err != nil {
 			m.log.Warn("双机轮询: 备用机探测出错，重试", "id", id, "error", res.err)
@@ -671,6 +695,12 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		if ip == "" {
 			continue
 		}
+		// 同样每轮读取最新检测端口。
+		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
+			cfg = fresh
+		}
+		checkPort = dualCheckPort(cfg)
+		m.notePort(cfg.TokenID, checkPort)
 		res := m.checkFn(context.Background(), ip, checkPort)
 		if res.err != nil {
 			m.log.Warn("双机轮询: 备用机探测出错，重建", "id", id, "error", res.err, "attempt", i+1)
