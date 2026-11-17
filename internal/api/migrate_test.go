@@ -38,8 +38,8 @@ func TestMigrateInstanceHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body := fmt.Sprintf(`{"token_id":%d,"target_token_id":%d}`, src, dst)
-	rr := authedPost(t, srv, cookie, "/api/instances/42/migrate", body)
+	body := fmt.Sprintf(`{"scope":"instance","instance_id":42,"source_token_id":%d,"target_token_id":%d}`, src, dst)
+	rr := authedPost(t, srv, cookie, "/api/migrate", body)
 	wantStatus(t, rr, http.StatusOK)
 	var resp struct {
 		Instance struct {
@@ -94,8 +94,8 @@ func TestMigrateInstanceRequiresRootPassword(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body := fmt.Sprintf(`{"token_id":%d,"target_token_id":%d}`, src, dst)
-	rr := authedPost(t, srv, cookie, "/api/instances/42/migrate", body)
+	body := fmt.Sprintf(`{"scope":"instance","instance_id":42,"source_token_id":%d,"target_token_id":%d}`, src, dst)
+	rr := authedPost(t, srv, cookie, "/api/migrate", body)
 	wantStatus(t, rr, http.StatusBadRequest)
 	// Nothing was moved.
 	if rows := srv.Store.CachedInstanceRows(src); len(rows) != 1 || rows[0].Alive {
@@ -120,7 +120,7 @@ func TestMigrateInstanceRejectsLiveInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body := fmt.Sprintf(`{"token_id":%d,"target_token_id":%d}`, src, dst)
-	rr := authedPost(t, srv, cookie, "/api/instances/42/migrate", body)
+	body := fmt.Sprintf(`{"scope":"instance","instance_id":42,"source_token_id":%d,"target_token_id":%d}`, src, dst)
+	rr := authedPost(t, srv, cookie, "/api/migrate", body)
 	wantStatus(t, rr, http.StatusConflict)
 }

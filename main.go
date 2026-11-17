@@ -37,11 +37,9 @@ func main() {
 	agentCode := flag.String("agent-code", "", "初始 agent 注册码（可选；若数据库已有注册码则优先使用）")
 	selfAgent := flag.Bool("self-agent", true, "面板自身也作为 agent：注册一个本地面板 agent，使经 agent 操作可由面板进程直接执行")
 	selfAgentName := flag.String("self-agent-name", "本地面板", "本地面板 agent 的名称（配合 --self-agent 使用；后台重命名后默认沿用持久化的名称）")
-	autoRebuild := flag.Bool("auto-rebuild", true, "启用「被墙后自动删机重建换 IP」后台监测")
-	autoRebuildTick := flag.Duration("auto-rebuild-tick", time.Minute, "自动换 IP 监听的轮询间隔（每个实例仍按自身配置的检测间隔探测）")
-	autoRebuildCheckAPI := flag.String("auto-rebuild-check-api", defaultAutoRebuildCheckAPI(), "国产 IP 连通性探测接口（被墙判定用，环境变量 AUTO_REBUILD_CHECK_API）")
-	dualEnabled := flag.Bool("dual", true, "启用双机轮询替换监测（被墙时切换到备用机并重建）")
-	dualTick := flag.Duration("dual-tick", time.Minute, "双机轮询监听的轮询间隔（每个账号仍按自身配置的检测间隔探测）")
+	selfHeal := flag.Bool("self-heal", true, "启用统一的「被墙自愈」后台监测（自动换 IP 与双机轮换）")
+	selfHealTick := flag.Duration("self-heal-tick", time.Minute, "自愈监测的轮询间隔（每个账号/实例仍按自身配置的检测间隔探测）")
+	selfHealCheckAPI := flag.String("self-heal-check-api", defaultSelfHealCheckAPI(), "国内 IP 连通性探测接口（被墙判定用，环境变量 SELF_HEAL_CHECK_API）")
 	cacheEnabled := flag.Bool("instance-cache", true, "启用实例缓存后台刷新（每轮拉取所有账号实例并更新列表缓存）")
 	cacheTick := flag.Duration("instance-cache-tick", time.Minute, "实例缓存后台刷新的轮询间隔")
 	tgBotToken := flag.String("tg-bot-token", defaultTGBotToken(), "Telegram Bot Token（为空则用数据库配置，环境变量 TG_BOT_TOKEN）")
@@ -92,7 +90,7 @@ func main() {
 	apiSrv := api.New(client, st)
 	apiSrv.SSHPort = *sshPort
 	apiSrv.APIBase = *apiBase
-	apiSrv.AutoRebuildCheckAPI = *autoRebuildCheckAPI
+	apiSrv.AutoRebuildCheckAPI = *selfHealCheckAPI
 	apiSrv.Tasks.APIBase = *apiBase
 	apiSrv.Tasks.SetSSHPort(*sshPort)
 
@@ -101,16 +99,10 @@ func main() {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
-	// 被墙后自动删机重建换 IP 的后台监测。
-	if *autoRebuild {
-		apiSrv.StartAutoRebuildMonitor(rootCtx, *autoRebuildTick)
-		log.Info("自动换 IP 监测已启动", "tick", autoRebuildTick.String(), "check_api", *autoRebuildCheckAPI)
-	}
-
-	// 双机轮询替换：被墙时切换到备用机并重建旧机。
-	if *dualEnabled {
-		apiSrv.StartDualMonitor(rootCtx, *dualTick)
-		log.Info("双机轮询监测已启动", "tick", dualTick.String())
+	// 统一的被墙自愈监测（rebuild 换 IP 与 dual 双机轮换共用一个后台循环）。
+	if *selfHeal {
+		apiSrv.StartSelfHealMonitor(rootCtx, *selfHealTick)
+		log.Info("被墙自愈监测已启动", "tick", selfHealTick.String(), "check_api", *selfHealCheckAPI)
 	}
 
 	// 实例缓存后台刷新：每轮拉取所有账号实例并更新列表缓存。
@@ -212,10 +204,10 @@ func defaultAPIPrefix() string {
 	return "https://api.linode.com/v4"
 }
 
-// defaultAutoRebuildCheckAPI returns the China-side reachability probe used by
-// the auto-rebuild monitor, overridable via AUTO_REBUILD_CHECK_API.
-func defaultAutoRebuildCheckAPI() string {
-	if v := strings.TrimSpace(os.Getenv("AUTO_REBUILD_CHECK_API")); v != "" {
+// defaultSelfHealCheckAPI returns the China-side reachability probe used by the
+// unified self-heal monitor.
+func defaultSelfHealCheckAPI() string {
+	if v := strings.TrimSpace(os.Getenv("SELF_HEAL_CHECK_API")); v != "" {
 		return v
 	}
 	return api.DefaultBlockCheckAPI

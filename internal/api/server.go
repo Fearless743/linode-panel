@@ -69,16 +69,12 @@ type Server struct {
 	newAgentExec func() *agenthub.Executor
 
 	// AutoRebuildCheckAPI overrides the China-side probe URL used by the
-	// auto-rebuild monitor (empty = DefaultBlockCheckAPI).
+	// self-heal monitor (empty = DefaultBlockCheckAPI).
 	AutoRebuildCheckAPI string
 
-	// monitor is the running auto-rebuild background monitor (nil until
-	// StartAutoRebuildMonitor is called). Handlers use it for on-demand checks.
-	monitor *AutoRebuildMonitor
-
-	// dualMonitor is the running dual polling monitor (nil until
-	// StartDualMonitor is called).
-	dualMonitor *DualMonitor
+	// selfHealMonitor is the single background monitor for both rebuild and
+	// dual modes (nil until StartSelfHealMonitor is called).
+	selfHealMonitor *SelfHealMonitor
 
 	// cacheMonitor is the running instance-cache refresher (nil until
 	// StartInstanceCacheMonitor is called).
@@ -189,52 +185,39 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/account/options", s.requireAuth(store.PermPower, s.handleAccountOptions))
 	mux.HandleFunc("POST /api/account/instances", s.requireAuth(store.PermPower, s.handleCreateInstance))
 
-	// 账号级配置（script/root/auto-rebuild），单实例入口仅为别名。
-	mux.HandleFunc("GET /api/account/config/{tid}", s.requireAuth("", s.handleGetAccountConfig))
-	mux.HandleFunc("PUT /api/account/config/{tid}", s.requireAuth("", s.handlePutAccountConfig))
+	// 账号级「被墙自愈」统一配置（自动换 IP + 双机轮换，模式互斥）。
+	mux.HandleFunc("GET /api/account/self-heal", s.requireAuth("", s.handleListSelfHeal))
+	mux.HandleFunc("GET /api/account/self-heal/{tid}", s.requireAuth("", s.handleGetSelfHeal))
+	mux.HandleFunc("PUT /api/account/self-heal/{tid}", s.requireAuth("", s.handlePutSelfHeal))
+	mux.HandleFunc("DELETE /api/account/self-heal/{tid}", s.requireAuth("", s.handleDeleteSelfHeal))
+	mux.HandleFunc("POST /api/account/self-heal/{tid}/check", s.requireAuth("", s.handleCheckSelfHeal))
+	mux.HandleFunc("POST /api/account/self-heal/{tid}/rotate", s.requireAuth("", s.handleRotateSelfHeal))
 
-	// 账号迁移：把一个账号的全部实例与面板配置迁移到另一个账号。
-	mux.HandleFunc("POST /api/account/migrate", s.requireAuth("", s.handleMigrateAccount))
-
-	// 双机轮询替换：一个账号一对 A/B，被墙时轮换。
-	mux.HandleFunc("GET /api/account/dual", s.requireAuth("", s.handleListDual))
-	mux.HandleFunc("PUT /api/account/dual/{tid}", s.requireAuth("", s.handlePutDual))
-	mux.HandleFunc("DELETE /api/account/dual/{tid}", s.requireAuth("", s.handleDeleteDual))
-	mux.HandleFunc("POST /api/account/dual/{tid}/check", s.requireAuth("", s.handleCheckDual))
-	mux.HandleFunc("POST /api/account/dual/{tid}/rotate", s.requireAuth("", s.handleRotateDual))
+	// 统一迁移：单个实例或整个账号，按 scope 区分。
+	mux.HandleFunc("POST /api/migrate", s.requireAuth("", s.handleMigrate))
 
 	// View permission.
 	mux.HandleFunc("GET /api/instances", s.requireAuth(store.PermView, s.handleListInstances))
 	mux.HandleFunc("GET /api/instances/{id}/refresh", s.requireAuth(store.PermView, s.handleInstanceRefresh))
 	mux.HandleFunc("GET /api/instances/{id}/status", s.requireAuth(store.PermView, s.handleInstanceStatus))
+	// 账号级脚本/密码的兼容别名（底层仍是同一份账号配置）：重建弹窗用它预填。
 	mux.HandleFunc("GET /api/instances/{id}/script", s.requireAuth(store.PermScript, s.handleGetInstanceScript))
 	mux.HandleFunc("PUT /api/instances/{id}/script", s.requireAuth(store.PermScript, s.handlePutInstanceScript))
 	mux.HandleFunc("DELETE /api/instances/{id}/script", s.requireAuth(store.PermScript, s.handleDeleteInstanceScript))
 	mux.HandleFunc("GET /api/instance-scripts", s.requireAuth(store.PermScript, s.handleInstanceScriptStatus))
-	// 实例 root 密码（重建时用于创建新实例）：设置/检查/清除，永不回显明文。
 	mux.HandleFunc("GET /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handleGetInstanceRootPassword))
 	mux.HandleFunc("PUT /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handlePutInstanceRootPassword))
 	mux.HandleFunc("DELETE /api/instances/{id}/root-password", s.requireAuth(store.PermScript, s.handleDeleteInstanceRootPassword))
-
 	// Power permission (includes deleting instances).
 	mux.HandleFunc("POST /api/instances/{id}/boot", s.requireAuth(store.PermPower, s.handleBoot))
 	mux.HandleFunc("POST /api/instances/{id}/shutdown", s.requireAuth(store.PermPower, s.handleShutdown))
 	mux.HandleFunc("POST /api/instances/{id}/reboot", s.requireAuth(store.PermPower, s.handleReboot))
-	// 手动迁移：在上游已不存在的实例可凭缓存配置在另一个账号上重建并迁移面板配置。
-	mux.HandleFunc("POST /api/instances/{id}/migrate", s.requireAuth(store.PermPower, s.handleMigrateInstance))
 	mux.HandleFunc("DELETE /api/instances/{id}", s.requireAuth(store.PermPower, s.handleDeleteInstance))
 
 	// Rebuild permission.
 	mux.HandleFunc("POST /api/instances/{id}/rebuild", s.requireAuth(store.PermRebuild, s.handleRebuild))
 	mux.HandleFunc("GET /api/rebuild/tasks", s.requireAuth(store.PermRebuild, s.handleRebuildTasks))
 	mux.HandleFunc("GET /api/rebuild/tasks/{id}", s.requireAuth(store.PermRebuild, s.handleRebuildTask))
-
-	// 被墙后自动重建换 IP（按实例配置）。
-	mux.HandleFunc("GET /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleGetAutoRebuild))
-	mux.HandleFunc("PUT /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handlePutAutoRebuild))
-	mux.HandleFunc("DELETE /api/instances/{id}/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleDeleteAutoRebuild))
-	mux.HandleFunc("POST /api/instances/{id}/auto-rebuild/check", s.requireAuth(store.PermRebuild, s.handleCheckAutoRebuild))
-	mux.HandleFunc("GET /api/auto-rebuild", s.requireAuth(store.PermRebuild, s.handleAutoRebuildList))
 
 	// Admin permission (users, groups & agents).
 	mux.HandleFunc("GET /api/users", s.requireAuth(store.PermAdmin, s.handleListUsers))
@@ -420,8 +403,8 @@ func (s *Server) dualRoleFor(instanceID int) string {
 // token can be tagged active/standby. Global matching caused an unavailable
 // cached row under another token (or an anchor) to still be labeled 主.
 func (s *Server) dualRoleForToken(tokenID, instanceID int) string {
-	for _, d := range s.Store.DualConfigs() {
-		if !d.Enabled {
+	for _, d := range s.Store.SelfHeals() {
+		if !d.Enabled || d.Mode != store.SelfHealDual {
 			continue
 		}
 		if tokenID > 0 && d.TokenID != tokenID {

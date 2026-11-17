@@ -249,7 +249,7 @@ else
 # linode-panel 环境变量（systemd EnvironmentFile）
 LINODE_API_BASE=${LINODE_API_BASE:-https://api.linode.com/v4}
 # 被墙判定使用的国内探测接口
-# AUTO_REBUILD_CHECK_API=${AUTO_REBUILD_CHECK_API:-https://api.24kplus.com/ipcheck}
+# SELF_HEAL_CHECK_API=${SELF_HEAL_CHECK_API:-https://api.24kplus.com/ipcheck}
 # 敏感字段（PAT/root 密码/注册码）加密主密钥。留空则在数据目录自动生成 state.db.key。
 # LINODE_PANEL_SECRET_KEY=请替换为足够长的随机字符串
 EOF

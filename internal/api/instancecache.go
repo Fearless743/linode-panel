@@ -16,7 +16,7 @@ import (
 // 刷新的情况下也能在 1 个 tick 内看到最新状态。单账号失败只记日志并保留
 // 旧缓存，不影响其他账号。
 type InstanceCacheMonitor struct {
-	srv *Server
+	srv  *Server
 	tick time.Duration
 	log  *slog.Logger
 

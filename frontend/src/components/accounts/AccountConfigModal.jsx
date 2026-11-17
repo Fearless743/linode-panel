@@ -1,8 +1,8 @@
-// 账号级配置弹窗：开机脚本、root 密码、自动换 IP、双机轮询开关共处一处，
-// 同账号所有实例共用；实例表仅为缓存。
+// 账号级「被墙自愈」统一配置弹窗：脚本、root 密码、检测参数与自愈模式
+// （关闭 / 自动换 IP / 双机轮换）只有这一处，同账号所有实例共用。
 import { useEffect, useState } from "react";
 import Modal from "../Modal";
-import { getAccountConfig, setAccountConfig, listDual, checkDual, forceDualRotate, setDual } from "../../api";
+import { getSelfHeal, setSelfHeal, deleteSelfHeal, checkSelfHeal, rotateSelfHeal } from "../../api";
 
 function fmtTime(s) {
   if (!s) return "—";
@@ -11,53 +11,53 @@ function fmtTime(s) {
   return d.toLocaleString();
 }
 
+const MODES = [
+  { value: "off", label: "关闭", hint: "不做被墙检测" },
+  { value: "rebuild", label: "自动换 IP", hint: "被墙后删机重建，换一个公网 IP" },
+  { value: "dual", label: "双机轮换", hint: "A 使用中 / B 备用，被墙时切到 B 并重建旧机" },
+];
+
 export default function AccountConfigModal({ token, onClose, onSaved, instances }) {
+  const [mode, setMode] = useState("off");
+  const [enabled, setEnabled] = useState(false);
   const [script, setScript] = useState("");
   const [clearScript, setClearScript] = useState(false);
   const [rootPass, setRootPass] = useState("");
-  const [clearPass, setClearPass] = useState(false);
-  const [enabled, setEnabled] = useState(false);
   const [port, setPort] = useState("22");
   const [threshold, setThreshold] = useState("3");
   const [intervalMin, setIntervalMin] = useState("5");
+  const [template, setTemplate] = useState("");
   const [hasPass, setHasPass] = useState(false);
+  const [cfg, setCfg] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null);
-
-  // dual (switch)
-  const [dualEnabled, setDualEnabled] = useState(false);
-  const [dualTemplate, setDualTemplate] = useState("");
-  const [dual, setDual] = useState(null);
-  const [rotating, setRotating] = useState(false);
   const list = Array.isArray(instances) ? instances : [];
+
+  function applyConfig(data) {
+    if (!data) return;
+    setCfg(data);
+    const m = data.mode === "rebuild" || data.mode === "dual" ? data.mode : "off";
+    setMode(m);
+    setEnabled(!!data.enabled);
+    setScript(data.script || "");
+    setPort(String(data.port || 22));
+    setThreshold(String(data.threshold || 3));
+    setIntervalMin(String(Math.round((data.interval_seconds || 300) / 60) || 5));
+    setHasPass(!!data.has_root_password);
+    if (data.active_instance_id) setTemplate(String(data.active_instance_id));
+  }
 
   useEffect(() => {
     let alive = true;
-    Promise.all([
-      getAccountConfig(token.id).catch(() => null),
-      listDual().catch(() => ({ dual: [] })),
-    ]).then(([ac, dl]) => {
-      if (!alive) return;
-      if (ac) {
-        setScript(ac.script || "");
-        setEnabled(!!ac.auto_enabled);
-        setPort(String(ac.auto_port || ac.dual_port || 22));
-        setThreshold(String(ac.auto_threshold || ac.dual_threshold || 3));
-        setIntervalMin(String(Math.round((ac.auto_interval_seconds || ac.dual_interval_seconds || 300) / 60) || 5));
-        setHasPass(!!ac.has_root_password);
-        setDualEnabled(!!ac.dual_enabled);
-        setDualTemplate(ac.dual_active_instance_id ? String(ac.dual_active_instance_id) : "");
-      }
-      const dualList = dl && Array.isArray(dl.dual) ? dl.dual : [];
-      const found = dualList.find((d) => d.token_id === token.id) || null;
-      if (found) {
-        setDual(found);
-        setDualEnabled(!!found.enabled);
-        setDualTemplate(found.active_instance_id ? String(found.active_instance_id) : "");
-      }
-      setLoading(false);
-    });
+    getSelfHeal(token.id)
+      .then((data) => {
+        if (alive) applyConfig(data);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
     return () => {
       alive = false;
     };
@@ -79,54 +79,49 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
       setStatus({ msg: "检测间隔必须在 1-1440 分钟之间", cls: "error" });
       return;
     }
-    if (!clearScript && !script.trim()) {
-      setStatus({ msg: "开机脚本不能为空（或勾选清除）", cls: "error" });
-      return;
-    }
-    if (dualEnabled && !dual?.active_instance_id && !dualTemplate) {
-      setStatus({ msg: "开启双机时请先选择模板实例（模板机将作为使用中 A）", cls: "error" });
+    if (mode === "dual" && enabled && !template) {
+      setStatus({ msg: "开启双机轮换时请先选择使用中实例（模板）", cls: "error" });
       return;
     }
     setBusy(true);
     setStatus({ msg: "保存中…", cls: "" });
     try {
       const payload = {
-        script: clearScript ? "" : script,
-        clear_script: clearScript,
-        clear_root_password: clearPass,
+        mode,
         enabled,
         port: p,
         threshold: t,
         interval_seconds: m * 60,
-      };
-      if (rootPass) payload.root_password = rootPass;
-      const d = await setAccountConfig(token.id, payload);
-      setHasPass(!!d.has_root_password);
-      // dual switch is separate endpoint but reuses the same script/root/port params
-      const dualPayload = {
-        enabled: dualEnabled,
-        port: p,
-        threshold: t,
-        interval_seconds: m * 60,
         script: clearScript ? "" : script,
       };
-      if (dualTemplate) dualPayload.template_instance_id = parseInt(dualTemplate, 10);
-      if (rootPass) dualPayload.root_password = rootPass;
-      let dualData = null;
-      try {
-        dualData = await setDual(token.id, dualPayload);
-      } catch (err) {
-        if (dualEnabled) throw err;
-      }
-      if (dualData?.dual) setDual(dualData.dual);
-      if (dualData?.warning) {
-        setStatus({ msg: "账号已保存，双机备用机创建失败：" + dualData.warning, cls: "error" });
-      } else {
-        setStatus({ msg: "已保存（同账号所有实例共用）", cls: "ok" });
-      }
+      if (template && mode === "dual") payload.template_instance_id = parseInt(template, 10);
+      if (rootPass) payload.root_password = rootPass;
+      const data = await setSelfHeal(token.id, payload);
+      applyConfig(data.self_heal || data);
+      setHasPass(!!(data.self_heal || data).has_root_password);
+      setStatus({
+        msg: data.warning ? "已保存，但备用机创建失败：" + data.warning : "已保存（同账号所有实例共用）",
+        cls: data.warning ? "error" : "ok",
+      });
       if (onSaved) onSaved();
     } catch (err) {
       setStatus({ msg: "保存失败：" + (err.message || "未知错误"), cls: "error" });
+    } finally {
+      setBusy(false);
+      setRootPass("");
+    }
+  }
+
+  async function disable() {
+    if (!window.confirm("关闭该账号的自愈监测？实例与配置会保留。")) return;
+    setBusy(true);
+    try {
+      await deleteSelfHeal(token.id);
+      applyConfig(await getSelfHeal(token.id));
+      setStatus({ msg: "已关闭自愈", cls: "ok" });
+      if (onSaved) onSaved();
+    } catch (err) {
+      setStatus({ msg: "关闭失败：" + (err.message || "未知错误"), cls: "error" });
     } finally {
       setBusy(false);
     }
@@ -136,8 +131,7 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
     setBusy(true);
     setStatus({ msg: "检测中…", cls: "" });
     try {
-      const data = await checkDual(token.id);
-      if (data && data.dual) setDual(data.dual);
+      applyConfig(await checkSelfHeal(token.id));
       setStatus({ msg: "检测完成", cls: "ok" });
       if (onSaved) onSaved();
     } catch (err) {
@@ -148,229 +142,148 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
   }
 
   async function rotateNow() {
-    if (!dual?.active_instance_id) return;
     if (!window.confirm("立即把使用中实例切换到备用机并重建旧机？")) return;
-    setRotating(true);
+    setBusy(true);
     setStatus({ msg: "已触发立即替换，后台执行中…", cls: "" });
     try {
-      await forceDualRotate(token.id);
+      await rotateSelfHeal(token.id);
       setTimeout(async () => {
         try {
-          const data = await checkDual(token.id);
-          if (data && data.dual) setDual(data.dual);
+          applyConfig(await getSelfHeal(token.id));
         } catch {}
       }, 2000);
     } catch (err) {
       setStatus({ msg: "触发失败：" + (err.message || "未知错误"), cls: "error" });
     } finally {
-      setRotating(false);
+      setBusy(false);
     }
   }
 
+  const active = mode !== "off" && enabled;
+
   return (
-    <Modal title={"账号配置 · " + (token.label || "#" + token.id)} onClose={onClose}>
+    <Modal title={"自愈设置 · " + (token.label || "#" + token.id)} onClose={onClose}>
       <p className="boot-script-hint">
-        配置只在账号一处：开机脚本、root 密码、自动换 IP 与双机轮询共用，同账号所有实例一致，实例表仅为缓存。
+        被墙检测只有一套配置：开机脚本、root 密码、检测端口与失败阈值在此统一设置；
+        选择一种模式即可，模式之间互斥。同账号所有实例共用。
       </p>
       {loading ? (
-        <div>加载中…</div>
+        <div className="users-empty">正在加载…</div>
       ) : (
         <>
           <div className="modal-field">
-            <label htmlFor="acct-script">开机脚本（账号级）</label>
-            <textarea
-              id="acct-script"
-              className="boot-script-textarea"
-              rows={6}
-              spellCheck={false}
-              value={script}
-              onChange={(e) => setScript(e.target.value)}
-              disabled={busy}
-            />
-            <label className="exec-option">
-              <input
-                type="checkbox"
-                checked={clearScript}
-                onChange={(e) => setClearScript(e.target.checked)}
-                disabled={busy}
-              />
-              <span className="exec-option-text">
-                <span>清除脚本（回退默认）</span>
-              </span>
-            </label>
-          </div>
-          <div className="modal-field">
-            <label htmlFor="acct-pass">
-              root 密码{hasPass ? "（已保存，留空不改）" : "（重建/创建用）"}
-            </label>
-            <input
-              id="acct-pass"
-              className="modal-input"
-              type="password"
-              autoComplete="new-password"
-              placeholder={hasPass ? "留空保持不变" : "输入 root 密码"}
-              value={rootPass}
-              onChange={(e) => setRootPass(e.target.value)}
-              disabled={busy || clearPass}
-            />
-            {hasPass && (
-              <label className="exec-option">
-                <input
-                  type="checkbox"
-                  checked={clearPass}
-                  onChange={(e) => setClearPass(e.target.checked)}
-                  disabled={busy}
-                />
-                <span className="exec-option-text">
-                  <span>清除已保存密码</span>
-                </span>
-              </label>
-            )}
-          </div>
-          <div className="modal-field">
-            <label className="exec-option">
-              <input
-                type="checkbox"
-                checked={enabled}
-                onChange={(e) => setEnabled(e.target.checked)}
-                disabled={busy}
-              />
-              <span className="exec-option-text">
-                <span>开启自动换 IP（账号级）</span>
-                <span className="exec-option-sub">该账号下所有实例按同一参数被墙后重建</span>
-              </span>
-            </label>
-          </div>
-          <div className="modal-field">
-            <label htmlFor="acct-port">检测端口（TCP）</label>
-            <input
-              id="acct-port"
-              className="modal-input"
-              type="number"
-              min="1"
-              max="65535"
-              value={port}
-              onChange={(e) => setPort(e.target.value)}
-              disabled={busy}
-            />
-            <p className="boot-script-hint">
-              仅用于国内探测是否被墙（自动换 IP 与双机轮询共用），可填代理/业务端口（如 443）。
-              开机脚本的 SSH 端口由面板启动参数 --ssh-port 决定（默认 22），不受此端口影响。
-            </p>
-          </div>
-          <div className="modal-field">
-            <label htmlFor="acct-th">连续失败多少次判定被墙</label>
-            <input
-              id="acct-th"
-              className="modal-input"
-              type="number"
-              min="1"
-              max="20"
-              value={threshold}
-              onChange={(e) => setThreshold(e.target.value)}
-              disabled={busy}
-            />
-          </div>
-          <div className="modal-field">
-            <label htmlFor="acct-iv">检测间隔（分钟）</label>
-            <input
-              id="acct-iv"
-              className="modal-input"
-              type="number"
-              min="1"
-              max="1440"
-              value={intervalMin}
-              onChange={(e) => setIntervalMin(e.target.value)}
-              disabled={busy}
-            />
+            <label>自愈模式</label>
+            <select value={mode} onChange={(e) => setMode(e.target.value)}>
+              {MODES.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label} — {m.hint}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="modal-field">
-            <h3 style={{ margin: "12px 0 6px" }}>双机轮询</h3>
-            <label className="exec-option">
-              <input
-                type="checkbox"
-                checked={dualEnabled}
-                onChange={(e) => setDualEnabled(e.target.checked)}
-                disabled={busy}
-              />
-              <span className="exec-option-text">
-                <span>开启双机轮询</span>
-                <span className="exec-option-sub">一个账号只管理一对 A/B；双机实例自动跳过自动换IP</span>
-              </span>
-            </label>
-          </div>
-          {dualEnabled && (
+          {mode !== "off" && (
             <>
-              <div className="modal-field">
-                <label htmlFor="dual-template">模板实例（作为使用中 A）</label>
-                <select
-                  id="dual-template"
-                  className="modal-input"
-                  value={dualTemplate}
-                  onChange={(e) => setDualTemplate(e.target.value)}
-                  disabled={busy}
-                  title="可重新选择：切换后旧主成为备用机并触发重建（若已被删则新建）"
-                >
-                  <option value="">选择该账号下的实例…</option>
-                  {list.map((i) => (
-                    <option key={i.id} value={String(i.id)}>
-                      {i.label || "未命名"} #{i.id}（{i.status}）
-                    </option>
-                  ))}
-                </select>
-                {dual && dual.active_instance_id > 0 && (
-                  <p className="boot-script-hint">
-                    使用中：#{dual.active_instance_id}
-                    {dual.standby_instance_id > 0 ? ` · 备用：#${dual.standby_instance_id}` : " · 备用机创建中…"}
-                  </p>
-                )}
-                {list.length === 0 && (
-                  <p className="boot-script-hint">
-                    该账号下暂无可用实例，请先到实例页创建一台后再回来选择作为使用中。双机实例被删后仅记录了指针，上游已无实例时必须先有新实例才能重绑。
-                  </p>
-                )}
+              <div className="modal-field row">
+                <label className="switch-line">
+                  <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+                  <span>启用自愈监测</span>
+                </label>
               </div>
-              {dual && (
-                <div className="modal-detail auto-rebuild-state">
-                  <div>状态：{dual.state || "—"} · {dual.last_status || "—"}</div>
-                  <div>连续失败：{dual.fail_count || 0}</div>
-                  <div>检测端口：{dual.port || 22}（开机脚本 SSH 端口由面板 --ssh-port 决定）</div>
-                  <div>最近检测：{fmtTime(dual.last_check_at)}</div>
-                  {dual.last_detail ? <div>上次检测详情：{dual.last_detail}</div> : null}
+
+              <div className="modal-field">
+                <label>开机脚本</label>
+                <textarea rows={6} value={script} onChange={(e) => { setScript(e.target.value); setClearScript(false); }} />
+                <label className="switch-line">
+                  <input type="checkbox" checked={clearScript} onChange={(e) => setClearScript(e.target.checked)} />
+                  <span>清除已保存的脚本</span>
+                </label>
+              </div>
+
+              <div className="modal-field">
+                <label>root 密码（用于 SSH 执行开机脚本 / 重建，不回显明文）</label>
+                <input type="password" value={rootPass} placeholder={hasPass ? "已保存，留空表示不修改" : "请输入 root 密码"} onChange={(e) => setRootPass(e.target.value)} />
+              </div>
+
+              <div className="modal-grid">
+                <div className="modal-field">
+                  <label>检测端口（TCP）</label>
+                  <input type="number" min="1" max="65535" value={port} onChange={(e) => setPort(e.target.value)} />
+                </div>
+                <div className="modal-field">
+                  <label>连续失败次数</label>
+                  <input type="number" min="1" max="20" value={threshold} onChange={(e) => setThreshold(e.target.value)} />
+                </div>
+                <div className="modal-field">
+                  <label>检测间隔（分钟）</label>
+                  <input type="number" min="1" max="1440" value={intervalMin} onChange={(e) => setIntervalMin(e.target.value)} />
+                </div>
+              </div>
+              <p className="boot-script-hint">
+                检测端口指向国内连通性探测端口（如 443、8443），与 SSH 登录端口互不影响。
+              </p>
+
+              {mode === "dual" && (
+                <div className="modal-field">
+                  <label>使用中实例（模板，作为 A）</label>
+                  <select value={template} onChange={(e) => setTemplate(e.target.value)}>
+                    <option value="">请选择实例</option>
+                    {list.map((i) => (
+                      <option key={i.id} value={i.id}>
+                        #{i.id} {i.label || ""} {i.ipv4?.[0] ? "· " + i.ipv4[0] : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="boot-script-hint">
+                    一个账号只管理一对 A/B；双机接管的实例会自动跳过单实例换 IP，避免重复删机。
+                  </p>
                 </div>
               )}
-              <div className="modal-actions">
-                <button
-                  className="btn btn-ghost"
-                  type="button"
-                  onClick={checkNow}
-                  disabled={busy || !dual?.active_instance_id}
-                >
-                  立即检测
+
+              {cfg && active && (
+                <div className="modal-detail auto-rebuild-state">
+                  <div>当前状态：{cfg.last_status || cfg.state || "—"}</div>
+                  <div>最近检测：{fmtTime(cfg.last_check_at)}</div>
+                  <div>详情：{cfg.last_detail || "—"}</div>
+                  {mode === "dual" && (
+                    <div>使用中 #{cfg.active_instance_id || "—"} · 备用 #{cfg.standby_instance_id || "—"}</div>
+                  )}
+                  {mode === "rebuild" && Array.isArray(cfg.instances) && (
+                    <div style={{ maxHeight: 160, overflow: "auto" }}>
+                      {cfg.instances.map((it) => (
+                        <div key={it.instance_id}>
+                          #{it.instance_id} · {it.last_status || "idle"} · 失败 {it.fail_count}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="actions" style={{ marginTop: 8 }}>
+                <button className="btn btn-primary" type="button" disabled={busy} onClick={save}>
+                  {busy ? "处理中…" : "保存"}
                 </button>
-                <button
-                  className="btn btn-danger"
-                  type="button"
-                  onClick={rotateNow}
-                  disabled={busy || rotating || !dual?.active_instance_id}
-                >
-                  {rotating ? "触发中…" : "立即替换"}
+                {active && (
+                  <button className="btn btn-ghost" type="button" disabled={busy} onClick={checkNow}>
+                    立即检测
+                  </button>
+                )}
+                {active && mode === "dual" && (
+                  <button className="btn btn-ghost" type="button" disabled={busy} onClick={rotateNow}>
+                    立即替换
+                  </button>
+                )}
+                <button className="btn btn-danger" type="button" disabled={busy} onClick={disable}>
+                  关闭自愈
                 </button>
               </div>
             </>
           )}
+
+          {status && <div className={"boot-script-status " + status.cls} style={{ marginTop: 8 }}>{status.msg}</div>}
         </>
       )}
-      {status && <div className={"boot-script-status " + status.cls}>{status.msg}</div>}
-      <div className="modal-actions">
-        <button className="btn btn-ghost" type="button" onClick={onClose} disabled={busy}>
-          关闭
-        </button>
-        <button className="btn btn-primary" type="button" onClick={save} disabled={busy || loading}>
-          保存
-        </button>
-      </div>
     </Modal>
   );
 }

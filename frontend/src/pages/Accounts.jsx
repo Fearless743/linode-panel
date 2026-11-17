@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, listAccountAgents, updateAccountToken, listDual, listInstances } from "../api";
+import { apiFetch, listAccountAgents, updateAccountToken, listSelfHeal, listInstances } from "../api";
 import AddTokenModal from "../components/accounts/AddTokenModal";
 import AccountConfigModal from "../components/accounts/AccountConfigModal";
-import AccountMigrateModal from "../components/accounts/AccountMigrateModal";
+import MigrateModal from "../components/MigrateModal";
 import EditFormModal from "../components/ui/EditFormModal";
 import AccountHealthCell from "../components/accounts/AccountHealthCell";
 
@@ -20,15 +20,15 @@ export default function Accounts() {
   const [editToken, setEditToken] = useState(null); // token object to edit, null = closed
   const [configToken, setConfigToken] = useState(null); // 账号级配置弹窗的账号（双机为其中开关）
   const [migrateOpen, setMigrateOpen] = useState(false);
-  const [dualList, setDualList] = useState([]);
+  const [selfHealList, setSelfHealList] = useState([]);
   const [allInstances, setAllInstances] = useState([]);
 
-  const loadDual = useCallback(async () => {
+  const loadSelfHeal = useCallback(async () => {
     try {
-      const data = await listDual();
-      setDualList(Array.isArray(data.dual) ? data.dual : []);
+      const data = await listSelfHeal();
+      setSelfHealList(Array.isArray(data.self_heal) ? data.self_heal : []);
     } catch {
-      setDualList([]);
+      setSelfHealList([]);
     }
   }, []);
 
@@ -41,8 +41,8 @@ export default function Accounts() {
     }
   }, []);
 
-  function dualOf(tokenId) {
-    return dualList.find((d) => d.token_id === tokenId) || null;
+  function selfHealOf(tokenId) {
+    return selfHealList.find((d) => d.token_id === tokenId) || null;
   }
 
   function instancesOf(tokenId) {
@@ -62,9 +62,9 @@ export default function Accounts() {
 
   useEffect(() => {
     loadTokens();
-    loadDual();
+    loadSelfHeal();
     loadAllInstances();
-  }, [loadTokens, loadDual, loadAllInstances]);
+  }, [loadTokens, loadSelfHeal, loadAllInstances]);
 
   // 加载可用 Agent 列表，用于账号绑定下拉框。
   useEffect(() => {
@@ -198,14 +198,14 @@ export default function Accounts() {
                 <th>名称</th>
                 <th>Token</th>
                 <th>余额 / 状态</th>
-                <th>双机轮询</th>
+                <th>被墙自愈</th>
                 <th>执行 Agent</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody>
               {tokens.map((t) => {
-                const d = dualOf(t.id);
+                const sh = selfHealOf(t.id);
                 return (
                 <tr key={t.id}>
                   <td>{t.label || "（未命名）"}</td>
@@ -214,16 +214,18 @@ export default function Accounts() {
                     <AccountHealthCell token={t} />
                   </td>
                   <td>
-                    {d && d.enabled ? (
-                      <span title={`使用中 #${d.active_instance_id} · 备用 #${d.standby_instance_id || "—"} · ${d.last_status || d.state || ""}`}>
-                        开启（A #{d.active_instance_id}{d.standby_instance_id ? ` / 备 #${d.standby_instance_id}` : ""}）
+                    {sh && sh.enabled ? (
+                      <span title={sh.last_detail || sh.last_status || ""}>
+                        {sh.mode === "dual"
+                          ? `双机轮换（A #${sh.active_instance_id}${sh.standby_instance_id ? ` / 备 #${sh.standby_instance_id}` : ""}）`
+                          : "自动换 IP"}
                       </span>
                     ) : (
                       <span className="agent-unbound">关闭</span>
                     )}
                     <div className="actions" style={{ marginTop: 4 }}>
                       <button className="action-btn" type="button" onClick={() => setConfigToken(t)}>
-                        账号配置
+                        自愈设置
                       </button>
                     </div>
                   </td>
@@ -289,15 +291,20 @@ export default function Accounts() {
           instances={instancesOf(configToken.id)}
           onClose={() => setConfigToken(null)}
           onSaved={() => {
-            loadDual();
+            loadSelfHeal();
             loadAllInstances();
           }}
         />
       )}
       {migrateOpen && (
-        <AccountMigrateModal
+        <MigrateModal
           tokens={tokens || []}
+          initialScope="account"
           onClose={() => setMigrateOpen(false)}
+          onDone={() => {
+            loadTokens();
+            loadAllInstances();
+          }}
         />
       )}
     </section>

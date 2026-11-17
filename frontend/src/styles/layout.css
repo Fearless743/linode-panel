@@ -281,6 +281,20 @@
   margin-bottom: var(--space-1);
 }
 
+.modal-field label.switch-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+  color: var(--text);
+}
+
+.modal-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
 .modal-input,
 .modal-textarea {
   width: 100%;

@@ -107,12 +107,18 @@ func (s *Store) ensureAccountConfigTable() error {
 			}
 		}
 	}
+	// 自愈统一模式列：老库补列并按旧开关推断模式（需在 dual_* 列补完后执行）。
+	if err := s.ensureHealModeColumn(); err != nil {
+		return err
+	}
 	// 清理孤儿账号配置：已删除 token 的配置行不再有归属。
 	_, _ = s.db.Exec(`DELETE FROM account_config WHERE token_id NOT IN (SELECT id FROM tokens) AND token_id!=0`)
 	// Merge old Dual (account_dual) into account_config single place.
 	_ = s.mergeDualIntoAccountConfig()
 	// Merge after deletion also skips orphans; ensure orphans from legacy table don't resurface.
 	_, _ = s.db.Exec(`DELETE FROM account_config WHERE token_id NOT IN (SELECT id FROM tokens) AND token_id!=0`)
+	// 旧 account_dual 合并进来的行此时才带 dual_* 值，补一次模式推断。
+	_ = s.backfillHealMode()
 	// 已迁移则不再重复（以 token 行存在与否判断）
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM account_config`).Scan(&n); err != nil {
@@ -126,7 +132,8 @@ func (s *Store) ensureAccountConfigTable() error {
 		return err
 	}
 	_ = migrated
-	return nil
+	// 单实例配置迁移进来的行带 auto_* 值，补一次模式推断。
+	return s.backfillHealMode()
 }
 
 func (s *Store) mergeDualIntoAccountConfig() error {

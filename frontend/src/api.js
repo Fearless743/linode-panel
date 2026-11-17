@@ -124,15 +124,10 @@ export function refreshInstance(id, tokenId) {
   );
 }
 
-// 手动迁移：上游已不存在的实例用缓存配置在另一个账号上重建，并把面板配置
-// （脚本、root 密码、自动换 IP、替换配置）迁移到新账号/新实例。
-// payload: { token_id（来源账号）, target_token_id, root_password?, label? }
-export function migrateInstance(id, payload) {
-  return jsonRequest(
-    "/api/instances/" + encodeURIComponent(id) + "/migrate",
-    "POST",
-    payload
-  );
+// 统一迁移：scope=instance 迁移一台不可用实例；scope=account 迁移整个账号。
+// payload: { scope, instance_id?, source_token_id?, target_token_id, delete_source?, root_password?, label? }
+export function migrate({ scope = "instance", ...payload }) {
+  return jsonRequest("/api/migrate", "POST", { scope, ...payload });
 }
 
 // 永久删除实例（DELETE /linode/instances/{id}），并清空后端缓存。
@@ -185,40 +180,38 @@ export function getRebuildTask(id) {
   return apiFetch("/api/rebuild/tasks/" + encodeURIComponent(id));
 }
 
-// ---------- 被墙后自动重建换 IP ----------
-export function getAutoRebuild(id) {
-  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild");
+// ---------- 账号级「被墙自愈」统一配置（自动换 IP + 双机轮换） ----------
+export function listSelfHeal() {
+  return apiFetch("/api/account/self-heal");
 }
 
-// payload: { enabled, port, threshold, interval_seconds, token_id }
-export function setAutoRebuild(id, payload) {
-  return jsonRequest("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild", "PUT", payload);
+export function getSelfHeal(tokenId) {
+  return apiFetch("/api/account/self-heal/" + encodeURIComponent(tokenId));
 }
 
-export function deleteAutoRebuild(id) {
-  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild", {
+// payload: { mode:'off'|'rebuild'|'dual', enabled, port, threshold,
+//   interval_seconds, script?, root_password?, template_instance_id? }
+export function setSelfHeal(tokenId, payload) {
+  return jsonRequest("/api/account/self-heal/" + encodeURIComponent(tokenId), "PUT", payload);
+}
+
+export function deleteSelfHeal(tokenId) {
+  return apiFetch("/api/account/self-heal/" + encodeURIComponent(tokenId), {
     method: "DELETE",
   });
 }
 
-// 立即探测一次并返回最新状态。
-export function checkAutoRebuild(id) {
-  return apiFetch("/api/instances/" + encodeURIComponent(id) + "/auto-rebuild/check", {
+export function checkSelfHeal(tokenId) {
+  return apiFetch("/api/account/self-heal/" + encodeURIComponent(tokenId) + "/check", {
     method: "POST",
+    timeout: 120000,
   });
 }
 
-// 已配置自动换 IP 的实例列表（用于行内标记）。
-export function listAutoRebuild() {
-  return apiFetch("/api/auto-rebuild");
-}
-
-// ---------- 账号级配置（实例仅为缓存，改动影响同账号全部实例） ----------
-export function getAccountConfig(tokenId) {
-  return apiFetch("/api/account/config/" + encodeURIComponent(tokenId));
-}
-export function setAccountConfig(tokenId, payload) {
-  return jsonRequest("/api/account/config/" + encodeURIComponent(tokenId), "PUT", payload);
+export function rotateSelfHeal(tokenId) {
+  return apiFetch("/api/account/self-heal/" + encodeURIComponent(tokenId) + "/rotate", {
+    method: "POST",
+  });
 }
 
 // ---------- 用户 / Token ----------
@@ -315,54 +308,6 @@ export function setAccountAgent(tokenId, agentId) {
 // payload: { label?: string, agent_id?: number }
 export function updateAccountToken(tokenId, payload) {
   return jsonRequest("/api/account/tokens/" + encodeURIComponent(tokenId), "PUT", payload);
-}
-
-// ---------- 账号迁移（把一个账号的全部实例与面板配置迁移到另一个账号） ----------
-// payload: { source_token_id, target_token_id, delete_source }
-// 返回 { migrated, failed, results: [{ source_instance_id, target_instance_id, ok, error }] }
-export function migrateAccount(payload) {
-  return apiFetch("/api/account/migrate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    timeout: 600000,
-  });
-}
-
-// ---------- 双机轮询替换（账号维度，一对 A/B） ----------
-// 返回 { dual: [{ token_id, user_id, enabled, port, threshold, interval_seconds,
-//   active_instance_id, standby_instance_id, state, fail_count, last_status,
-//   last_detail, last_check_at, script, has_root_password, updated_at }] }
-export function listDual() {
-  return apiFetch("/api/account/dual");
-}
-
-// 保存账号的双机配置；启用时需要 template_instance_id（模板机作为 A）。
-// payload: { enabled, template_instance_id?, port, threshold, interval_seconds, script?, root_password? }
-// 返回 { dual }，失败时可能附带 warning（B 创建失败但配置已保存）。
-export function setDual(tokenId, payload) {
-  return jsonRequest("/api/account/dual/" + encodeURIComponent(tokenId), "PUT", payload);
-}
-
-export function deleteDual(tokenId) {
-  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId), {
-    method: "DELETE",
-  });
-}
-
-// 立即探测一次并返回最新状态。
-export function checkDual(tokenId) {
-  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId) + "/check", {
-    method: "POST",
-    timeout: 120000,
-  });
-}
-
-// 立即执行一次轮换（不等被墙阈值），异步执行，返回 accepted。
-export function forceDualRotate(tokenId) {
-  return apiFetch("/api/account/dual/" + encodeURIComponent(tokenId) + "/rotate", {
-    method: "POST",
-  });
 }
 
 // ---------- TG 通知全局配置（管理员） ----------

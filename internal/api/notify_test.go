@@ -25,7 +25,7 @@ func TestFormatBlockedInterval(t *testing.T) {
 }
 
 func TestNotifyConfigRoundTrip(t *testing.T) {
-	srv, session := newDualServer(t)
+	srv, session := newSelfHealServer(t)
 	_ = session
 	if err := srv.Store.SetNotifyConfig(true, "123", "tok"); err != nil {
 		t.Fatalf("SetNotifyConfig: %v", err)
@@ -53,7 +53,7 @@ func TestNotifyConfigRoundTrip(t *testing.T) {
 }
 
 func TestNotifyAPIRequiresAdmin(t *testing.T) {
-	srv, session := newDualServer(t)
+	srv, session := newSelfHealServer(t)
 	// admin (seeded id 1) 可访问。
 	req := httptest.NewRequest(http.MethodGet, "/api/notify", nil)
 	authed(req, session)
@@ -71,7 +71,7 @@ func TestNotifyAPIRequiresAdmin(t *testing.T) {
 		sent = append(sent, text)
 		return nil
 	}
-	m := &DualMonitor{srv: srv}
+	m := &SelfHealMonitor{srv: srv}
 	m.notifyDualRotated(1, "acc", "1.1.1.1", "2.2.2.2", 99)
 	if len(sent) != 1 || !strings.Contains(sent[0], "2.2.2.2") || !strings.Contains(sent[0], "被墙") {
 		t.Fatalf("dual notify = %v", sent)

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"linode-panel/internal/linode"
 	"linode-panel/internal/store"
@@ -267,4 +268,13 @@ func decodeJSONInto(t *testing.T, rr *httptest.ResponseRecorder, v any) {
 	if err := json.Unmarshal(rr.Body.Bytes(), v); err != nil {
 		t.Fatalf("decode: %v (body=%s)", err, rr.Body.String())
 	}
+}
+
+// newSelfHealServer returns a server with one token and a session string.
+// Used by the self-heal / notify tests in place of the old dual-only helper.
+func newSelfHealServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	srv := testServer(t, &fakeAPI{})
+	addAliceToken(t, srv, "acc", "pat-selfheal")
+	return srv, srv.Store.NewSession(aliceID, time.Hour)
 }

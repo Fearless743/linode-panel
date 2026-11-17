@@ -1845,12 +1845,12 @@ func mergeConfigToCacheID(tx *sql.Tx, fromID, toID int) error {
 	var (
 		hasScript, hasPass, hasAuto int
 		script, password            string
-		userID, tokenID, enabled   int
-		port, threshold, interval  int
-		failCount                  int
-		lastStatus, lastDetail     string
-		lastCheckAt, lastBlockedAt string
-		lastTaskID, updatedAt      string
+		userID, tokenID, enabled    int
+		port, threshold, interval   int
+		failCount                   int
+		lastStatus, lastDetail      string
+		lastCheckAt, lastBlockedAt  string
+		lastTaskID, updatedAt       string
 	)
 	err := tx.QueryRow(`SELECT has_script, script, has_password, password,
 		has_auto_rebuild, user_id, token_id, enabled, port, threshold, interval_sec,

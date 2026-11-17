@@ -86,7 +86,7 @@ func (s *Server) notifyClient() *http.Client {
 }
 
 // notifyDualRotated 在双机轮换成功后通知：旧 IP → 新 IP + 间隔。
-func (m *DualMonitor) notifyDualRotated(cfgTokenID int, label, oldIP, newIP string, newActiveID int) {
+func (m *SelfHealMonitor) notifyDualRotated(cfgTokenID int, label, oldIP, newIP string, newActiveID int) {
 	prev := m.srv.Store.DualLastBlockedAt(cfgTokenID)
 	now := time.Now().UTC()
 	interval := formatBlockedInterval(prev, now)
@@ -99,7 +99,7 @@ func (m *DualMonitor) notifyDualRotated(cfgTokenID int, label, oldIP, newIP stri
 }
 
 // notifyDualFailed 在双机轮换失败时通知（无新 IP）。
-func (m *DualMonitor) notifyDualFailed(label, reason string) {
+func (m *SelfHealMonitor) notifyDualFailed(label, reason string) {
 	text := fmt.Sprintf("⚠️ 双机轮询轮换失败\n账号：%s\n原因：%s", label, reason)
 	if err := m.srv.sendTelegram(context.Background(), text); err != nil {
 		slog.Warn("双机轮询 TG 通知失败", "error", err)
@@ -107,7 +107,7 @@ func (m *DualMonitor) notifyDualFailed(label, reason string) {
 }
 
 // notifyAutoRebuilt 在自动换 IP 重建成功后通知：旧 IP → 新 IP + 间隔。
-func (m *AutoRebuildMonitor) notifyAutoRebuilt(label string, instanceID int, oldIP, newIP, prevBlockedAt string) {
+func (m *SelfHealMonitor) notifyAutoRebuilt(label string, instanceID int, oldIP, newIP, prevBlockedAt string) {
 	now := time.Now().UTC()
 	interval := formatBlockedInterval(prevBlockedAt, now)
 	text := fmt.Sprintf("🚨 自动换IP被墙重建\n实例：%s #%d\n旧 IP：%s\n✅ 新 IP：%s\n%s",

@@ -7,7 +7,6 @@ import {
   instanceAction,
   listInstances,
   listRebuildTasks,
-  migrateInstance,
   rebuildInstance,
   refreshInstance,
 } from "../api";
@@ -19,7 +18,7 @@ import InstanceTable from "../components/instances/InstanceTable";
 import ActionModal from "../components/instances/ActionModal";
 import RebuildModal from "../components/instances/RebuildModal";
 import CreateInstanceModal from "../components/instances/CreateInstanceModal";
-import MigrateInstanceModal from "../components/instances/MigrateInstanceModal";
+import MigrateModal from "../components/MigrateModal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 
 export default function Instances() {
@@ -282,21 +281,6 @@ export default function Instances() {
     loadInstances();
   };
 
-  // ---------- 手动迁移（上游已不存在的实例） ----------
-  const confirmMigrate = async ({ targetTokenId, rootPassword, label }) => {
-    const inst = migrateModal;
-    if (!inst) return;
-    hideBanner();
-    await migrateInstance(inst.id, {
-      token_id: inst.token_id,
-      target_token_id: targetTokenId,
-      root_password: rootPassword || undefined,
-      label: label || undefined,
-    });
-    await loadInstances();
-    showBanner("实例已迁移到目标账号；开机脚本将在新实例启动后自动执行", false);
-  };
-
   // ---------- 删除实例 ----------
   // 确认后调用 API 永久删除实例；执行通道跟随账号绑定。
   // 对不可用实例，删除只会清理面板中的缓存记录及其配置。
@@ -380,11 +364,17 @@ export default function Instances() {
         />
       )}
       {migrateModal && (
-        <MigrateInstanceModal
-          inst={migrateModal}
+        <MigrateModal
           tokens={tokens}
+          instances={instances}
+          initialScope="instance"
+          initialInstance={migrateModal}
           onClose={() => setMigrateModal(null)}
-          onConfirm={confirmMigrate}
+          onDone={() => {
+            setMigrateModal(null);
+            loadInstances();
+            showBanner("实例已迁移到目标账号；开机脚本将在新实例启动后自动执行", false);
+          }}
         />
       )}
       {deleteModal && (

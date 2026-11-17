@@ -34,17 +34,18 @@ type groupJSON struct {
 //   - health_status：ok | no_balance | banned | error，探测失败时留空；
 //   - health_detail：可读中文说明（含余额数字）；
 //   - health_checked_at：本次探测时间（RFC3339）。
+//
 // balance / balance_uninvoiced 仅探测成功时返回（float64，正数=欠款）。
 type tokenJSON struct {
-	ID               int     `json:"id"`
-	Label            string  `json:"label"`
-	Masked           string  `json:"masked"`
-	AgentID          int     `json:"agent_id"`
-	AgentName        string  `json:"agent_name,omitempty"`
-	HealthStatus     string  `json:"health_status,omitempty"`
-	HealthDetail     string  `json:"health_detail,omitempty"`
-	HealthCheckedAt  string  `json:"health_checked_at,omitempty"`
-	Balance          float64 `json:"balance,omitempty"`
+	ID                int     `json:"id"`
+	Label             string  `json:"label"`
+	Masked            string  `json:"masked"`
+	AgentID           int     `json:"agent_id"`
+	AgentName         string  `json:"agent_name,omitempty"`
+	HealthStatus      string  `json:"health_status,omitempty"`
+	HealthDetail      string  `json:"health_detail,omitempty"`
+	HealthCheckedAt   string  `json:"health_checked_at,omitempty"`
+	Balance           float64 `json:"balance,omitempty"`
 	BalanceUninvoiced float64 `json:"balance_uninvoiced,omitempty"`
 }
 
