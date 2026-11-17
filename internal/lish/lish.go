@@ -26,7 +26,7 @@ const (
 	readyTimeout    = 30 * time.Second
 	scriptTimeout   = 4 * time.Minute
 	// chunkSize stays well below a PTY's canonical line limit (4096 on Linux).
-	chunkSize = 800
+	chunkSize = 512
 )
 
 var (
@@ -276,8 +276,9 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 
 	// 3. Write the base64-encoded script to a temp file in small chunks.
 	//    Chunking avoids PTY canonical line limits and shell quoting problems.
-	//    Decoding happens once at the end (decoding each chunk separately would
-	//    break the 4-byte base64 group alignment on the final chunk).
+	//    Each chunk is acknowledged by its own marker so the next one is only
+	//    sent once the previous command has actually executed — waiting for a
+	//    bare shell prompt is not reliable on a serial console.
 	b64Path := "/tmp/.panel-boot-" + nonce + ".b64"
 	scriptPath := "/tmp/.panel-boot-" + nonce + ".sh"
 	c.mark()
@@ -293,22 +294,40 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 		if j > len(encoded) {
 			j = len(encoded)
 		}
+		ack := fmt.Sprintf("__PANEL_CHUNK_%s_%d__", nonce, i/chunkSize)
 		c.mark()
-		if err := c.send(ctx, fmt.Sprintf("printf %%s '%s' >> '%s'\r", encoded[i:j], b64Path)); err != nil {
+		if err := c.send(ctx, fmt.Sprintf("printf %%s '%s' >> '%s'; printf '\\n%s\\n'\r", encoded[i:j], b64Path, ack)); err != nil {
 			return Result{}, err
 		}
-		if _, err := c.waitFor(ctx, shellPromptRE, readyTimeout); err != nil {
-			return Result{}, fmt.Errorf("lish: 写入脚本失败: %w", err)
+		if _, err := c.waitFor(ctx, regexp.MustCompile(regexp.QuoteMeta(ack)), readyTimeout); err != nil {
+			return Result{}, fmt.Errorf("lish: 写入脚本第 %d 段失败: %w", i/chunkSize+1, err)
 		}
 	}
 
-	// 4. Decode it to a real script, run it, and capture the exit code through
-	//    a unique sentinel. "&&" means a decode failure is reported as the
-	//    exit code instead of silently running an empty script.
+	// 4. Decode and verify the byte count before running. A truncated transfer
+	//    must never be executed as a partial script.
+	lenMarker := "__PANEL_LEN_" + nonce + "__"
+	lenRE := regexp.MustCompile(regexp.QuoteMeta(lenMarker) + `:(\d+):(\d+)__`)
+	c.mark()
+	if err := c.send(ctx, fmt.Sprintf("base64 -d '%s' > '%s'; printf '\\n%s:%%d:%%d__\\n' $(wc -c < '%s') %d\r", b64Path, scriptPath, lenMarker, scriptPath, len(script))); err != nil {
+		return Result{}, err
+	}
+	lenMatch, err := c.waitFor(ctx, lenRE, readyTimeout)
+	if err != nil {
+		return Result{}, fmt.Errorf("lish: 校验脚本长度失败: %w", err)
+	}
+	lenParts := lenRE.FindSubmatch(lenMatch)
+	actual, aErr := strconv.Atoi(string(lenParts[1]))
+	expected, eErr := strconv.Atoi(string(lenParts[2]))
+	if aErr != nil || eErr != nil || actual != expected {
+		return Result{}, fmt.Errorf("lish: 脚本传输不完整（期望 %d 字节，实际 %d 字节）", len(script), actual)
+	}
+
+	// 5. Run it and capture the exit code through a unique sentinel.
 	marker := "__PANEL_BOOT_" + nonce + "_RC__"
 	rcRE := regexp.MustCompile(regexp.QuoteMeta(marker) + `:(\d+)__`)
 	start := c.mark()
-	if err := c.send(ctx, fmt.Sprintf("base64 -d '%s' > '%s' && bash '%s'; printf '\\n%s:%%d__\\n' $?\r", b64Path, scriptPath, scriptPath, marker)); err != nil {
+	if err := c.send(ctx, fmt.Sprintf("bash '%s'; printf '\\n%s:%%d__\\n' $?\r", scriptPath, marker)); err != nil {
 		return Result{}, err
 	}
 	match, err := c.waitFor(ctx, rcRE, scriptTimeout)
@@ -320,7 +339,7 @@ func drive(ctx context.Context, conn Conn, password, script string) (Result, err
 		return Result{}, fmt.Errorf("lish: 解析退出码失败: %w", convErr)
 	}
 
-	// 5. Best-effort cleanup.
+	// 6. Best-effort cleanup.
 	c.mark()
 	_ = c.send(ctx, "rm -f '"+b64Path+"' '"+scriptPath+"'\r")
 

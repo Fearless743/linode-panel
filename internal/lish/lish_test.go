@@ -2,6 +2,7 @@ package lish
 
 import (
 	"context"
+	"encoding/base64"
 	"regexp"
 	"strings"
 	"testing"
@@ -34,6 +35,9 @@ func newScriptedConn(pass string, badPass bool, exit int) *scriptedConn {
 var (
 	readyCmdRE = regexp.MustCompile(`echo (__PANEL_BOOT_[0-9a-f]+_READY__)`)
 	rcCmdRE    = regexp.MustCompile(`(__PANEL_BOOT_[0-9a-f]+_RC__):%d__`)
+	chunkCmdRE = regexp.MustCompile(`(__PANEL_CHUNK_[0-9a-f]+_[0-9]+__)`)
+	lenCmdRE   = regexp.MustCompile(`(__PANEL_LEN_[0-9a-f]+__):%d:%d__`)
+	lenValueRE = regexp.MustCompile(`(\d+)\r?$`)
 )
 
 func (c *scriptedConn) Read(ctx context.Context) ([]byte, error) {
@@ -61,6 +65,17 @@ func (c *scriptedConn) Write(_ context.Context, data []byte) error {
 		m := readyCmdRE.FindStringSubmatch(cmd)
 		if m != nil {
 			c.out <- []byte(m[1] + "\r\nroot@li:~# ")
+		}
+	case strings.Contains(cmd, "__PANEL_CHUNK_"):
+		m := chunkCmdRE.FindStringSubmatch(cmd)
+		if m != nil {
+			c.out <- []byte(m[1] + "\r\nroot@li:~# ")
+		}
+	case strings.Contains(cmd, "__PANEL_LEN_"):
+		m := lenCmdRE.FindStringSubmatch(cmd)
+		v := lenValueRE.FindStringSubmatch(cmd)
+		if m != nil && v != nil {
+			c.out <- []byte(m[1] + ":" + v[1] + ":" + v[1] + "__\r\nroot@li:~# ")
 		}
 	case strings.Contains(cmd, "_RC__:%d__"):
 		m := rcCmdRE.FindStringSubmatch(cmd)
@@ -123,8 +138,11 @@ func TestRunDeliversScriptAndExitCode(t *testing.T) {
 	}
 	// The base64 written to the console must be decoded before bash runs it.
 	joined := strings.Join(conn.commands, "\n")
-	if !strings.Contains(joined, "base64 -d") || !strings.Contains(joined, "&& bash '") {
+	if !strings.Contains(joined, "base64 -d") || !strings.Contains(joined, "bash '") {
 		t.Fatalf("console commands missing decode+run step: %q", joined)
+	}
+	if !strings.Contains(joined, "__PANEL_CHUNK_") || !strings.Contains(joined, "__PANEL_LEN_") {
+		t.Fatalf("console commands missing chunk/length verification: %q", joined)
 	}
 }
 
@@ -137,6 +155,30 @@ func TestRunZeroExit(t *testing.T) {
 	}
 	if res.Exit != 0 {
 		t.Fatalf("Exit = %d, want 0", res.Exit)
+	}
+}
+
+// TestRunMultiChunkScript verifies a script larger than one chunk is delivered
+// completely. A dropped final chunk used to truncate the script silently.
+func TestRunMultiChunkScript(t *testing.T) {
+	long := strings.Repeat("# padding line 0123456789\n", 120)
+	conn := newScriptedConn("Secret123!", false, 0)
+	res, err := Run(context.Background(), testOptions(conn), long)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Exit != 0 {
+		t.Fatalf("Exit = %d, want 0", res.Exit)
+	}
+	chunks := 0
+	for _, cmd := range conn.commands {
+		if strings.Contains(cmd, "__PANEL_CHUNK_") {
+			chunks++
+		}
+	}
+	want := (len(base64.StdEncoding.EncodeToString([]byte(long))) + chunkSize - 1) / chunkSize
+	if chunks != want || want < 2 {
+		t.Fatalf("chunks = %d, want %d", chunks, want)
 	}
 }
 
