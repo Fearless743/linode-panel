@@ -180,7 +180,7 @@ func TestRebuildHappyPath(t *testing.T) {
 	}
 
 	got := h.sequence()
-	for _, want := range []string{"GetInstance", "Shutdown", "DeleteInstance", "CreateInstance", "GetInstanceIPs"} {
+	for _, want := range []string{"GetInstance", "Shutdown", "DeleteInstance", "CreateInstance", "AttachAllowAllFirewall", "GetInstanceIPs"} {
 		found := false
 		for _, g := range got {
 			if g == want {
@@ -191,6 +191,48 @@ func TestRebuildHappyPath(t *testing.T) {
 		if !found {
 			t.Fatalf("sequence missing %s (got %v)", want, got)
 		}
+	}
+}
+
+// TestRebuildAttachesAllowAllFirewall verifies the replacement instance gets
+// the allow-all Cloud Firewall attached (so no firewall policy can block SSH),
+// and that a firewall failure does not abort the rebuild.
+func TestRebuildAttachesAllowAllFirewall(t *testing.T) {
+	h := newStatefulHarness(t)
+	h.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+		return sshrun.Result{Exit: 0}, nil
+	}
+	var gotRegion string
+	var gotID int
+	h.api.attachFirewall = func(_ context.Context, region string, id int) error {
+		gotRegion, gotID = region, id
+		return nil
+	}
+
+	id := startRebuild(t, h.mgr, 42, "echo hi")
+	task := h.mgr.runToCompletion(t, id)
+	if task.Status != StatusSuccess {
+		t.Fatalf("status = %s (err=%q log=%v)", task.Status, task.Err, task.Log)
+	}
+	if gotRegion != "us-east" || gotID != 99 {
+		t.Fatalf("AttachAllowAllFirewall(%q, %d), want (\"us-east\", 99)", gotRegion, gotID)
+	}
+
+	// A firewall failure must not fail the rebuild (best-effort).
+	h2 := newStatefulHarness(t)
+	h2.mgr.RunFn = func(context.Context, sshrun.Options, string) (sshrun.Result, error) {
+		return sshrun.Result{Exit: 0}, nil
+	}
+	h2.api.attachFirewall = func(context.Context, string, int) error {
+		return errors.New("no firewall scope")
+	}
+	id2 := startRebuild(t, h2.mgr, 42, "echo hi")
+	task2 := h2.mgr.runToCompletion(t, id2)
+	if task2.Status != StatusSuccess {
+		t.Fatalf("status = %s (err=%q log=%v)", task2.Status, task2.Err, task2.Log)
+	}
+	if !strings.Contains(strings.Join(task2.Log, "\n"), "allow-all firewall failed") {
+		t.Fatalf("log missing firewall warning: %v", task2.Log)
 	}
 }
 

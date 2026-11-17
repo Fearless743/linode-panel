@@ -32,10 +32,12 @@ const rebuildPollTimeout = 10 * time.Minute
 //  2. delete the old instance
 //  3. create a fresh instance (same region/type/image, booted) with the
 //     saved root password
-//  4. poll until the new instance is running (3s interval, 10m cap)
-//  5. run the boot script over SSH with the root password (5m timeout,
+//  4. attach the allow-all Cloud Firewall (best-effort, so no firewall policy
+//     can block SSH on the replacement instance)
+//  5. poll until the new instance is running (3s interval, 10m cap)
+//  6. run the boot script over SSH with the root password (5m timeout,
 //     skipped when SkipBootScript is set)
-//  6. probe the SSH port; task succeeds only when the probe connects
+//  7. probe the SSH port; task succeeds only when the probe connects
 func (m *Manager) run(t *Task, pat string) {
 	ctx := context.Background()
 	oldID := t.InstanceID
@@ -112,13 +114,21 @@ func (m *Manager) run(t *Task, pat string) {
 		m.RepointCache(oldID, newID)
 	}
 
-	m.log(t, "step 4: wait for instance %d to be running", newID)
+	// 默认开放所有端口：把「允许全部」Cloud Firewall 绑定到新实例，避免重建
+	// 后的实例被防火墙策略挡住 SSH（含自定义端口）。失败不阻塞重建（PAT 可能
+	// 缺少 firewall 权限），与创建实例/双机重建等其它路径保持一致。
+	m.log(t, "step 4: attach allow-all firewall to instance %d", newID)
+	if err := api.AttachAllowAllFirewall(ctx, old.Region, newID); err != nil {
+		m.log(t, "  attach allow-all firewall failed (continuing): %v", err)
+	}
+
+	m.log(t, "step 5: wait for instance %d to be running", newID)
 	if err := m.waitStatus(t, api, ctx, newID, "running"); err != nil {
 		m.fail(t, err)
 		return
 	}
 
-	m.log(t, "step 5: run boot script via SSH")
+	m.log(t, "step 6: run boot script via SSH")
 	ips, err := api.GetInstanceIPs(ctx, newID)
 	if err != nil {
 		m.fail(t, fmt.Errorf("获取新实例 IP 失败: %w", err))
@@ -136,7 +146,7 @@ func (m *Manager) run(t *Task, pat string) {
 	sshPort := m.sshPort
 	m.mu.Unlock()
 	if t.SkipBootScript {
-		m.log(t, "step 5: skip boot script (dual standby rebuild)")
+		m.log(t, "step 6: skip boot script (dual standby rebuild)")
 	} else {
 		res, runErr := m.runBootScript(t, ctx, host, sshPort, t.rootPass, t.Script)
 		if runErr != nil {
@@ -156,7 +166,7 @@ func (m *Manager) run(t *Task, pat string) {
 			m.log(t, "  stderr: %s", res.Stderr)
 		}
 	}
-	m.log(t, "step 6: probe SSH port on %s", host)
+	m.log(t, "step 7: probe SSH port on %s", host)
 
 	if err := m.ProbeFn(ctx, host); err != nil {
 		m.fail(t, fmt.Errorf("SSH 端口探测失败: %w", err))
@@ -197,7 +207,7 @@ func (m *Manager) runBootScript(t *Task, ctx context.Context, host string, port 
 		if attempt == attempts {
 			break
 		}
-		m.log(t, "step 5: SSH 连接失败（%v），%s 后重试（第 %d/%d 次）", err, delay, attempt+1, attempts)
+		m.log(t, "step 6: SSH 连接失败（%v），%s 后重试（第 %d/%d 次）", err, delay, attempt+1, attempts)
 		select {
 		case <-ctx.Done():
 			return res, lastErr
