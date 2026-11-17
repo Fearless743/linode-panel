@@ -253,6 +253,10 @@ export default function AccountConfigModal({ token, onClose, onSaved, instances 
               onChange={(e) => setPort(e.target.value)}
               disabled={busy}
             />
+            <p className="boot-script-hint">
+              仅用于国内探测是否被墙（自动换 IP 与双机轮询共用），可填代理/业务端口（如 443）。
+              开机脚本的 SSH 端口由面板启动参数 --ssh-port 决定（默认 22），不受此端口影响。
+            </p>
           </div>
           <div className="modal-field">
             <label htmlFor="acct-th">连续失败多少次判定被墙</label>

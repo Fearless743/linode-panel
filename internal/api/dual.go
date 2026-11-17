@@ -164,9 +164,12 @@ func (m *DualMonitor) rebuildFailed(cfg store.DualConfig, err error) {
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", err.Error(), m.now())
 }
 
-// dualPort 双机链路探测与脚本 SSH 端口：未配置时默认 22。
-// 双机的检测、备用机探测与开机脚本共用同一个端口，避免检测与执行用不同端口。
-func dualPort(cfg store.DualConfig) int {
+// dualCheckPort 是双机被墙检测用的 TCP 端口（未配置时默认 22）。
+//
+// 检测端口与开机脚本的 SSH 端口是两件事：检测可以指向代理/业务端口
+// （443、8443 等）来判断国内是否可达，而脚本仍通过面板的 --ssh-port
+// （默认 22）登录执行，否则把检测端口改成 443 会让 SSH 也连 443 而失败。
+func dualCheckPort(cfg store.DualConfig) int {
 	if cfg.Port > 0 {
 		return cfg.Port
 	}
@@ -294,7 +297,7 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "", "idle", "使用中实例没有公网 IPv4，跳过检测", m.now())
 		return
 	}
-	res := m.checkFn(ctx, ip, dualPort(cfg))
+	res := m.checkFn(ctx, ip, dualCheckPort(cfg))
 	switch {
 	case res.err != nil:
 		m.log.Warn("双机轮询: 检测出错（不计入失败）", "active", active.ID, "ip", ip, "error", res.err)
@@ -410,7 +413,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	if script == "" {
 		script = DefaultBootScript
 	}
-	if err := m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script); err != nil {
+	if err := m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script); err != nil {
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机执行开机脚本失败: "+err.Error(), m.now())
 		m.notifyDualFailed(label, "备用机执行开机脚本失败: "+err.Error())
 		return
@@ -443,11 +446,11 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}()
 }
 
-// ensureCleanStandby 保证备用机存在且 SSH 端口国内可达：缺失则按 spec 重建；
+// ensureCleanStandby 保证备用机存在且检测端口国内可达：缺失则按 spec 重建；
 // 若被墙则删机重建（不执行脚本）直到干净或达上限。返回干净的 standby 实例 id。
 func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConfig, pat string, standbyID int, region, typ, image, label, rootPass string, active linode.Instance) (int, error) {
 	api := m.srv.clientFor(pat)
-	sshPort := dualPort(cfg)
+	checkPort := dualCheckPort(cfg)
 	id := standbyID
 	// 缺失则创建。
 	if id > 0 {
@@ -523,7 +526,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			}
 			continue
 		}
-		res := m.checkFn(ctx, ip, sshPort)
+		res := m.checkFn(ctx, ip, checkPort)
 		if res.err != nil {
 			m.log.Warn("双机轮询: 备用机探测出错，重试", "id", id, "error", res.err)
 			time.Sleep(5 * time.Second)
@@ -593,10 +596,10 @@ func (m *DualMonitor) recreateStandbyOnce(ctx context.Context, cfg store.DualCon
 }
 
 // rebuildStandbyLoop 把旧 active（现 standby）删机重建（不执行脚本），循环直到
-// SSH 端口国内可达，然后关机待命。
+// 检测端口国内可达，然后关机待命。
 // 探测用重建必须开机，但该循环退出时无论以何种路径都关掉 standby，避免与 active 双运行残留。
 func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, standbyID int, rootPass string) {
-	sshPort := dualPort(cfg)
+	checkPort := dualCheckPort(cfg)
 	api := m.srv.clientFor(pat)
 	id := standbyID
 	defer func() {
@@ -646,7 +649,7 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 		if ip == "" {
 			continue
 		}
-		res := m.checkFn(context.Background(), ip, sshPort)
+		res := m.checkFn(context.Background(), ip, checkPort)
 		if res.err != nil {
 			m.log.Warn("双机轮询: 备用机探测出错，重建", "id", id, "error", res.err, "attempt", i+1)
 			_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "rebuilding_standby", "error", "备用机探测出错，重建: "+res.err.Error(), m.now())
@@ -859,7 +862,7 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 			host = ips.SLAACv6()
 		}
 		if host != "" && rootPass != "" {
-			scriptErr = m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script)
+			scriptErr = m.runScriptWithRetry(ctx, host, m.srv.sshPort(), rootPass, script)
 		}
 	}
 	m.renameActiveLabel(ctx, api, inst.ID, inst.Label)
@@ -920,7 +923,8 @@ func (m *DualMonitor) ForceRotate(ctx context.Context, cfg store.DualConfig) {
 	m.rotate(ctx, cfg, pat, active)
 }
 
-// runScriptWithRetry 通过 root 密码 SSH 执行脚本，连接失败最多重试 3 次。
+// runScriptWithRetry 通过 root 密码 SSH 执行脚本；连接类失败最多重试 10 次，
+// 密码/认证错误立即失败。
 func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port int, password, script string) error {
 	if port == 0 {
 		port = 22
