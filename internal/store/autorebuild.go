@@ -127,13 +127,17 @@ func (s *Store) AutoRebuild(instanceID int) (AutoRebuild, bool) {
 
 // AutoRebuilds returns every instance whose account has auto-rebuild config,
 // ordered by current instance id. Runtime state is per instance.
+//
+// Only alive cache rows are returned: a missing instance (alive=0, e.g. the
+// old active deleted by a dual rotation) has nothing to probe and must not be
+// treated as an out-of-band deletion over and over again.
 func (s *Store) AutoRebuilds() []AutoRebuild {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT c.id, c.instance_id, c.token_id, a.user_id,
 		a.auto_enabled, a.auto_port, a.auto_threshold, a.auto_interval, a.updated_at
 		FROM instance_cache c JOIN account_config a ON a.token_id=c.token_id
-		WHERE a.has_auto=1
+		WHERE a.has_auto=1 AND c.alive=1
 		ORDER BY c.instance_id, c.id`)
 	if err != nil {
 		return nil

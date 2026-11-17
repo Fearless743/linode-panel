@@ -211,9 +211,16 @@ func (m *AutoRebuildMonitor) checkInstance(ctx context.Context, cfg store.AutoRe
 	if err != nil {
 		var apiErr *linode.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-			// The instance is gone (deleted out of band): drop the config.
-			m.log.Info("自动换IP: 实例不存在，移除配置", "instance_id", id)
-			_ = m.srv.Store.DeleteAutoRebuild(id)
+			// The instance is gone (deleted out of band): mark the cache row
+			// unavailable so AutoRebuilds stops probing it. Do not disable the
+			// account-level auto-rebuild here: it also covers the account's
+			// other instances, and re-resolving the instance id may hit a
+			// token-less anchor row and silently fail (the log used to repeat
+			// every tick).
+			m.log.Info("自动换IP: 实例不存在，标记缓存失效并停止监控", "instance_id", id)
+			if merr := m.srv.Store.MarkInstanceMissing(cfg.TokenID, id); merr != nil {
+				m.log.Warn("自动换IP: 标记实例失效失败", "instance_id", id, "error", merr)
+			}
 			return
 		}
 		m.log.Warn("自动换IP: 读取实例失败", "instance_id", id, "error", err)

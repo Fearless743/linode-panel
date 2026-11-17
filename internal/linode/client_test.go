@@ -357,11 +357,14 @@ func TestClient_CreateFirewall(t *testing.T) {
 	if gotAuth != "Bearer t" {
 		t.Errorf("Authorization = %q", gotAuth)
 	}
-	if gotBody["region"] != "us-east" || gotBody["label"] != allowAllFirewallLabel("us-east") {
+	if gotBody["label"] != allowAllFirewallLabel("us-east") {
 		t.Errorf("body = %v", gotBody)
 	}
-	// The label must be region-scoped: a fixed label collides as soon as a
-	// second region creates its own allow-all firewall.
+	if _, ok := gotBody["region"]; ok {
+		t.Errorf("create body must not include region: %v", gotBody)
+	}
+	// The label must be region-scoped so a concurrent create for another
+	// region cannot collide on the account-unique label.
 	if allowAllFirewallLabel("us-east") == allowAllFirewallLabel("ap-northeast") {
 		t.Error("firewall label is not region-scoped")
 	}
@@ -389,7 +392,7 @@ func TestClient_CreateFirewall(t *testing.T) {
 			t.Errorf("%s rules = %d, want 3", dir, len(list))
 		}
 	}
-	if fw.ID != 77 || fw.Region != "us-east" {
+	if fw.ID != 77 {
 		t.Errorf("firewall = %+v", fw)
 	}
 }
@@ -427,9 +430,11 @@ func TestClient_EnsureAllowAllFirewallReuses(t *testing.T) {
 	}
 }
 
-// TestClient_EnsureAllowAllFirewallCreates checks a missing firewall is created.
+// TestClient_EnsureAllowAllFirewallCreates checks a missing firewall is created
+// with a region-scoped label and without a (non-existent) region field.
 func TestClient_EnsureAllowAllFirewallCreates(t *testing.T) {
 	var posts atomic.Int32
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -437,7 +442,8 @@ func TestClient_EnsureAllowAllFirewallCreates(t *testing.T) {
 			fmt.Fprint(w, `{"data":[],"page":1,"pages":1}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
 			posts.Add(1)
-			fmt.Fprint(w, `{"id":42,"region":"us-east"}`)
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			fmt.Fprint(w, `{"id":42}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
@@ -453,6 +459,12 @@ func TestClient_EnsureAllowAllFirewallCreates(t *testing.T) {
 	}
 	if id != 42 || posts.Load() != 1 {
 		t.Errorf("id = %d posts = %d, want 42 / 1", id, posts.Load())
+	}
+	if gotBody["label"] != allowAllFirewallLabel("us-east") {
+		t.Errorf("create label = %v, want %q", gotBody["label"], allowAllFirewallLabel("us-east"))
+	}
+	if _, ok := gotBody["region"]; ok {
+		t.Errorf("create body must not include region: %v", gotBody)
 	}
 }
 
@@ -517,20 +529,22 @@ func TestClient_EnsureAllowAllFirewallAdoptsLegacyLabel(t *testing.T) {
 	}
 }
 
-// TestClient_EnsureAllowAllFirewallCreatesForOtherRegion is the regression test
-// for the reported 400: an allow-all firewall already exists in another region,
-// so a request for a different region must create a region-scoped label rather
-// than reusing the account-unique bare label.
-func TestClient_EnsureAllowAllFirewallCreatesForOtherRegion(t *testing.T) {
-	var gotBody map[string]any
+// TestClient_EnsureAllowAllFirewallReusesAcrossRegions is the regression test
+// for the reported 400: Cloud Firewalls are account-wide and the API response
+// has no region, so an existing allow-all firewall must be reused for a Linode
+// in another region instead of retrying the create and failing with
+// "Label must be unique among your Cloud Firewalls".
+func TestClient_EnsureAllowAllFirewallReusesAcrossRegions(t *testing.T) {
+	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/networking/firewalls":
-			fmt.Fprint(w, `{"data":[{"id":9,"label":"linode-panel-allow-all-us-west","region":"us-west","tags":["linode-panel-allow-all"]}],"page":1,"pages":1}`)
+			// Real API responses carry no "region" field.
+			fmt.Fprint(w, `{"data":[{"id":9,"label":"linode-panel-fw-us-west","tags":["linode-panel-allow-all"]}],"page":1,"pages":1}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/networking/firewalls":
-			_ = json.NewDecoder(r.Body).Decode(&gotBody)
-			fmt.Fprint(w, `{"id":42,"region":"ap-northeast"}`)
+			posts.Add(1)
+			fmt.Fprint(w, `{"id":42}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"errors":[{"reason":"not found"}]}`)
@@ -544,11 +558,11 @@ func TestClient_EnsureAllowAllFirewallCreatesForOtherRegion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureAllowAllFirewall error: %v", err)
 	}
-	if id != 42 {
-		t.Errorf("id = %d, want 42 (created in ap-northeast)", id)
+	if id != 9 {
+		t.Errorf("id = %d, want 9 (reused account-wide firewall)", id)
 	}
-	if gotBody["label"] != allowAllFirewallLabel("ap-northeast") {
-		t.Errorf("create label = %v, want %q", gotBody["label"], allowAllFirewallLabel("ap-northeast"))
+	if posts.Load() != 0 {
+		t.Errorf("unexpected POST count = %d", posts.Load())
 	}
 }
 

@@ -78,6 +78,28 @@ func TestAutoRebuildCRUD(t *testing.T) {
 	}
 }
 
+// TestAutoRebuildsSkipsMissingInstances ensures a dead cache row (for example
+// the old active instance deleted by a dual rotation) is not probed and does
+// not re-trigger the out-of-band-deletion path on every tick.
+func TestAutoRebuildsSkipsMissingInstances(t *testing.T) {
+	s, _ := newTestStore(t)
+	if err := s.SetAutoRebuild(AutoRebuild{
+		InstanceID: 42, UserID: 1, TokenID: 7, Enabled: true,
+		Port: 22, Threshold: 3, IntervalSec: 300,
+	}); err != nil {
+		t.Fatalf("SetAutoRebuild: %v", err)
+	}
+	if got := s.AutoRebuilds(); len(got) != 1 {
+		t.Fatalf("AutoRebuilds = %+v, want 1 alive instance", got)
+	}
+	if err := s.MarkInstanceMissing(7, 42); err != nil {
+		t.Fatalf("MarkInstanceMissing: %v", err)
+	}
+	if got := s.AutoRebuilds(); len(got) != 0 {
+		t.Fatalf("AutoRebuilds = %+v, want missing instance skipped", got)
+	}
+}
+
 // TestMoveAutoRebuild verifies an instance's config follows it to a new id and
 // that monitor state is reset.
 func TestMoveAutoRebuild(t *testing.T) {

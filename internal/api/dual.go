@@ -24,7 +24,19 @@ const (
 	// MaxStandbyRebuilds bounds the "rebuild until clean" loop so a fully
 	// blocked region does not burn money forever.
 	MaxStandbyRebuilds = 20
+	// StandbyRebuildCooldown pauses automatic standby/promote rebuilds after a
+	// full cycle still could not find a clean IP (Linode's region IP pool is
+	// small and tends to hand back the same blocked addresses). Without it the
+	// monitor rebuilds a fresh instance on every tick indefinitely.
+	StandbyRebuildCooldown = 30 * time.Minute
+	// dualStateCooldown is the persisted dual_state used while the rebuild
+	// circuit breaker is open. A manual check/rotate clears it.
+	dualStateCooldown = "cooldown"
 )
+
+// errStandbyPoolExhausted reports that repeated rebuilds kept landing on
+// already-blocked IPs, i.e. the region's assignable pool is exhausted for now.
+var errStandbyPoolExhausted = errors.New("备用机可用 IP 已耗尽")
 
 // DualMonitor 定期从国内探测双机配置的 active 实例；连续被墙达阈值时轮换到
 // standby（开机并执行账号级开机脚本），再把旧 active 删机重建（不执行脚本）
@@ -37,7 +49,11 @@ type DualMonitor struct {
 	log      *slog.Logger
 
 	checkFn func(ctx context.Context, ip string, port int) blockCheckResult
-	lck sync.Map
+	lck     sync.Map
+	// cooldowns holds the per-token rebuild circuit breaker deadline. It is
+	// in-memory on purpose: probe results keep updating dual_state/last_check_at
+	// and must not accidentally close (or endlessly reopen) the breaker.
+	cooldowns sync.Map
 }
 
 // StartDualMonitor 启动后台双机监测；ctx 取消即退出。
@@ -110,6 +126,42 @@ func (m *DualMonitor) due(cfg store.DualConfig) bool {
 
 func (m *DualMonitor) now() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// inCooldown reports whether the account's standby rebuild circuit breaker is
+// still open. It only gates the expensive rebuild paths (lost active instance
+// and missing standby), never the active IP probe.
+func (m *DualMonitor) inCooldown(cfg store.DualConfig) bool {
+	v, ok := m.cooldowns.Load(cfg.TokenID)
+	if !ok {
+		return false
+	}
+	until, ok := v.(time.Time)
+	return ok && time.Now().Before(until)
+}
+
+// clearCooldown closes the circuit breaker after a rebuild succeeded (or the
+// user asked for a manual retry).
+func (m *DualMonitor) clearCooldown(tokenID int) { m.cooldowns.Delete(tokenID) }
+
+// coolDown opens the rebuild circuit breaker for the account so the next
+// automatic tick does not immediately rebuild another instance.
+func (m *DualMonitor) coolDown(cfg store.DualConfig, detail string) {
+	m.log.Warn("双机轮询: 备用机重建进入冷却，暂停自动重建",
+		"token_id", cfg.TokenID, "cooldown", StandbyRebuildCooldown.String(), "detail", detail)
+	m.cooldowns.Store(cfg.TokenID, time.Now().Add(StandbyRebuildCooldown))
+	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, dualStateCooldown, "error",
+		fmt.Sprintf("%s（%s 后自动重试）", detail, StandbyRebuildCooldown), m.now())
+}
+
+// rebuildFailed records a failed standby/promote rebuild: a pool exhausted
+// error opens the circuit breaker, anything else is a normal retryable error.
+func (m *DualMonitor) rebuildFailed(cfg store.DualConfig, err error) {
+	if errors.Is(err, errStandbyPoolExhausted) {
+		m.coolDown(cfg, err.Error())
+		return
+	}
+	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", err.Error(), m.now())
+}
+
 // dualPort 双机链路探测与脚本 SSH 端口：未配置时默认 22。
 // 双机的检测、备用机探测与开机脚本共用同一个端口，避免检测与执行用不同端口。
 func dualPort(cfg store.DualConfig) int {
@@ -175,6 +227,10 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		var apiErr *linode.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			// 使用中实例已在上游消失：尝试直接扶正备用机。
+			// 冷却期内不再自动重建（否则每次 tick 都会删建一台实例）。
+			if m.inCooldown(cfg) {
+				return
+			}
 			m.log.Warn("双机轮询: 使用中实例已不存在，尝试扶正备用机", "active", cfg.ActiveInstanceID)
 			m.promoteStandbyAfterLoss(ctx, cfg, pat)
 			return
@@ -197,8 +253,12 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		}
 	}
 	// 缺备补备：active 健康但 standby 缺失时直接建一台关机备用机，不要等下次轮换。
-	if cfg.StandbyInstanceID <= 0 {
-		m.ensureNeutralStandby(ctx, cfg, pat, active)
+	// 冷却期内跳过补备（但继续探测 active）。
+	if cfg.StandbyInstanceID <= 0 && !m.inCooldown(cfg) {
+		if err := m.ensureNeutralStandby(ctx, cfg, pat, active); err != nil {
+			m.rebuildFailed(cfg, err)
+			return
+		}
 		// 补备完成后继续本轮检测；刷新 cfg
 		if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok {
 			cfg = fresh
@@ -225,6 +285,12 @@ func (m *DualMonitor) check(ctx context.Context, cfg store.DualConfig) {
 		}
 		m.log.Info("双机轮询: 疑似被墙", "active", active.ID, "ip", ip, "fails", fails, "threshold", threshold)
 		if fails >= threshold {
+			// 冷却期内说明地区 IP 池暂时无干净地址，轮换只会删掉当前实例
+			// 再重建出一台同样被墙的机器；保留现状等待人工处理或冷却结束。
+			if m.inCooldown(cfg) {
+				m.log.Warn("双机轮询: 备用机重建冷却中，暂停自动轮换（保留当前实例）", "active", active.ID, "ip", ip)
+				return
+			}
 			m.rotate(ctx, cfg, pat, active)
 			return
 		}
@@ -275,7 +341,7 @@ func (m *DualMonitor) rotate(ctx context.Context, cfg store.DualConfig, pat stri
 	}
 	cleanStandby, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, active)
 	if err != nil {
-		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", "备用机准备失败: "+err.Error(), m.now())
+		m.rebuildFailed(cfg, fmt.Errorf("备用机准备失败: %w", err))
 		m.notifyDualFailed(label, "备用机准备失败: "+err.Error())
 		return
 	}
@@ -383,6 +449,9 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 		_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, m.freshActiveID(cfg.TokenID, cfg.ActiveInstanceID), id)
 	}
 	// 先开机再探测：离线时 22 端口必然不通，会被误判为被墙而无限重建。
+	// blockedIPs 记录本轮已判定被墙的 IP：Linode 的可分配 IP 池很小，重建
+	// 很快会拿回同一个地址，重复即说明池已耗尽，继续删建只是烧钱。
+	blockedIPs := make(map[string]bool, MaxStandbyRebuilds)
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		inst, err := api.GetInstance(ctx, id)
 		if err != nil {
@@ -426,8 +495,17 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 			continue
 		}
 		if !res.blocked {
+			m.clearCooldown(cfg.TokenID)
 			return id, nil
 		}
+		if blockedIPs[ip] {
+			m.log.Warn("双机轮询: 重建回到已判定被墙的 IP，停止重建", "id", id, "ip", ip,
+				"attempt", i+1, "blocked_ips", len(blockedIPs))
+			_ = api.Shutdown(ctx, id)
+			return 0, fmt.Errorf("%w：重建后回到已判定被墙的 IP %s（共 %d 个 IP 均不可用）",
+				errStandbyPoolExhausted, ip, len(blockedIPs))
+		}
+		blockedIPs[ip] = true
 		m.log.Info("双机轮询: 备用机 IP 被墙，重建", "id", id, "ip", ip, "attempt", i+1)
 		id, err = m.recreateStandbyOnce(ctx, cfg, pat, id, rootPass)
 		if err != nil {
@@ -436,7 +514,7 @@ func (m *DualMonitor) ensureCleanStandby(ctx context.Context, cfg store.DualConf
 	}
 	// 重建不等同于关机：失败时把最后的 standby 关掉，避免与 active 双运行残留。
 	_ = api.Shutdown(ctx, id)
-	return 0, fmt.Errorf("备用机连续 %d 次重建仍被墙，停止以避免费用失控", MaxStandbyRebuilds)
+	return 0, fmt.Errorf("%w：连续 %d 次重建仍被墙", errStandbyPoolExhausted, MaxStandbyRebuilds)
 }
 
 // recreateStandbyOnce 删机重建一台备用机（不执行脚本），返回新实例 id。
@@ -491,6 +569,7 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			_ = api.Shutdown(context.Background(), id)
 		}
 	}()
+	blockedIPs := make(map[string]bool, MaxStandbyRebuilds)
 	for i := 0; i < MaxStandbyRebuilds; i++ {
 		// 用重建任务执行删机重建（跳过脚本），任务日志可在任务页查看。
 		// 被墙或失败都不退出：继续重建，直到拿到没被墙的实例待命（上限防费用失控）。
@@ -539,16 +618,25 @@ func (m *DualMonitor) rebuildStandbyLoop(cfg store.DualConfig, pat string, stand
 			continue
 		}
 		if res.blocked {
+			if blockedIPs[ip] {
+				m.log.Warn("双机轮询: 重建回到已判定被墙的 IP，停止重建", "id", id, "ip", ip,
+					"attempt", i+1, "blocked_ips", len(blockedIPs))
+				m.coolDown(cfg, fmt.Sprintf("%v：重建后回到已判定被墙的 IP %s（共 %d 个 IP 均不可用）",
+					errStandbyPoolExhausted, ip, len(blockedIPs)))
+				return
+			}
+			blockedIPs[ip] = true
 			m.log.Info("双机轮询: 重建后仍被墙，继续重建", "id", id, "ip", ip, "attempt", i+1)
 			continue
 		}
 		// 干净：关机待命，回到 idle。
 		_ = api.Shutdown(context.Background(), id)
+		m.clearCooldown(cfg.TokenID)
 		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "idle", fmt.Sprintf("备用机 #%d 已就绪（%s），关机待命", id, ip), m.now())
 		m.log.Info("双机轮询: 备用机已就绪", "id", id, "ip", ip)
 		return
 	}
-	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error", fmt.Sprintf("备用机连续 %d 次重建仍被墙，已停止", MaxStandbyRebuilds), m.now())
+	m.coolDown(cfg, fmt.Sprintf("%v：连续 %d 次重建仍被墙", errStandbyPoolExhausted, MaxStandbyRebuilds))
 }
 
 // renameActiveLabel 把新主的标签还原为根名（去掉 -standby 后缀），使下次建备机不会与主同名。
@@ -567,7 +655,8 @@ func (m *DualMonitor) renameActiveLabel(ctx context.Context, api *linode.Client,
 }
 
 // ensureNeutralStandby 在缺备时按使用中实例规格建一台关机备用机（不执行脚本）。
-func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) {
+// 返回错误时调用方负责记录状态（IP 池耗尽会开启重建冷却）。
+func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualConfig, pat string, active linode.Instance) error {
 	// Per-token guard: background tick + manual check may race creating two standbys.
 	muI, _ := m.lck.LoadOrStore(cfg.TokenID, &sync.Mutex{})
 	mu := muI.(*sync.Mutex)
@@ -575,12 +664,12 @@ func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualCo
 	defer mu.Unlock()
 	// Re-read: another creator may have filled standby meanwhile.
 	if fresh, ok := m.srv.Store.DualConfigOf(cfg.TokenID); ok && fresh.StandbyInstanceID > 0 {
-		return
+		return nil
 	}
 	rootPass, _ := m.srv.Store.DualRootPassword(cfg.TokenID)
 	if rootPass == "" {
 		m.log.Warn("双机轮询: 缺备但无 root 密码，跳过补备", "token_id", cfg.TokenID)
-		return
+		return nil
 	}
 	// Label 必须全局唯一：若新主仍带 -standby 后缀，先把主改回根名再建备机。
 	api2 := m.srv.clientFor(pat)
@@ -604,8 +693,9 @@ func (m *DualMonitor) ensureNeutralStandby(ctx context.Context, cfg store.DualCo
 	standbyID := cfg.StandbyInstanceID
 	if _, err := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, label, rootPass, active); err != nil {
 		m.log.Warn("双机轮询: 补备失败", "token_id", cfg.TokenID, "error", err)
-		return
+		return err
 	}
+	return nil
 }
 
 // currentActive 读取最新的 active id（轮换后可能已变化）；读不到时返回 0，
@@ -695,7 +785,7 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 		// 但这里 active 本身已失，按缓存重建 standby 再开机扶正。
 		newID, cerr := m.ensureCleanStandby(ctx, cfg, pat, standbyID, specRegion, specType, specImage, standbyLabel, rootPass, linode.Instance{})
 		if cerr != nil {
-			_ = m.srv.Store.UpdateDualState(cfg.TokenID, cfg.FailCount, "error", "error", "备用机也不可用且重建失败: "+err.Error()+" / "+cerr.Error()+"（双机实例均已在上游删除且缓存无规格，请先在实例页创建新实例，再回到账号配置重新选择模板）", m.now())
+			m.rebuildFailed(cfg, fmt.Errorf("备用机也不可用且重建失败: %v / %w", err, cerr))
 			return
 		}
 		inst, err = api.GetInstance(ctx, newID)
@@ -728,6 +818,7 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 	m.renameActiveLabel(ctx, api, inst.ID, inst.Label)
 	// 扶正后 standby 指向已不存在的旧 active 无法再重建；置 0，下次轮换时重建。
 	_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, inst.ID, 0)
+	m.clearCooldown(cfg.TokenID)
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", fmt.Sprintf("使用中实例丢失，已扶正备用机 #%d", inst.ID), m.now())
 }
 

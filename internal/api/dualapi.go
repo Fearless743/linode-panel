@@ -278,6 +278,12 @@ func (s *Server) handleCheckDual(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "双机轮询监控未启用"})
 		return
 	}
+	// 手动检测是明确的重试意图：清掉自动重建冷却，让本轮可以立即补备/扶正。
+	s.dualMonitor.clearCooldown(tid)
+	if cfg.State == dualStateCooldown {
+		_ = s.Store.UpdateDualState(tid, cfg.FailCount, "idle", cfg.LastStatus, "手动检测，退出重建冷却", time.Now().UTC().Format(time.RFC3339))
+		cfg.State = "idle"
+	}
 	// check 可能含建备机（耗时），用后台上下文，避免 HTTP 请求超时把轮换/补备掐断。
 	s.dualMonitor.check(context.Background(), cfg)
 	out, _ := s.Store.DualConfigOf(tid)

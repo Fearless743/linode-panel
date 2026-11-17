@@ -20,8 +20,8 @@ const AllowAllFirewallTag = "linode-panel-allow-all"
 // AllowAllFirewallLabel is the label prefix used for the panel's allow-all
 // Cloud Firewall. Cloud Firewall labels must be unique across the whole
 // account, so the actual label is suffixed with the region (see
-// allowAllFirewallLabel): a bare constant label makes the second region fail
-// with HTTP 400 "Label must be unique among your Cloud Firewalls".
+// allowAllFirewallLabel) to keep concurrent creates from colliding on HTTP 400
+// "Label must be unique among your Cloud Firewalls".
 //
 // The prefix is deliberately short (and the full label clamped to 32
 // characters) because the API also enforces a 3-32 character limit and long
@@ -33,8 +33,8 @@ const AllowAllFirewallLabel = "linode-panel-fw"
 // firewalls are reused rather than duplicated.
 const legacyAllowAllLabel = "linode-panel-allow-all"
 
-// allowAllFirewallLabel returns the account-unique label for the allow-all
-// firewall in region. It stays within the API's 32-character limit and remains
+// allowAllFirewallLabel returns the label used when creating the allow-all
+// firewall for region. It stays within the API's 32-character limit and remains
 // unique even for hypothetical over-long region ids by hashing the region tail.
 func allowAllFirewallLabel(region string) string {
 	label := AllowAllFirewallLabel + "-" + region
@@ -72,10 +72,12 @@ type FirewallRules struct {
 }
 
 // Firewall is the subset of a Cloud Firewall returned by the API.
+//
+// Note: Cloud Firewalls are account-wide and the API response has no region
+// field, so a firewall cannot be matched (or filtered) by region.
 type Firewall struct {
 	ID     int           `json:"id"`
 	Label  string        `json:"label"`
-	Region string        `json:"region"`
 	Status string        `json:"status"`
 	Tags   []string      `json:"tags"`
 	Rules  FirewallRules `json:"rules"`
@@ -121,13 +123,14 @@ func (c *Client) ListFirewalls(ctx context.Context) ([]Firewall, error) {
 	return paginate[Firewall](c, ctx, "/networking/firewalls")
 }
 
-// CreateFirewall creates a Cloud Firewall in region that accepts all traffic.
+// CreateFirewall creates a Cloud Firewall that accepts all traffic. The
+// region only affects the (account-unique) label; firewalls themselves are
+// account-wide and the API does not accept a region on creation.
 func (c *Client) CreateFirewall(ctx context.Context, region string) (Firewall, error) {
 	body, err := json.Marshal(map[string]any{
-		"label":  allowAllFirewallLabel(region),
-		"region": region,
-		"rules":  allowAllRules(),
-		"tags":   []string{AllowAllFirewallTag},
+		"label": allowAllFirewallLabel(region),
+		"rules": allowAllRules(),
+		"tags":  []string{AllowAllFirewallTag},
 	})
 	if err != nil {
 		return Firewall{}, fmt.Errorf("linode api: %w", err)
@@ -153,20 +156,23 @@ func (c *Client) AttachFirewall(ctx context.Context, firewallID, linodeID int) e
 	return c.do(ctx, http.MethodPost, "/networking/firewalls/"+strconv.Itoa(firewallID)+"/devices", bytes.NewReader(body), nil)
 }
 
-// EnsureAllowAllFirewall returns the id of the account's allow-all firewall in
-// region, creating it when none exists yet.
+// EnsureAllowAllFirewall returns the id of the account's allow-all firewall,
+// creating it when none exists yet.
 //
-// Firewall labels are account-unique while tags are not, so the lookup matches
-// the region's tagged firewall first and then adopts a firewall in region that
-// already carries the region-scoped label (tags may have been stripped) or the
-// legacy region-less label (created by an older panel version).
+// Firewalls are account-wide and the API response carries no region, so region
+// only selects the label used when a new firewall has to be created. Lookup
+// matches the tagged firewall first and then adopts a firewall carrying the
+// region-scoped label (tags may have been stripped) or a legacy label created
+// by an older panel version. Matching by region is impossible: doing so made
+// every rebuild miss the existing firewall, retry the create and fail forever
+// with HTTP 400 "Label must be unique among your Cloud Firewalls".
 func (c *Client) EnsureAllowAllFirewall(ctx context.Context, region string) (int, error) {
 	want := allowAllFirewallLabel(region)
 	fws, err := c.ListFirewalls(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if id, ok := findAllowAllFirewall(fws, region, want); ok {
+	if id, ok := findAllowAllFirewall(fws, want); ok {
 		return id, nil
 	}
 	created, err := c.CreateFirewall(ctx, region)
@@ -176,7 +182,7 @@ func (c *Client) EnsureAllowAllFirewall(ctx context.Context, region string) (int
 		// failing the whole rebuild.
 		if isDuplicateLabel(err) {
 			if fws, listErr := c.ListFirewalls(ctx); listErr == nil {
-				if id, ok := findAllowAllFirewall(fws, region, want); ok {
+				if id, ok := findAllowAllFirewall(fws, want); ok {
 					return id, nil
 				}
 			}
@@ -186,15 +192,17 @@ func (c *Client) EnsureAllowAllFirewall(ctx context.Context, region string) (int
 	return created.ID, nil
 }
 
-// findAllowAllFirewall locates the panel's allow-all firewall for region in
-// fws: same region and either tagged, or labelled with the region-scoped label
-// (current or legacy form).
-func findAllowAllFirewall(fws []Firewall, region, want string) (int, bool) {
+// findAllowAllFirewall locates the panel's allow-all firewall in fws: one of
+// the panel's tagged firewalls first, then one labelled with the region-scoped
+// label requested (current or legacy form).
+func findAllowAllFirewall(fws []Firewall, want string) (int, bool) {
 	for _, fw := range fws {
-		if fw.Region != region {
-			continue
+		if hasTag(fw.Tags, AllowAllFirewallTag) {
+			return fw.ID, true
 		}
-		if hasTag(fw.Tags, AllowAllFirewallTag) || fw.Label == want || isLegacyAllowAllLabel(fw.Label, region) {
+	}
+	for _, fw := range fws {
+		if fw.Label == want || isLegacyAllowAllLabel(fw.Label) {
 			return fw.ID, true
 		}
 	}
@@ -203,8 +211,8 @@ func findAllowAllFirewall(fws []Firewall, region, want string) (int, bool) {
 
 // isLegacyAllowAllLabel reports whether label is one older panel versions may
 // have created: the bare legacy label or the legacy label suffixed with region.
-func isLegacyAllowAllLabel(label, region string) bool {
-	return label == legacyAllowAllLabel || label == legacyAllowAllLabel+"-"+region
+func isLegacyAllowAllLabel(label string) bool {
+	return label == legacyAllowAllLabel || strings.HasPrefix(label, legacyAllowAllLabel+"-")
 }
 
 // isDuplicateLabel reports whether err is the Linode API's 400 response for an

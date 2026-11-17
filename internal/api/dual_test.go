@@ -1,6 +1,8 @@
 package api
 
 import (
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -110,12 +112,47 @@ func TestIsDualManagedSkipsAutoRebuild(t *testing.T) {
 	}
 }
 
+// TestDualRebuildCooldown verifies a rebuild cycle that exhausted the blocked
+// IP pool opens the circuit breaker, while ordinary errors stay retryable.
+func TestDualRebuildCooldown(t *testing.T) {
+	srv, _ := newDualServer(t)
+	if err := srv.Store.SetDualConfig(store.DualConfig{
+		TokenID: 1, UserID: 1, Enabled: true, Port: 22,
+		Threshold: 3, IntervalSec: 60, ActiveInstanceID: 10, StandbyInstanceID: 11,
+	}, "Secret123!"); err != nil {
+		t.Fatalf("SetDualConfig: %v", err)
+	}
+	m := &DualMonitor{srv: srv, log: slog.New(slog.DiscardHandler)}
+	cfg, _ := srv.Store.DualConfigOf(1)
+	if m.inCooldown(cfg) {
+		t.Fatal("fresh config should not be cooling down")
+	}
+
+	m.rebuildFailed(cfg, fmt.Errorf("准备工作失败: %w", errStandbyPoolExhausted))
+	cfg, _ = srv.Store.DualConfigOf(1)
+	if cfg.State != dualStateCooldown || !m.inCooldown(cfg) {
+		t.Fatalf("pool exhaustion should cool down, state=%q detail=%q", cfg.State, cfg.LastDetail)
+	}
+
+	// 普通错误（如 API 创建失败）不进入冷却，下一轮可重试。
+	m.clearCooldown(1)
+	if err := srv.Store.UpdateDualState(1, 0, "idle", "idle", "reset", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("UpdateDualState: %v", err)
+	}
+	cfg, _ = srv.Store.DualConfigOf(1)
+	m.rebuildFailed(cfg, fmt.Errorf("创建备用机失败"))
+	cfg, _ = srv.Store.DualConfigOf(1)
+	if cfg.State != "error" || m.inCooldown(cfg) {
+		t.Fatalf("ordinary error should stay retryable, state=%q detail=%q", cfg.State, cfg.LastDetail)
+	}
+}
+
 func TestDualStandbyLabel(t *testing.T) {
 	cases := map[string]string{
-		"web":        "web-standby",
+		"web":         "web-standby",
 		"web-standby": "web-standby",
-		"测试机":        "---standby",
-		"":           "dual-standby",
+		"测试机":         "---standby",
+		"":            "dual-standby",
 	}
 	for in, wantSuffix := range cases {
 		got := dualStandbyLabel(in)
