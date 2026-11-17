@@ -146,6 +146,10 @@ func (s *Server) runBootScript(instanceID int, pat string, password string, scri
 		// Only connectivity failures are worth retrying: once the session
 		// started, a transport error may have interrupted a partially applied
 		// script and re-running it could be unsafe.
+		if isSSHAuthError(runErr) {
+			s.failBootScript(instanceID, fmt.Errorf("root 密码不正确或 SSH 禁止密码登录: %w", runErr))
+			return
+		}
 		if !isSSHConnectError(runErr) {
 			s.failBootScript(instanceID, fmt.Errorf("SSH 执行开机脚本失败: %w", runErr))
 			return
@@ -176,6 +180,18 @@ func isSSHConnectError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "sshrun: dial") || strings.Contains(msg, "sshrun: handshake")
+}
+
+// isSSHAuthError reports whether the handshake failed because the password was
+// rejected (or password auth is disabled). Retrying cannot help; the caller
+// should surface a clear "wrong root password" error instead.
+func isSSHAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "unable to authenticate") ||
+		strings.Contains(msg, "no supported methods remain")
 }
 
 // waitForInstanceStatus polls api until the instance reaches want or ctx ends.

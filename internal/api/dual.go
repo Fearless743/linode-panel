@@ -849,20 +849,31 @@ func (m *DualMonitor) promoteStandbyAfterLoss(ctx context.Context, cfg store.Dua
 	if script == "" {
 		script = DefaultBootScript
 	}
+	var scriptErr error
 	ips, err := api.GetInstanceIPs(ctx, inst.ID)
-	if err == nil {
+	if err != nil {
+		scriptErr = fmt.Errorf("获取实例 IP 失败: %w", err)
+	} else {
 		host := ips.PublicIPv4()
 		if host == "" {
 			host = ips.SLAACv6()
 		}
 		if host != "" && rootPass != "" {
-			_ = m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script)
+			scriptErr = m.runScriptWithRetry(ctx, host, dualPort(cfg), rootPass, script)
 		}
 	}
 	m.renameActiveLabel(ctx, api, inst.ID, inst.Label)
 	// 扶正后 standby 指向已不存在的旧 active 无法再重建；置 0，下次轮换时重建。
 	_ = m.srv.Store.UpdateDualInstances(cfg.TokenID, inst.ID, 0)
 	m.clearCooldown(cfg.TokenID)
+	if scriptErr != nil {
+		// 已经扶正（否则整对机器都没有主），但必须把脚本失败明确暴露出来：
+		// 密码错误时新主看起来在运行，实际代理配置没生效。
+		_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "error", "error",
+			fmt.Sprintf("已扶正备用机 #%d，但开机脚本失败: %v", inst.ID, scriptErr), m.now())
+		m.notifyDualFailed(m.srv.dualAccountLabel(cfg), "已扶正备用机但开机脚本失败: "+scriptErr.Error())
+		return
+	}
 	_ = m.srv.Store.UpdateDualState(cfg.TokenID, 0, "idle", "ok", fmt.Sprintf("使用中实例丢失，已扶正备用机 #%d", inst.ID), m.now())
 }
 
@@ -917,8 +928,11 @@ func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port 
 	run := m.srv.sshRunner()
 	sshCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+	// 新机从 "running" 到 sshd 可登录通常需要几十秒：连接类失败多给几次机会。
+	// 密码错误则立即失败，不做无意义的重复尝试。
+	const maxAttempts = 10
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		res, err := run(sshCtx, sshrun.Options{
 			Host: host, Port: port, Password: password,
 			InsecureSkipVerify: true, Timeout: 5 * time.Minute,
@@ -933,6 +947,9 @@ func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port 
 			}
 			return nil
 		}
+		if isSSHAuthError(err) {
+			return fmt.Errorf("root 密码不正确或 SSH 禁止密码登录（请更新账号配置里的 root 密码）: %w", err)
+		}
 		if !isSSHConnectError(err) {
 			return fmt.Errorf("SSH 执行开机脚本失败: %w", err)
 		}
@@ -943,7 +960,7 @@ func (m *DualMonitor) runScriptWithRetry(ctx context.Context, host string, port 
 		case <-time.After(10 * time.Second):
 		}
 	}
-	return fmt.Errorf("SSH 连接失败（已尝试 3 次）: %w", lastErr)
+	return fmt.Errorf("SSH 连接失败（已尝试 %d 次）: %w", maxAttempts, lastErr)
 }
 
 func (s *Server) dualAccountLabel(cfg store.DualConfig) string {

@@ -278,6 +278,19 @@ func TestDualCheckSkippedWhileBusy(t *testing.T) {
 	}
 }
 
+func TestIsSSHAuthError(t *testing.T) {
+	authErr := fmt.Errorf("sshrun: handshake 1.2.3.4:22: ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain")
+	if !isSSHAuthError(authErr) {
+		t.Fatal("password rejection should be classified as an auth error")
+	}
+	if isSSHAuthError(fmt.Errorf("sshrun: dial 1.2.3.4:22: connection refused")) {
+		t.Fatal("dial failure is not an auth error")
+	}
+	if isSSHAuthError(nil) {
+		t.Fatal("nil is not an auth error")
+	}
+}
+
 func TestDualStandbyLabel(t *testing.T) {
 	cases := map[string]string{
 		"web":         "web-standby",
