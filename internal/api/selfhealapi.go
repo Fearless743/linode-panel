@@ -75,7 +75,13 @@ func (s *Server) handlePutSelfHeal(w http.ResponseWriter, r *http.Request) {
 		req.Enabled = false
 	}
 
+	existing := s.Store.SelfHealOf(tid)
 	port := req.Port
+	if port == 0 {
+		// 未显式传端口时沿用账号已保存的检测端口，避免回退到全局 SSH 端口
+		// 导致被墙探测端口与账号设置不一致。
+		port = existing.Port
+	}
 	if port == 0 {
 		port = s.sshPort()
 	}
@@ -100,7 +106,6 @@ func (s *Server) handlePutSelfHeal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing := s.Store.SelfHealOf(tid)
 	activeID, standbyID := existing.ActiveInstanceID, existing.StandbyInstanceID
 	script := strings.TrimSpace(req.Script)
 	rootPass := req.RootPassword

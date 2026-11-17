@@ -112,12 +112,31 @@ func (s *Store) scanSelfHealLocked(tokenID int) (SelfHeal, bool) {
 	c.Mode = normalizeMode(mode)
 	c.HasRootPass = hasP != 0
 	// 检测端口/阈值/间隔只有一个有效值：rebuild 用 auto_*，dual 用 dual_*。
+	// 老库若某一列缺失，用另一列兜底，保证探测始终使用账号里配置的端口。
 	if c.Mode == SelfHealDual {
 		c.Enabled = dualEn != 0
 		c.Port, c.Threshold, c.IntervalSec = dualPort, dualTh, dualIv
+		if c.Port <= 0 {
+			c.Port = autoPort
+		}
+		if c.Threshold <= 0 {
+			c.Threshold = autoTh
+		}
+		if c.IntervalSec <= 0 {
+			c.IntervalSec = autoIv
+		}
 	} else {
 		c.Enabled = autoEn != 0
 		c.Port, c.Threshold, c.IntervalSec = autoPort, autoTh, autoIv
+		if c.Port <= 0 {
+			c.Port = dualPort
+		}
+		if c.Threshold <= 0 {
+			c.Threshold = dualTh
+		}
+		if c.IntervalSec <= 0 {
+			c.IntervalSec = dualIv
+		}
 	}
 	return c, true
 }
